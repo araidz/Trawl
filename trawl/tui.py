@@ -23,7 +23,7 @@ import tty
 import unicodedata
 
 from . import theme as T
-from .aria2 import Aria2Error, Download, control_infohash
+from .aria2 import STATE_DIR, Aria2Error, Download, control_infohash
 from .sources import (SOURCES, Result, Search, build_magnet, dedupe, parse_magnet,
                       sort_results)
 
@@ -31,6 +31,25 @@ GROUP_OF = {s.id: s.group for s in SOURCES}
 CATS = [("all", "All"), ("games", "Games"), ("movies", "Movies"),
         ("tv", "TV"), ("anime", "Anime")]
 CAT_GROUP = {"games": "Games", "movies": "Movies", "tv": "TV", "anime": "Anime"}
+
+HIST_MAX = 100
+HIST_FILE = STATE_DIR / "history.txt"
+
+
+def load_history() -> list[str]:
+    try:
+        lines = [ln.strip() for ln in HIST_FILE.read_text().splitlines() if ln.strip()]
+        return lines[-HIST_MAX:]
+    except OSError:
+        return []
+
+
+def save_history(hist: list[str]) -> None:
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        HIST_FILE.write_text("\n".join(hist[-HIST_MAX:]))
+    except OSError:
+        pass
 
 RAIL_W = 16  # fits "Downloads (NN)"
 MARGIN = 2
@@ -323,6 +342,9 @@ class App:
         self.view = "search"  # search | downloads
         self.editing = False  # splash is a landing (q quits); typing/"/" starts editing
         self.query = ""
+        self.history = load_history()  # past queries, oldest -> newest
+        self.hist_idx = len(self.history)  # cursor; == len means "live draft"
+        self.draft = ""  # query in progress before browsing history
         self.results: list[Result] = []
         self.errors: dict[str, str] = {}
         self.search: Search | None = None
@@ -368,7 +390,26 @@ class App:
         self.results, self.errors, self.search_done, self.sel = [], {}, 0, 0
         self.editing = False
         self.detail = None
+        if q:
+            self._add_history(q)
         self.status = f'searching "{clean(q)}"' if q else "loading latest"
+
+    def _add_history(self, q: str) -> None:
+        if q in self.history:
+            self.history.remove(q)
+        self.history.append(q)
+        self.history = self.history[-HIST_MAX:]
+        save_history(self.history)
+        self.hist_idx = len(self.history)
+        self.draft = ""
+
+    def _hist(self, delta: int) -> None:
+        if not self.history:
+            return
+        if self.hist_idx == len(self.history):  # leaving the live draft
+            self.draft = self.query
+        self.hist_idx = max(0, min(self.hist_idx + delta, len(self.history)))
+        self.query = self.history[self.hist_idx] if self.hist_idx < len(self.history) else self.draft
 
     def clear(self) -> None:
         """Drop search results and return to the splash."""
@@ -489,14 +530,16 @@ class App:
                 self.editing = False
             elif k == "backspace":
                 self.query = self.query[:-1]
+                self.hist_idx = len(self.history)
             elif k == "tab":
                 self.view, self.editing = "downloads", False
             elif k == "up":
-                self._move(-1)
+                self._hist(-1)
             elif k == "down":
-                self._move(1)
+                self._hist(1)
             elif len(k) == 1 and k >= " ":
                 self.query += k
+                self.hist_idx = len(self.history)
             return
         if self.view == "search" and self.search is None and not self.editing:
             if k == "q":
@@ -507,6 +550,9 @@ class App:
                 self.submit()
             elif k in ("/", "i"):
                 self.editing = True
+            elif k == "up":
+                self.editing = True
+                self._hist(-1)
             elif len(k) == 1 and k >= " ":
                 self.editing = True
                 self.query += k
@@ -815,7 +861,8 @@ def _help_panel(width: int, height: int) -> list[str]:
     groups = [
         ("Search", [("type", "search (paste a magnet to grab)"), ("enter", "details"),
                     ("d", "download"), ("o", "open page in browser"), ("y", "copy magnet"),
-                    ("/  i", "edit query"), ("c", "clear results"), ("← →", "filter category")]),
+                    ("/  i", "edit query"), ("↑ ↓", "recall past searches"),
+                    ("c", "clear results"), ("← →", "filter category")]),
         ("Navigate", [("↑ ↓  j k", "move selection"), ("tab", "switch search / downloads")]),
         ("Downloads", [("p", "pause / resume"), ("x", "cancel / remove"),
                        ("o", "reveal in Finder"), ("s", "resume partial downloads on disk")]),
@@ -836,7 +883,7 @@ def _footer(app: App, width: int) -> str:
     elif app.detail is not None:
         hints = [("d", "download"), ("o", "page"), ("y", "copy magnet"), ("esc", "back"), ("q", "back")]
     elif app.view == "search" and app.editing:
-        hints = [("enter", "search"), ("esc", "nav"), ("tab", "downloads"), ("^c", "quit")]
+        hints = [("enter", "search"), ("↑↓", "history"), ("esc", "nav"), ("tab", "downloads"), ("^c", "quit")]
     elif app.view == "search":
         hints = [("↑↓", "move"), ("enter", "details"), ("d", "grab"), ("o", "page"), ("y", "copy"),
                  ("←→", "category"), ("/", "edit"), ("c", "clear"), ("s", "resume"), ("q", "quit")]
@@ -1117,6 +1164,25 @@ def selftest() -> None:
     appn.update_downloads([Download("g", "Movie", "complete", 100, 100, 0, 0, None, root="r1")])
     assert len(notes) == 1, "no re-notify while staying complete"
     gn["notify"] = orig_notify
+    # search history: ↑/↓ recall past queries; add dedups + moves to end + saves
+    gh = globals()
+    orig_load, orig_save, saved = gh["load_history"], gh["save_history"], []
+    gh["load_history"] = lambda: ["alpha", "beta"]
+    gh["save_history"] = lambda h: (saved.clear(), saved.extend(h))
+    apph = App(eng=None)
+    assert apph.history == ["alpha", "beta"] and apph.hist_idx == 2
+    apph.editing = True
+    apph.query = "ga"
+    apph.on_key("up")
+    assert apph.query == "beta", apph.query
+    apph.on_key("up")
+    assert apph.query == "alpha"
+    apph.on_key("down")
+    apph.on_key("down")
+    assert apph.query == "ga", apph.query  # back to the live draft
+    apph._add_history("alpha")
+    assert apph.history == ["beta", "alpha"] and saved == ["beta", "alpha"], (apph.history, saved)
+    gh["load_history"], gh["save_history"] = orig_load, orig_save
     print("interaction ok")
 
     # render: search nav, downloads, help — sized lines, no overflow, no crash
