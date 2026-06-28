@@ -13,7 +13,7 @@ class Trawl < Formula
     (bin/"trawl").write <<~SH
       #!/bin/sh
       export PYTHONPATH="#{libexec}:$PYTHONPATH"
-      exec "#{Formula["python@3.14"].opt_bin}/python3.14" -m trawl "$@"
+      exec "#{formula_opt_bin("python@3.14")}/python3.14" -m trawl "$@"
     SH
   end
 
