@@ -1,5 +1,9 @@
 # Trawl — Project Plan
 
+> This is the **original design plan**. Some details evolved during build (e.g.
+> resume is now triggered by `s` rather than on launch, and several "deferred"
+> items shipped). See [README](README.md) for the current feature set.
+
 A torrent finder that lives in the terminal: one search trawls a curated list of
 sources at once, you pick a result, and **aria2** downloads it. A native-feeling
 single command (`trawl`) — no Node, no `npx`, no install step. Looks and acts like
