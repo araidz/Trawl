@@ -39,8 +39,8 @@ TRACK = "░"
 
 # trawl wordmark (2-row half-block; gradient applied at render time)
 LOGO_LINES: list[str] = [
-    "▀█▀ █▀▄ ▄▀▄ █ █ █  ",
-    " █  █▀▄ █▀█ ▀▄▀ █▄▄",
+    "▀█▀ █▀▄ ▄▀▄ █ ▄ █ █  ",
+    " █  █▀▄ █▀█ ▀▄▀▄▀ █▄▄",
 ]
 
 # -- per-source tag + color (torlink SOURCE_STYLE) ---------------------------

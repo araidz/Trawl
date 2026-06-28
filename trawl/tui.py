@@ -489,21 +489,21 @@ def _rail(app: App, h: int) -> list[str]:
     return (lines + [cell("", RAIL_W)] * h)[:h]
 
 
-def _search_panel(app: App, width: int) -> list[str]:
-    inner_w = width - 4
+def _search_line(app: App, inner_w: int) -> str:
     editing = app.view == "search" and app.editing
     prompt = style(T.PTR + " ", T.ACCENT)
     if app.query:
         text = dtrunc(app.query, inner_w - 3)
-        shown = style(text, T.TEXT)
         cur = style("█", T.ACCENT) if editing else ""
-        line = prompt + shown + cur
-        line = line + " " * max(0, inner_w - 2 - dwidth(text) - (1 if editing else 0))
-    else:
-        ph = dtrunc("Search or paste a magnet link…", inner_w - 2)
-        line = prompt + style(ph, dim=True)
-        line = line + " " * max(0, inner_w - 2 - dwidth(ph))
-    return _wrap_panel("search", [line], width, 3, editing)
+        line = prompt + style(text, T.TEXT) + cur
+        return line + " " * max(0, inner_w - 2 - dwidth(text) - (1 if editing else 0))
+    ph = dtrunc("Search or paste a magnet link…", inner_w - 2)
+    return prompt + style(ph, dim=True) + " " * max(0, inner_w - 2 - dwidth(ph))
+
+
+def _search_panel(app: App, width: int) -> list[str]:
+    editing = app.view == "search" and app.editing
+    return _wrap_panel("Search", [_search_line(app, width - 4)], width, 3, editing)
 
 
 def _status_line(app: App, results: list[Result], inner_w: int) -> str:
@@ -548,7 +548,7 @@ def _results_panel(app: App, width: int, height: int) -> list[str]:
                 + cell(fmt_bytes(r.size), 9, "right", dim=True) + " "
                 + cell(sl, 9, "right", color=T.GOOD if r.seeders else None, dim=not r.seeders) + " "
                 + cell(tag, 5, "right", color=tcolor, dim=not here))
-    title = "latest" if (app.search is not None and not app.query.strip()) else "results"
+    title = "Latest" if (app.search is not None and not app.query.strip()) else "Results"
     count = f"({len(results)})" if results else None
     return _wrap_panel(title, inner, width, height, app.view == "search" and not app.editing, count)
 
@@ -594,8 +594,8 @@ def _downloads_panel(app: App, width: int, height: int) -> list[str]:
             bar = render_bar(d.progress, inner_w - 2, app.tick, animate, base)
             inner.append("  " + bar)
     n = len(app.downloads)
-    return _wrap_panel("downloads", inner, width, height, app.view == "downloads",
-                       f"({n})" if n else None)
+    return _wrap_panel("Downloads", inner, width, height, app.view == "downloads",
+                           f"({n})" if n else None)
 
 
 def _help_panel(width: int, height: int) -> list[str]:
@@ -614,7 +614,7 @@ def _help_panel(width: int, height: int) -> list[str]:
         for keys, desc in items:
             inner.append("  " + cell(keys, 12, color=T.BRIGHT) + " " + cell(desc, inner_w - 15, dim=True))
         inner.append(cell("", inner_w))
-    return _wrap_panel("help", inner, width, height, True)
+    return _wrap_panel("Help", inner, width, height, True)
 
 
 def _footer(app: App, width: int) -> str:
@@ -647,13 +647,46 @@ def _footer(app: App, width: int) -> str:
     return out
 
 
+TAGLINE = "A curated, terminal-native torrent finder."
+CATS_LINE = "games  ·  movies  ·  tv  ·  anime"
+
+
+def _center(line: str, plain_w: int, cols: int) -> str:
+    return " " * max(0, (cols - plain_w) // 2) + line
+
+
+def _splash(app: App, cols: int, rows: int) -> list[str]:
+    """torlink's calm welcome: centered gradient logo, tagline, search box, hints."""
+    logo_w = max(dwidth(s) for s in T.LOGO_LINES)
+    left = max(0, (cols - logo_w) // 2)
+    block = [" " * left + L for L in _logo_lines()]
+    block += ["", _center(style(TAGLINE, T.TEXT), dwidth(TAGLINE), cols),
+              _center(style(CATS_LINE, dim=True), dwidth(CATS_LINE), cols), ""]
+    box_w = min(64, cols - 8)
+    editing = app.view == "search" and app.editing
+    box = _wrap_panel("Search", [_search_line(app, box_w - 4)], box_w, 3, editing)
+    bleft = max(0, (cols - box_w) // 2)
+    block += [" " * bleft + b for b in box]
+    parts, plain = [], 0
+    for i, (k, v) in enumerate([("↵", "search"), ("↵", "browse"), ("^c", "quit")]):
+        if i:
+            parts.append(style("   ", dim=True))
+            plain += 3
+        parts.append(style(k, T.ALT) + style(" " + v, dim=True))
+        plain += dwidth(k) + 1 + dwidth(v)
+    block += ["", _center("".join(parts), plain, cols)]
+    top = max(0, (rows - len(block)) // 2)
+    return ([""] * top + block + [""] * rows)[:rows]
+
 def render(app: App, cols: int, rows: int) -> list[str]:
     cols = max(40, cols)
     rows = max(12, rows)
+    if app.view == "search" and app.search is None and not app.help:
+        return _splash(app, cols, rows)
     lines: list[str] = []
     for L in _logo_lines():
         lines.append(" " * MARGIN + L)
-    lines.append("")
+    lines.append(" " * MARGIN + style("─" * max(0, cols - 2 * MARGIN), T.RULE))
 
     header_h = len(T.LOGO_LINES) + 1
     footer_h = 2
@@ -751,6 +784,17 @@ def selftest() -> None:
     f = "\n".join(strip_ansi(x) for x in render(app2, 100, 30))
     assert "Active.Movie.mkv" in f and "fetching metadata" in f, "downloads view"
     assert "█" in f or "░" in f, "no progress bar"
+    # splash: fresh app (no search yet) shows the centered welcome
+    app3 = App(eng=None)
+    for cols, rows in [(100, 30), (80, 24), (140, 50)]:
+        frame = render(app3, cols, rows)
+        assert len(frame) == rows
+        for ln in frame:
+            assert dwidth(strip_ansi(ln)) <= cols, f"splash overflow: {strip_ansi(ln)!r}"
+    sf = "\n".join(strip_ansi(x) for x in render(app3, 100, 30))
+    assert "terminal-native" in sf and "games" in sf and "Search" in sf, "splash content"
+    app3.search = Search.__new__(Search)  # once searched, splash gives way to browse
+    assert "terminal-native" not in "\n".join(strip_ansi(x) for x in render(app3, 100, 30))
     print("render ok")
     print("\nPhase 3 selftest passed.")
 
