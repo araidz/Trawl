@@ -24,8 +24,7 @@ import unicodedata
 
 from . import theme as T
 from .aria2 import STATE_DIR, Aria2Error, Download, control_infohash
-from .sources import (SOURCES, Result, Search, build_magnet, dedupe, parse_magnet,
-                      sort_results)
+from .sources import (SOURCES, Result, Search, build_magnet, dedupe, parse_magnet)
 
 GROUP_OF = {s.id: s.group for s in SOURCES}
 CATS = [("all", "All"), ("games", "Games"), ("movies", "Movies"),
@@ -186,6 +185,13 @@ def copy_clipboard(text: str) -> bool:
         return False
 
 
+def paste_clipboard() -> str:
+    try:
+        return subprocess.run(["pbpaste"], capture_output=True, text=True, timeout=2).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
 def reveal(path: str) -> bool:
     # reveal a file in Finder, or open a directory
     args = ["open", "-R", path] if os.path.isfile(path) else ["open", path]
@@ -258,7 +264,19 @@ def parse_keys(data: bytes) -> list[str]:
     while i < n:
         b = data[i]
         if b == 0x1b:
-            if i + 2 < n and data[i + 1] in (ord("["), ord("O")) and bytes([data[i + 2]]) in _ARROWS:
+            if data[i:i + 3] == b"\x1b[<":  # SGR mouse: \x1b[<btn;x;y(M|m)
+                j = i + 3
+                while j < n and data[j] not in (ord("M"), ord("m")):
+                    j += 1
+                parts = data[i + 3:j].split(b";")
+                if parts and parts[0].isdigit():
+                    btn = int(parts[0])
+                    if btn == 64:  # wheel up
+                        keys.append("up")
+                    elif btn == 65:  # wheel down
+                        keys.append("down")
+                i = j + 1
+            elif i + 2 < n and data[i + 1] in (ord("["), ord("O")) and bytes([data[i + 2]]) in _ARROWS:
                 keys.append(_ARROWS[bytes([data[i + 2]])])
                 i += 3
             else:
@@ -298,12 +316,12 @@ class Terminal:
     def enter(self) -> None:
         self.saved = termios.tcgetattr(self.fd)
         tty.setraw(self.fd)
-        # alt-screen + clear screen & scrollback so trawl owns the whole tab
-        sys.stdout.write("\x1b[?1049h\x1b[3J\x1b[2J\x1b[H\x1b[?25l")
+        # alt-screen + clear + SGR mouse reporting; trawl owns the whole tab
+        sys.stdout.write("\x1b[?1049h\x1b[3J\x1b[2J\x1b[H\x1b[?25l\x1b[?1000h\x1b[?1006h")
         sys.stdout.flush()
 
     def leave(self) -> None:
-        sys.stdout.write("\x1b[?25h\x1b[?1049l")
+        sys.stdout.write("\x1b[?1000l\x1b[?1006l\x1b[?25h\x1b[?1049l")
         sys.stdout.flush()
         if self.saved:
             termios.tcsetattr(self.fd, termios.TCSADRAIN, self.saved)
@@ -352,6 +370,7 @@ class App:
         self.search_total = len(SOURCES)
         self.sel = 0
         self.cat = "all"
+        self.sort = "seeders"  # seeders | size | newest
         self.downloads: list[Download] = []
         self.dsel = 0
         self.down_speed = 0  # aria2 global download speed (bytes/s)
@@ -468,8 +487,24 @@ class App:
             else:
                 self.results.extend(u.results)
         if changed:
-            self.results = sort_results(dedupe(self.results))
+            self.results = self._apply_sort(dedupe(self.results))
             self.sel = min(self.sel, max(0, len(self.visible_results()) - 1))
+
+    def _apply_sort(self, results: list[Result]) -> list[Result]:
+        if self.sort == "size":
+            key = lambda r: (r.size, r.seeders)
+        elif self.sort == "newest":
+            key = lambda r: (r.added or 0, r.seeders)
+        else:
+            key = lambda r: (r.seeders, r.added or 0)
+        return sorted(results, key=key, reverse=True)
+
+    def _cycle_sort(self) -> None:
+        order = ["seeders", "size", "newest"]
+        self.sort = order[(order.index(self.sort) + 1) % len(order)]
+        self.results = self._apply_sort(self.results)
+        self.sel = 0
+        self.status = f"sorted by {self.sort}"
 
     def update_downloads(self, downloads: list[Download]) -> None:
         """Replace the download list, notifying on any active->complete transition
@@ -571,6 +606,12 @@ class App:
                            else "nothing to resume on disk")
             if n:
                 self.view = "downloads"
+        elif k == "v":
+            pm = parse_magnet(paste_clipboard())
+            if pm:
+                self.grab(pm.magnet, pm.name)
+            else:
+                self.status = "no magnet in clipboard"
         elif k in ("up", "k"):
             self._move(-1)
         elif k in ("down", "j"):
@@ -584,6 +625,8 @@ class App:
                 self.editing = True
             elif k == "c":
                 self.clear()
+            elif k == "S":
+                self._cycle_sort()
             elif k == "d":
                 rs = self.visible_results()
                 if rs and 0 <= self.sel < len(rs):
@@ -808,7 +851,8 @@ def _results_panel(app: App, width: int, height: int) -> list[str]:
                     + cell(fmt_bytes(r.size), 9, "right", dim=True) + " "
                     + cell(sl, 9, "right", color=T.GOOD if r.seeders else None, dim=not r.seeders) + " "
                     + cell(tag, 5, "right", color=tcolor, dim=True))
-    title = "Latest" if (app.search is not None and not app.query.strip()) else "Results"
+    base = "Latest" if (app.search is not None and not app.query.strip()) else "Results"
+    title = f"{base} · {app.sort}" if results else base
     count = f"({len(results)})" if results else None
     return _wrap_panel(title, inner, width, height, app.view == "search" and not app.editing, count)
 
@@ -862,8 +906,10 @@ def _help_panel(width: int, height: int) -> list[str]:
         ("Search", [("type", "search (paste a magnet to grab)"), ("enter", "details"),
                     ("d", "download"), ("o", "open page in browser"), ("y", "copy magnet"),
                     ("/  i", "edit query"), ("↑ ↓", "recall past searches"),
-                    ("c", "clear results"), ("← →", "filter category")]),
-        ("Navigate", [("↑ ↓  j k", "move selection"), ("tab", "switch search / downloads")]),
+                    ("S", "cycle sort (seeders/size/newest)"), ("c", "clear results"),
+                    ("← →", "filter category"), ("v", "grab magnet from clipboard")]),
+        ("Navigate", [("↑ ↓  j k", "move selection / scroll wheel"),
+                      ("tab", "switch search / downloads")]),
         ("Downloads", [("p", "pause / resume"), ("x", "cancel / remove"),
                        ("o", "reveal in Finder"), ("s", "resume partial downloads on disk")]),
         ("General", [("?", "this help"), ("q", "quit (confirm)"), ("ctrl-c", "quit now")]),
@@ -886,7 +932,8 @@ def _footer(app: App, width: int) -> str:
         hints = [("enter", "search"), ("↑↓", "history"), ("esc", "nav"), ("tab", "downloads"), ("^c", "quit")]
     elif app.view == "search":
         hints = [("↑↓", "move"), ("enter", "details"), ("d", "grab"), ("o", "page"), ("y", "copy"),
-                 ("←→", "category"), ("/", "edit"), ("c", "clear"), ("s", "resume"), ("q", "quit")]
+                 ("S", "sort"), ("←→", "category"), ("v", "paste"), ("c", "clear"), ("s", "resume"),
+                 ("q", "quit")]
     else:
         hints = [("↑↓", "move"), ("p", "pause/resume"), ("x", "cancel"), ("o", "reveal"),
                  ("s", "resume"), ("tab", "search"), ("?", "keys"), ("q", "quit")]
@@ -1036,6 +1083,10 @@ def selftest() -> None:
     assert parse_keys(b"\x1b[A") == ["up"]
     assert parse_keys(b"ab\r\x7f\t\x03") == ["a", "b", "enter", "backspace", "tab", "ctrl-c"]
     assert parse_keys("café".encode()) == ["c", "a", "f", "é"]
+    assert parse_keys(b"\x1b[<64;10;5M") == ["up"], "wheel up"
+    assert parse_keys(b"\x1b[<65;10;5M") == ["down"], "wheel down"
+    assert parse_keys(b"\x1b[<0;1;1M") == [], "click ignored, sequence consumed"
+    assert parse_keys(b"a\x1b[<64;1;1Mb") == ["a", "up", "b"], "mouse mid-stream"
     print("primitives ok")
 
     # interaction: edit -> type -> submit -> nav -> tab -> downloads
@@ -1183,6 +1234,34 @@ def selftest() -> None:
     apph._add_history("alpha")
     assert apph.history == ["beta", "alpha"] and saved == ["beta", "alpha"], (apph.history, saved)
     gh["load_history"], gh["save_history"] = orig_load, orig_save
+    # sort toggle (S) cycles seeders -> size -> newest and reorders
+    appso = App(eng=None)
+    appso.search = Search.__new__(Search)
+    appso.editing = False
+    appso.results = [Result("1" + "x" * 39, "small-many", 1, 99, 0, "yts", "m"),
+                     Result("2" + "x" * 39, "huge-few", 9_000_000_000, 1, 0, "yts", "m")]
+    assert appso.sort == "seeders"
+    appso.on_key("S")
+    assert appso.sort == "size" and appso.results[0].name == "huge-few", appso.sort
+    appso.on_key("S")
+    assert appso.sort == "newest"
+    appso.on_key("S")
+    assert appso.sort == "seeders" and appso.results[0].name == "small-many"
+    # clipboard grab (v): a magnet on the clipboard gets grabbed
+    gp = globals()
+    orig_paste = gp["paste_clipboard"]
+    gp["paste_clipboard"] = lambda: "magnet:?xt=urn:btih:" + "a" * 40
+    appv = App(eng=None)
+    appv.search = Search.__new__(Search)
+    appv.editing = False
+    got = {}
+    appv.grab = lambda m, n: got.update(m=m)  # type: ignore
+    appv.on_key("v")
+    assert got.get("m", "").startswith("magnet:?"), got
+    gp["paste_clipboard"] = lambda: "not a magnet"
+    appv.on_key("v")
+    assert appv.status == "no magnet in clipboard", appv.status
+    gp["paste_clipboard"] = orig_paste
     print("interaction ok")
 
     # render: search nav, downloads, help — sized lines, no overflow, no crash
