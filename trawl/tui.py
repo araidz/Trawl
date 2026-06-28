@@ -28,7 +28,7 @@ CATS = [("all", "All"), ("games", "Games"), ("movies", "Movies"),
         ("tv", "TV"), ("anime", "Anime")]
 CAT_GROUP = {"games": "Games", "movies": "Movies", "tv": "TV", "anime": "Anime"}
 
-RAIL_W = 13
+RAIL_W = 16  # fits "Downloads (NN)"
 MARGIN = 2
 GAP = 2
 
@@ -281,7 +281,7 @@ class App:
     def __init__(self, eng=None):
         self.eng = eng
         self.view = "search"  # search | downloads
-        self.editing = True
+        self.editing = False  # splash is a landing (q quits); typing/"/" starts editing
         self.query = ""
         self.results: list[Result] = []
         self.errors: dict[str, str] = {}
@@ -325,6 +325,14 @@ class App:
         self.results, self.errors, self.search_done, self.sel = [], {}, 0, 0
         self.editing = False
         self.status = f'searching "{clean(q)}"' if q else "loading latest"
+
+    def clear(self) -> None:
+        """Drop search results and return to the splash."""
+        self.search = None
+        self.results, self.errors, self.search_done, self.sel = [], {}, 0, 0
+        self.query = ""
+        self.editing = False
+        self.status = ""
 
     def grab(self, magnet: str, name: str) -> None:
         if not self.eng:
@@ -397,6 +405,19 @@ class App:
             elif len(k) == 1 and k >= " ":
                 self.query += k
             return
+        if self.view == "search" and self.search is None and not self.editing:
+            if k == "q":
+                self.confirm_quit = True
+            elif k == "tab":
+                self.view = "downloads"
+            elif k == "enter":
+                self.submit()
+            elif k in ("/", "i"):
+                self.editing = True
+            elif len(k) == 1 and k >= " ":
+                self.editing = True
+                self.query += k
+            return
         # nav (results) / downloads
         if k == "q":
             self.confirm_quit = True
@@ -415,17 +436,30 @@ class App:
                 self._cycle_cat(1)
             elif k in ("/", "i"):
                 self.editing = True
+            elif k == "c":
+                self.clear()
             elif k in ("d", "enter"):
                 rs = self.visible_results()
                 if rs and 0 <= self.sel < len(rs):
                     self.grab(rs[self.sel].magnet, rs[self.sel].name)
         elif self.view == "downloads":
-            if k == "x" and self.downloads and 0 <= self.dsel < len(self.downloads):
-                d = self.downloads[self.dsel]
+            if not self.downloads or not (0 <= self.dsel < len(self.downloads)):
+                return
+            d = self.downloads[self.dsel]
+            if k == "x":
                 if self.eng:
                     self.eng.remove(d.root)
-                self.status = f"removed: {clean(d.name)[:40]}"
+                self.status = f"cancelled: {clean(d.name)[:40]}"
                 self.dsel = max(0, self.dsel - 1)
+            elif k == "p":
+                if d.status == "paused":
+                    if self.eng:
+                        self.eng.resume(d.root)
+                    self.status = f"resumed: {clean(d.name)[:40]}"
+                else:
+                    if self.eng:
+                        self.eng.pause(d.root)
+                    self.status = f"paused: {clean(d.name)[:40]}"
 
 
 # -- rendering ---------------------------------------------------------------
@@ -551,13 +585,20 @@ def _results_panel(app: App, width: int, height: int) -> list[str]:
             here = idx == app.sel
             tag, tcolor = T.source_style(r.source)
             sl = f"{r.seeders}:{r.leechers}" if (r.seeders or r.leechers) else "-"
-            ptr = cell(T.PTR if here else "", 2, color=T.ACCENT)
-            inner.append(
-                ptr + " "
-                + cell(clean(r.name), name_w, color=T.ACCENT if here else None, bold=here, dim=not here) + " "
-                + cell(fmt_bytes(r.size), 9, "right", dim=True) + " "
-                + cell(sl, 9, "right", color=T.GOOD if r.seeders else None, dim=not r.seeders) + " "
-                + cell(tag, 5, "right", color=tcolor, dim=not here))
+            if here:  # selected row: the whole line lights up in accent
+                inner.append(
+                    cell(T.PTR, 2, color=T.ACCENT) + " "
+                    + cell(clean(r.name), name_w, color=T.ACCENT, bold=True) + " "
+                    + cell(fmt_bytes(r.size), 9, "right", color=T.ACCENT, bold=True) + " "
+                    + cell(sl, 9, "right", color=T.ACCENT, bold=True) + " "
+                    + cell(tag, 5, "right", color=T.ACCENT, bold=True))
+            else:
+                inner.append(
+                    cell("", 2) + " "
+                    + cell(clean(r.name), name_w, dim=True) + " "
+                    + cell(fmt_bytes(r.size), 9, "right", dim=True) + " "
+                    + cell(sl, 9, "right", color=T.GOOD if r.seeders else None, dim=not r.seeders) + " "
+                    + cell(tag, 5, "right", color=tcolor, dim=True))
     title = "Latest" if (app.search is not None and not app.query.strip()) else "Results"
     count = f"({len(results)})" if results else None
     return _wrap_panel(title, inner, width, height, app.view == "search" and not app.editing, count)
@@ -570,39 +611,37 @@ def _downloads_panel(app: App, width: int, height: int) -> list[str]:
         inner.append(cell("No downloads yet. Find something and press d to grab it.", inner_w, dim=True))
     else:
         app.dsel = min(app.dsel, len(app.downloads) - 1)
-        per = 2
+        per = 3  # name line, bar line, blank spacer
         list_h = max(1, (height - 2) // per)
         start = _window(app.dsel, len(app.downloads), list_h)
         for idx in range(start, min(start + list_h, len(app.downloads))):
             d = app.downloads[idx]
             here = idx == app.dsel
-            if d.status == "error":
-                icon, ic = T.ERR, T.BAD
-            elif d.status == "complete":
-                icon, ic = T.DONE, T.GOOD
-            else:
-                icon, ic = T.DOWN, T.ACCENT
             pct = int(d.progress * 100)
-            if d.status == "active":
-                stats = f"{pct}%  {fmt_speed(d.speed)}  {T.PEER}{d.peers}" + (f"  {fmt_eta(d.eta)}" if d.eta else "")
-            elif d.status == "metadata":
-                stats = "fetching metadata…"
-            elif d.status == "complete":
-                stats = "done"
-            elif d.status == "error":
+            if d.status == "error":
+                icon, ic, base = T.ERR, T.BAD, T.BAD
                 stats = dtrunc(d.error or "failed", 28)
-            else:
-                stats = d.status
-            stat_w = min(len(stats) + 1, inner_w - 6)
+            elif d.status == "complete":
+                icon, ic, base = T.DONE, T.GOOD, T.GOOD
+                stats = "done"
+            elif d.status == "paused":
+                icon, ic, base = T.PAUSE, T.PAUSED, T.PAUSED
+                stats = f"paused  {pct}%"
+            elif d.status == "metadata":
+                icon, ic, base = T.DOWN, T.ACCENT, T.ACCENT
+                stats = "fetching metadata…"
+            else:  # active / waiting
+                icon, ic, base = T.DOWN, T.ACCENT, T.ACCENT
+                stats = f"{pct}%  {fmt_speed(d.speed)}  {T.PEER}{d.peers}" + (f"  {fmt_eta(d.eta)}" if d.eta else "")
+            stat_w = min(dwidth(stats) + 1, inner_w - 6)
             name_w = inner_w - 2 - stat_w
             inner.append(
                 cell(icon, 2, color=ic) + cell(clean(d.name) or "…", name_w,
                                                color=T.ACCENT if here else None, bold=here, dim=not here)
                 + cell(stats, stat_w, "right", dim=True))
             animate = d.status in ("active", "metadata")
-            base = T.GOOD if d.status == "complete" else (T.BAD if d.status == "error" else T.ACCENT)
-            bar = render_bar(d.progress, inner_w - 2, app.tick, animate, base)
-            inner.append("  " + bar)
+            inner.append("  " + render_bar(d.progress, inner_w - 2, app.tick, animate, base))
+            inner.append(cell("", inner_w))  # spacer between entries
     n = len(app.downloads)
     return _wrap_panel("Downloads", inner, width, height, app.view == "downloads",
                            f"({n})" if n else None)
@@ -611,12 +650,12 @@ def _downloads_panel(app: App, width: int, height: int) -> list[str]:
 def _help_panel(width: int, height: int) -> list[str]:
     inner_w = width - 4
     groups = [
-        ("Search", [("type", "edit query"), ("enter", "run search / grab magnet"),
-                    ("esc", "leave edit"), ("/  i", "edit query")]),
-        ("Navigate", [("↑ ↓  j k", "move selection"), ("← →", "filter category"),
-                      ("tab", "switch search / downloads")]),
-        ("Actions", [("d  enter", "download selected"), ("x", "remove download")]),
-        ("General", [("?", "this help"), ("q", "quit"), ("ctrl-c", "quit")]),
+        ("Search", [("type", "search (paste a magnet to grab)"), ("enter", "run search"),
+                    ("/  i", "edit query"), ("c", "clear results"), ("← →", "filter category")]),
+        ("Navigate", [("↑ ↓  j k", "move selection"), ("tab", "switch search / downloads")]),
+        ("Downloads", [("d  enter", "download selected"), ("p", "pause / resume"),
+                       ("x", "cancel / remove")]),
+        ("General", [("?", "this help"), ("q", "quit (confirm)"), ("ctrl-c", "quit now")]),
     ]
     inner = [cell("Keys", inner_w, color=T.ACCENT, bold=True), cell("", inner_w)]
     for title, items in groups:
@@ -634,9 +673,10 @@ def _footer(app: App, width: int) -> str:
         hints = [("enter", "search"), ("esc", "nav"), ("tab", "downloads"), ("^c", "quit")]
     elif app.view == "search":
         hints = [("↑↓", "move"), ("d", "grab"), ("←→", "category"), ("/", "edit"),
-                 ("tab", "downloads"), ("?", "keys"), ("q", "quit")]
+                 ("c", "clear"), ("tab", "downloads"), ("?", "keys"), ("q", "quit")]
     else:
-        hints = [("↑↓", "move"), ("x", "remove"), ("tab", "search"), ("?", "keys"), ("q", "quit")]
+        hints = [("↑↓", "move"), ("p", "pause/resume"), ("x", "cancel"),
+                 ("tab", "search"), ("?", "keys"), ("q", "quit")]
     out, used = "", 0
     if app.status:
         st = dtrunc(clean(app.status), max(10, width // 2))
@@ -677,8 +717,12 @@ def _splash(app: App, cols: int, rows: int) -> list[str]:
     box = _wrap_panel("Search", [_search_line(app, box_w - 4)], box_w, 3, editing)
     bleft = max(0, (cols - box_w) // 2)
     block += [" " * bleft + b for b in box]
+    if editing:
+        hints = [("↵", "search"), ("esc", "back"), ("tab", "downloads")]
+    else:
+        hints = [("type", "to search"), ("↵", "browse"), ("q", "quit")]
     parts, plain = [], 0
-    for i, (k, v) in enumerate([("↵", "search"), ("↵", "browse"), ("^c", "quit")]):
+    for i, (k, v) in enumerate(hints):
         if i:
             parts.append(style("   ", dim=True))
             plain += 3
@@ -769,12 +813,18 @@ def selftest() -> None:
 
     # interaction: edit -> type -> submit -> nav -> tab -> downloads
     app = App(eng=None)
-    assert app.view == "search" and app.editing
+    assert app.view == "search" and not app.editing and app.search is None, "splash landing"
+    app.on_key("q")
+    assert app.confirm_quit, "q quits on the splash landing"
+    app.on_key("esc")
+    assert not app.confirm_quit
     for ch in "matrix":
         app.on_key(ch)
-    assert app.query == "matrix", app.query
+    assert app.query == "matrix" and app.editing, "typing starts editing"
     app.on_key("backspace")
     assert app.query == "matri"
+    app.search = Search.__new__(Search)  # simulate a completed search -> browse nav
+    app.search_done = app.search_total
     app.results = [
         Result("a" * 40, "The Matrix 1999 [1080p]", 1_500_000_000, 900, 30, "yts", "magnet:?xt=m"),
         Result("b" * 40, "The Matrix Reloaded", 2_000_000_000, 0, 0, "fitgirl", "magnet:?xt=m"),
@@ -786,8 +836,10 @@ def selftest() -> None:
     app.grab = lambda m, name: grabbed.update(name=name)  # type: ignore
     app.on_key("d")
     assert grabbed.get("name") == "The Matrix Reloaded", grabbed
-    app.on_key("right")  # cycle category off "all"
+    app.on_key("right")
     assert app.cat == "games", app.cat
+    app.on_key("c")  # clear -> back to splash landing
+    assert app.search is None and app.results == [] and not app.editing, "c clears to splash"
     app.on_key("tab")
     assert app.view == "downloads"
     # quit confirmation: q arms it, esc cancels, q+enter quits; ^c is immediate
@@ -803,6 +855,24 @@ def selftest() -> None:
     appq.running = True
     appq.on_key("ctrl-c")
     assert not appq.running, "ctrl-c quits immediately"
+    # downloads: p toggles pause/resume, x cancels — all routed to the engine
+    calls = []
+
+    class _FakeEng:
+        def pause(self, r): calls.append(("pause", r))
+        def resume(self, r): calls.append(("resume", r))
+        def remove(self, r): calls.append(("remove", r))
+
+    appd = App(eng=_FakeEng())
+    appd.view = "downloads"
+    appd.downloads = [Download("g", "F", "active", 100, 10, 5, 1, None, root="r1")]
+    appd.on_key("p")
+    assert calls == [("pause", "r1")], calls
+    appd.downloads[0].status = "paused"
+    appd.on_key("p")
+    assert calls[-1] == ("resume", "r1"), calls
+    appd.on_key("x")
+    assert calls[-1] == ("remove", "r1"), calls
     print("interaction ok")
 
     # render: search nav, downloads, help — sized lines, no overflow, no crash
@@ -816,6 +886,8 @@ def selftest() -> None:
         Download("g1", "Active.Movie.mkv", "active", 100, 42, 2_500_000, 12, 90.0, root="r1"),
         Download("g2", "Done.Movie.mkv", "complete", 100, 100, 0, 0, None, root="r2"),
         Download("g3", "meta", "metadata", 0, 0, 0, 0, None, root="r3"),
+        Download("g4", "Paused.Movie.mkv", "paused", 100, 60, 0, 4, None, root="r4"),
+        Download("g5", "Bad.Movie.mkv", "error", 100, 5, 0, 0, None, error="no peers", root="r5"),
     ]
     for cols, rows in [(100, 30), (80, 24), (140, 50)]:
         for view, help_ in [("search", False), ("downloads", False), ("search", True)]:

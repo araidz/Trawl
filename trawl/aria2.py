@@ -177,6 +177,19 @@ class Aria2:
             self.roots.remove(root)
         self._resolved.pop(root, None)
 
+    def pause(self, root: str) -> None:
+        # forcePause stops a BT download immediately (no tracker round-trip)
+        try:
+            self._call("aria2.forcePause", [self._resolved.get(root, root)])
+        except Aria2Error:
+            pass
+
+    def resume(self, root: str) -> None:
+        try:
+            self._call("aria2.unpause", [self._resolved.get(root, root)])
+        except Aria2Error:
+            pass
+
     def global_stat(self) -> dict:
         return self._call("aria2.getGlobalStat")
 
