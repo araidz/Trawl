@@ -53,6 +53,7 @@ class Result:
     added: int | None = None
     num_files: int | None = None
     page: str | None = None  # the torrent's web page, to open in a browser
+    group: str | None = None  # per-result category (aggregators span groups)
 
 
 @dataclass(frozen=True)
@@ -81,7 +82,7 @@ class SourceUpdate:
 
 
 def fetch(url: str, retries: int = 1, timeout: float = 15.0,
-          headers: dict | None = None) -> str:
+          headers: dict | None = None, data: bytes | None = None) -> str:
     h = {"User-Agent": UA, "Accept": "*/*"}
     if headers:
         h.update(headers)
@@ -89,7 +90,7 @@ def fetch(url: str, retries: int = 1, timeout: float = 15.0,
     for attempt in range(retries + 1):
         try:
             with urllib.request.urlopen(
-                urllib.request.Request(url, headers=h), timeout=timeout
+                urllib.request.Request(url, headers=h, data=data), timeout=timeout
             ) as resp:
                 return resp.read().decode("utf-8", "replace")
         except urllib.error.HTTPError as e:
@@ -345,10 +346,10 @@ def _subsplease(query: str) -> list[Result]:
 # -- sources: RSS ------------------------------------------------------------
 
 
-def _fitgirl(query: str) -> list[Result]:
+def _wordpress_repacks(home: str, source: str, query: str) -> list[Result]:
+    """WordPress repack sites (FitGirl, DODI): magnet links live in the RSS items."""
     q = query.strip()
-    url = (f"https://fitgirl-repacks.site/?s={urllib.parse.quote(q)}&feed=rss2"
-           if q else "https://fitgirl-repacks.site/feed/")
+    url = f"{home}/?s={urllib.parse.quote(q)}&feed=rss2" if q else f"{home}/feed/"
     out = []
     for item in _rss_items(fetch(url)):
         m = re.search(r'href="(magnet:\?xt=urn:btih:[^"]+)"', item, re.I)
@@ -359,9 +360,17 @@ def _fitgirl(query: str) -> list[Result]:
         if not hm:
             continue
         name = html.unescape(_tag(item, "title") or "Unknown Title")
-        out.append(Result(hm.group(1).lower(), name, 0, 0, 0, "fitgirl", magnet,
+        out.append(Result(normalize_info_hash(hm.group(1)), name, 0, 0, 0, source, magnet,
                           _rfc822_unix(_tag(item, "pubDate")), page=_tag(item, "link") or None))
     return out
+
+
+def _fitgirl(query: str) -> list[Result]:
+    return _wordpress_repacks("https://fitgirl-repacks.site", "fitgirl", query)
+
+
+def _dodi(query: str) -> list[Result]:
+    return _wordpress_repacks("https://dodi-repacks.site", "dodi", query)
 
 
 def _nyaa(query: str) -> list[Result]:
@@ -456,10 +465,114 @@ def _x1337(query: str, cat: str, source: str) -> list[Result]:
     return out
 
 
+# -- sources: aggregators ----------------------------------------------------
+
+_KNABEN_API = "https://api.knaben.eu/v1"
+
+
+def _knaben_group(category: str | None) -> str | None:
+    c = category or ""
+    if c.startswith("XXX"):
+        return "SKIP"
+    for token in ("Anime", "Movies", "TV", "Games"):
+        if token in c:
+            return token
+    return None
+
+
+def _knaben(query: str) -> list[Result]:
+    q = query.strip()
+    if not q:  # meta-aggregator: search only, no browse
+        return []
+    payload = json.dumps({"query": q, "search_type": "score", "size": 100,
+                          "hide_unsafe": True, "hide_xxx": True}).encode()
+    data = fetch_json(_KNABEN_API, data=payload, headers={"Content-Type": "application/json"})
+    out = []
+    for h in data.get("hits") or []:
+        ih = (h.get("hash") or "").lower()
+        if not re.fullmatch(r"[a-f0-9]{40}", ih):
+            continue
+        grp = _knaben_group(h.get("category"))
+        if grp == "SKIP":  # drop XXX
+            continue
+        name = h.get("title") or "Unknown"
+        out.append(Result(ih, name, _int(h.get("bytes")), _int(h.get("seeders")),
+                          _int(h.get("peers")), "knaben",
+                          h.get("magnetUrl") or build_magnet(ih, name),
+                          _iso_unix(h.get("date")), page=h.get("details"), group=grp))
+    return out
+
+
+def _animetosho(query: str) -> list[Result]:
+    params = {"only_tor": "1"}
+    if query.strip():
+        params["q"] = query.strip()
+    data = fetch_json(f"https://feed.animetosho.org/json?{urllib.parse.urlencode(params)}")
+    if not isinstance(data, list):
+        return []
+    out = []
+    for a in data:
+        ih = (a.get("info_hash") or "").lower()
+        if not ih:
+            continue
+        name = a.get("title") or "Unknown"
+        nf = _int(a.get("num_files"))
+        out.append(Result(ih, name, _int(a.get("total_size")), _int(a.get("seeders")),
+                          _int(a.get("leechers")), "animetosho",
+                          a.get("magnet_uri") or build_magnet(ih, name),
+                          None, nf if nf > 0 else None, page=a.get("link"), group="Anime"))
+    return out
+
+
+_TGX_HOSTS = ["torrentgalaxy.to", "torrentgalaxy.mx", "tgx.rs"]
+
+
+def _tgx(query: str) -> list[Result]:
+    q = query.strip()
+    if not q:
+        return []
+    path = f"/get-posts/keywords:{urllib.parse.quote(q)}:/"
+    page = base = last = None
+    for host in _TGX_HOSTS:
+        try:
+            base = f"https://{host}"
+            page = fetch(f"{base}{path}", retries=1)
+            break
+        except SourceError as e:
+            last = e
+    if page is None:
+        raise last or SourceError("TorrentGalaxy unreachable")
+    low = page.lower()
+    if "just a moment" in low or "cf-chl" in low or "checking your browser" in low:
+        raise SourceError("blocked by Cloudflare")
+    out = []
+    for block in page.split("tgxtablerow")[1:]:
+        mm = re.search(r"magnet:\?xt=urn:btih:[a-z0-9]+[^\"'<>\s]*", block, re.I)
+        if not mm:
+            continue
+        magnet = html.unescape(mm.group(0))
+        hm = re.search(r"urn:btih:([a-z0-9]+)", magnet, re.I)
+        if not hm:
+            continue
+        dn = re.search(r"[?&]dn=([^&\"'<>]+)", magnet)
+        name = urllib.parse.unquote_plus(dn.group(1)) if dn else hm.group(1)
+        link = re.search(r'href="(/torrent/\d+/[^"]+)"', block)
+        seeds = re.search(r"color=['\"]?#?green['\"]?[^>]*>\s*<b>\s*(\d+)", block, re.I)
+        leech = re.search(r"color=['\"]?#?ff0000['\"]?[^>]*>\s*<b>\s*(\d+)", block, re.I)
+        size = re.search(r"(\d+(?:\.\d+)?\s*[KMGT]i?B)", block)
+        out.append(Result(normalize_info_hash(hm.group(1)), html.unescape(name),
+                          parse_size(size.group(1)) if size else 0,
+                          _int(seeds.group(1)) if seeds else 0,
+                          _int(leech.group(1)) if leech else 0, "torrentgalaxy", magnet,
+                          page=(base + link.group(1)) if link else None))
+    return out
+
+
 # -- registry ----------------------------------------------------------------
 
 SOURCES: list[Source] = [
     Source("fitgirl", "FitGirl", "Games", _fitgirl),
+    Source("dodi", "DODI", "Games", _dodi),
     Source("yts", "YTS", "Movies", _yts),
     Source("tpb-movies", "TPB", "Movies", _tpb_movies),
     Source("x1337-movies", "1337x", "Movies", lambda q: _x1337(q, "Movies", "x1337-movies")),
@@ -469,6 +582,9 @@ SOURCES: list[Source] = [
     Source("x1337-tv", "1337x", "TV", lambda q: _x1337(q, "TV", "x1337-tv")),
     Source("nyaa", "Nyaa", "Anime", _nyaa),
     Source("subsplease", "SubsPlease", "Anime", _subsplease),
+    Source("animetosho", "AnimeTosho", "Anime", _animetosho),
+    Source("knaben", "Knaben", "Other", _knaben),
+    Source("torrentgalaxy", "TGx", "Other", _tgx),
 ]
 
 
@@ -566,6 +682,38 @@ def selftest() -> None:
     assert len(xr) == 1 and xr[0]["name"] == "The Matrix 1999", xr
     assert xr[0]["seeders"] == 1234 and xr[0]["leechers"] == 56, xr
     assert xr[0]["size"] == 1_500_000_000 and xr[0]["path"] == "/torrent/42/The-Matrix-1999/", xr
+    # knaben category -> group mapping
+    assert _knaben_group("Movies / HD") == "Movies"
+    assert _knaben_group("PC / Games") == "Games"
+    assert _knaben_group("Anime / Subbed") == "Anime"
+    assert _knaben_group("XXX / Video") == "SKIP"
+    assert _knaben_group("Books / EBooks") is None
+    # TGx + DODI parsers (synthetic pages; fetch monkeypatched — real sites unverified here)
+    _g = globals()
+    _of = _g["fetch"]
+    _g["fetch"] = lambda *a, **k: (
+        'x<div class="tgxtablerow">'
+        '<a href="/torrent/55/The-Matrix/">The Matrix</a>'
+        '<a href="magnet:?xt=urn:btih:dd8255ecdc7ca55fb0bbf81323d87062db1f6d1c'
+        '&dn=The+Matrix+1999">m</a>'
+        "<font color='green'><b>1234</b></font>"
+        "<font color='#ff0000'><b>56</b></font>"
+        '<span class="badge">1.5 GB</span></div>')
+    tg = _tgx("matrix")
+    assert len(tg) == 1 and tg[0].name == "The Matrix 1999", tg
+    assert tg[0].seeders == 1234 and tg[0].leechers == 56 and tg[0].size == 1_500_000_000, tg
+    assert tg[0].page.endswith("/torrent/55/The-Matrix/"), tg[0].page
+    _g["fetch"] = lambda *a, **k: (
+        '<rss><channel><item><title>Cyberpunk 2077</title>'
+        '<link>https://dodi-repacks.site/cyberpunk-2077/</link>'
+        '<pubDate>Mon, 01 Jan 2024 00:00:00 +0000</pubDate>'
+        '<description>x <a href="magnet:?xt=urn:btih:'
+        'dd8255ecdc7ca55fb0bbf81323d87062db1f6d1c&dn=cp">here</a></description>'
+        '</item></channel></rss>')
+    dd = _dodi("cyberpunk")
+    assert len(dd) == 1 and dd[0].source == "dodi" and dd[0].name == "Cyberpunk 2077", dd
+    assert dd[0].page == "https://dodi-repacks.site/cyberpunk-2077/", dd[0].page
+    _g["fetch"] = _of
     print("pure logic ok")
 
     # live — best-effort; proves the pipeline + real parsing without requiring

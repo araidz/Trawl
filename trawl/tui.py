@@ -436,7 +436,7 @@ class App:
         if self.cat == "all":
             return self.results
         g = CAT_GROUP[self.cat]
-        return [r for r in self.results if GROUP_OF.get(r.source) == g]
+        return [r for r in self.results if (r.group or GROUP_OF.get(r.source)) == g]
 
     def animating(self) -> bool:
         return any(d.status in ("active", "metadata") for d in self.downloads)
