@@ -52,6 +52,7 @@ class Result:
     magnet: str
     added: int | None = None
     num_files: int | None = None
+    page: str | None = None  # the torrent's web page, to open in a browser
 
 
 @dataclass(frozen=True)
@@ -228,7 +229,7 @@ def _yts(query: str) -> list[Result]:
             name = f"{base} [{tag}]" if tag else base
             out.append(Result(h, name, t.get("size_bytes") or 0, t.get("seeds") or 0,
                               t.get("peers") or 0, "yts", build_magnet(h, name),
-                              movie.get("date_uploaded_unix")))
+                              movie.get("date_uploaded_unix"), page=movie.get("url")))
     return out
 
 
@@ -255,7 +256,8 @@ def _tpb(query: str, cats: set[int], browse: str, source: str) -> list[Result]:
         nf = _int(it.get("num_files"))
         out.append(Result(h, name, _int(it.get("size")), _int(it.get("seeders")),
                           _int(it.get("leechers")), source, build_magnet(h, name),
-                          _int(it.get("added")) or None, nf if nf > 0 else None))
+                          _int(it.get("added")) or None, nf if nf > 0 else None,
+                          page=f"https://thepiratebay.org/description.php?id={it.get('id')}"))
     return out
 
 
@@ -279,7 +281,8 @@ def _eztv(query: str) -> list[Result]:
         name = t.get("title") or t.get("filename") or h
         magnet = t.get("magnet_url") or build_magnet(h, name)
         out.append(Result(h, name, _int(t.get("size_bytes")), t.get("seeds") or 0,
-                          t.get("peers") or 0, "eztv", magnet, t.get("date_released_unix")))
+                          t.get("peers") or 0, "eztv", magnet, t.get("date_released_unix"),
+                          page=t.get("episode_url")))
     return out
 
 
@@ -294,7 +297,8 @@ def _solid(query: str) -> list[Result]:
         out.append(Result(h, it.get("title") or "Unknown", it.get("size") or 0,
                           it.get("seeders") or 0, it.get("leechers") or 0, "solid",
                           build_magnet(h, it.get("title") or "Unknown"),
-                          _iso_unix(it.get("updatedAt"))))
+                          _iso_unix(it.get("updatedAt")),
+                          page=f"https://solidtorrents.net/view/{it['_id']}" if it.get("_id") else None))
     return out
 
 
@@ -333,7 +337,8 @@ def _subsplease(query: str) -> list[Result]:
         m = re.search(r"[?&]xl=(\d+)", dl.get("magnet", ""))
         out.append(Result(parsed.info_hash, f"{show}{ep} [{dl.get('res', '?')}p]",
                           int(m.group(1)) if m else 0, 0, 0, "subsplease", parsed.magnet,
-                          _iso_unix(entry.get("release_date"))))
+                          _iso_unix(entry.get("release_date")),
+                          page=f"https://subsplease.org/shows/{entry['page']}" if entry.get("page") else None))
     return out
 
 
@@ -355,7 +360,7 @@ def _fitgirl(query: str) -> list[Result]:
             continue
         name = html.unescape(_tag(item, "title") or "Unknown Title")
         out.append(Result(hm.group(1).lower(), name, 0, 0, 0, "fitgirl", magnet,
-                          _rfc822_unix(_tag(item, "pubDate"))))
+                          _rfc822_unix(_tag(item, "pubDate")), page=_tag(item, "link") or None))
     return out
 
 
@@ -367,9 +372,12 @@ def _nyaa(query: str) -> list[Result]:
         name = html.unescape(_tag(item, "title"))
         if not h or not name:
             continue
+        vid = re.search(r"/(?:view|download)/(\d+)", _tag(item, "link"))
+        page = f"https://nyaa.si/view/{vid.group(1)}" if vid else None
         out.append(Result(h, name, parse_size(_tag(item, "nyaa:size")),
                           _int(_tag(item, "nyaa:seeders")), _int(_tag(item, "nyaa:leechers")),
-                          "nyaa", build_magnet(h, name), _rfc822_unix(_tag(item, "pubDate"))))
+                          "nyaa", build_magnet(h, name), _rfc822_unix(_tag(item, "pubDate")),
+                          page=page))
     return out
 
 
@@ -444,7 +452,7 @@ def _x1337(query: str, cat: str, source: str) -> list[Result]:
         if not hm:
             continue
         out.append(Result(hm.group(1).lower(), r["name"], r["size"], r["seeders"],
-                          r["leechers"], source, magnet))
+                          r["leechers"], source, magnet, page=base + r["path"]))
     return out
 
 
@@ -565,6 +573,7 @@ def selftest() -> None:
     s = Search("the matrix")
     counts: dict[str, int] = {}
     errors: dict[str, str] = {}
+    pages: dict[str, int] = {}
     got = 0
     end = time.monotonic() + 25
     while got < s.total and time.monotonic() < end:
@@ -580,9 +589,12 @@ def selftest() -> None:
             for r in u.results:
                 assert re.fullmatch(r"[a-f0-9]{40}", r.info_hash), f"bad hash from {u.source}: {r.info_hash!r}"
                 assert r.magnet.lower().startswith("magnet:?"), f"bad magnet from {u.source}"
+                if r.page:
+                    assert r.page.startswith("http"), f"bad page from {u.source}: {r.page!r}"
+                    pages[u.source] = pages.get(u.source, 0) + 1
     print(f"sources answered: {got}/{s.total}")
     for sid, n in sorted(counts.items()):
-        print(f"  {sid:14} {n} results")
+        print(f"  {sid:14} {n} results  ({pages.get(sid, 0)} with pages)")
     for sid, err in sorted(errors.items()):
         print(f"  {sid:14} ERROR: {err[:60]}")
     total = sum(counts.values())

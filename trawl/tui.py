@@ -174,6 +174,14 @@ def reveal(path: str) -> bool:
         return False
 
 
+def open_url(url: str) -> bool:
+    try:
+        subprocess.run(["open", url], check=True)
+        return True
+    except (OSError, subprocess.CalledProcessError):
+        return False
+
+
 # -- progress bar ------------------------------------------------------------
 
 
@@ -468,6 +476,16 @@ class App:
                 if rs and 0 <= self.sel < len(rs):
                     ok = copy_clipboard(rs[self.sel].magnet)
                     self.status = "magnet copied to clipboard" if ok else "copy failed"
+            elif k == "o":
+                rs = self.visible_results()
+                if rs and 0 <= self.sel < len(rs):
+                    page = rs[self.sel].page
+                    if not page:
+                        self.status = "no page for this source"
+                    elif open_url(page):
+                        self.status = "opened in browser"
+                    else:
+                        self.status = "couldn't open browser"
         elif self.view == "downloads":
             if not self.downloads or not (0 <= self.dsel < len(self.downloads)):
                 return
@@ -680,8 +698,8 @@ def _help_panel(width: int, height: int) -> list[str]:
     inner_w = width - 4
     groups = [
         ("Search", [("type", "search (paste a magnet to grab)"), ("enter", "run search"),
-                    ("/  i", "edit query"), ("y", "copy magnet"), ("c", "clear results"),
-                    ("← →", "filter category")]),
+                    ("/  i", "edit query"), ("o", "open torrent page in browser"),
+                    ("y", "copy magnet"), ("c", "clear results"), ("← →", "filter category")]),
         ("Navigate", [("↑ ↓  j k", "move selection"), ("tab", "switch search / downloads")]),
         ("Downloads", [("d  enter", "download selected"), ("p", "pause / resume"),
                        ("x", "cancel / remove"), ("o", "reveal in Finder")]),
@@ -702,7 +720,7 @@ def _footer(app: App, width: int) -> str:
     elif app.view == "search" and app.editing:
         hints = [("enter", "search"), ("esc", "nav"), ("tab", "downloads"), ("^c", "quit")]
     elif app.view == "search":
-        hints = [("↑↓", "move"), ("d", "grab"), ("y", "copy"), ("←→", "category"),
+        hints = [("↑↓", "move"), ("d", "grab"), ("o", "page"), ("y", "copy"), ("←→", "category"),
                  ("/", "edit"), ("c", "clear"), ("tab", "downloads"), ("?", "keys"), ("q", "quit")]
     else:
         hints = [("↑↓", "move"), ("p", "pause/resume"), ("x", "cancel"), ("o", "reveal"),
@@ -915,22 +933,28 @@ def selftest() -> None:
     assert calls[-1] == ("resume", "r1"), calls
     appd.on_key("x")
     assert calls[-1] == ("remove", "r1"), calls
-    # copy magnet (y) and reveal (o) route to the helpers
+    # copy magnet (y), open page (o, search), reveal (o, downloads) route to helpers
     g = globals()
-    orig_copy, orig_reveal, hit = g["copy_clipboard"], g["reveal"], []
+    orig = {k: g[k] for k in ("copy_clipboard", "reveal", "open_url")}
+    hit = []
     g["copy_clipboard"] = lambda t: hit.append(("copy", t)) or True
     g["reveal"] = lambda p: hit.append(("reveal", p)) or True
+    g["open_url"] = lambda u: hit.append(("open", u)) or True
     appy = App(eng=None)
     appy.search = Search.__new__(Search)
     appy.editing = False
-    appy.results = [Result("a" * 40, "X", 1, 1, 0, "yts", "magnet:?xt=test")]
+    appy.results = [Result("a" * 40, "X", 1, 1, 0, "yts", "magnet:?xt=test",
+                          page="https://yts.mx/movies/x")]
     appy.on_key("y")
     assert hit == [("copy", "magnet:?xt=test")], hit
+    appy.on_key("o")  # search view: open the torrent page
+    assert hit[-1] == ("open", "https://yts.mx/movies/x"), hit
     appy.view = "downloads"
     appy.downloads = [Download("g", "F", "complete", 1, 1, 0, 0, None, root="r", path="/tmp/F")]
-    appy.on_key("o")
+    appy.on_key("o")  # downloads view: reveal in Finder
     assert hit[-1] == ("reveal", "/tmp/F"), hit
-    g["copy_clipboard"], g["reveal"] = orig_copy, orig_reveal
+    for k, v in orig.items():
+        g[k] = v
     print("interaction ok")
 
     # render: search nav, downloads, help — sized lines, no overflow, no crash
