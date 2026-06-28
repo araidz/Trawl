@@ -1,0 +1,9 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# zipapp build output
+/trawl
+
+# macOS
+.DS_Store
