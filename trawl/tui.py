@@ -239,7 +239,8 @@ class Terminal:
     def enter(self) -> None:
         self.saved = termios.tcgetattr(self.fd)
         tty.setraw(self.fd)
-        sys.stdout.write("\x1b[?1049h\x1b[?25l")
+        # alt-screen + clear screen & scrollback so trawl owns the whole tab
+        sys.stdout.write("\x1b[?1049h\x1b[3J\x1b[2J\x1b[H\x1b[?25l")
         sys.stdout.flush()
 
     def leave(self) -> None:
@@ -294,6 +295,7 @@ class App:
         self.help = False
         self.status = ""
         self.running = True
+        self.confirm_quit = False
         self.start = time.monotonic()
 
     # -- derived
@@ -373,6 +375,12 @@ class App:
         if k == "ctrl-c":
             self.running = False
             return
+        if self.confirm_quit:
+            if k == "enter":
+                self.running = False
+            elif k == "esc":
+                self.confirm_quit = False
+            return
         if self.view == "search" and self.editing:
             if k == "enter":
                 self.submit()
@@ -391,7 +399,7 @@ class App:
             return
         # nav (results) / downloads
         if k == "q":
-            self.running = False
+            self.confirm_quit = True
         elif k == "?":
             self.help = True
         elif k == "tab":
@@ -466,6 +474,8 @@ def _logo_lines() -> list[str]:
         for i, ch in enumerate(chars):
             if ch == " ":
                 seg += " "
+            elif ch in T.NET_GLYPHS:
+                seg += style(ch, T.NET_COLOR, bold=True)
             else:
                 seg += style(ch, T.logo_color(((i / last) + ty) / 2), bold=True)
         out.append(seg)
@@ -678,11 +688,36 @@ def _splash(app: App, cols: int, rows: int) -> list[str]:
     top = max(0, (rows - len(block)) // 2)
     return ([""] * top + block + [""] * rows)[:rows]
 
+def _confirm(cols: int) -> list[str]:
+    label = "Quit trawl?"
+    inner_plain = f"  {label}   ↵ yes  ·  esc no  "
+    box_w = dwidth(inner_plain) + 2
+    pre = " " * max(0, (cols - box_w) // 2)
+    inner = ("  " + style(label, T.WARN, bold=True) + "   "
+             + style("↵", T.ACCENT) + style(" yes", dim=True) + style("  ·  ", dim=True)
+             + style("esc", T.ACCENT) + style(" no", dim=True) + "  ")
+    return [
+        pre + style("╭" + "─" * (box_w - 2) + "╮", T.WARN),
+        pre + style("│", T.WARN) + inner + style("│", T.WARN),
+        pre + style("╰" + "─" * (box_w - 2) + "╯", T.WARN),
+    ]
+
+
+def _overlay_confirm(lines: list[str], app: App, cols: int, rows: int) -> list[str]:
+    if not app.confirm_quit:
+        return lines
+    mid = max(0, rows // 2 - 1)
+    for j, b in enumerate(_confirm(cols)):
+        if mid + j < len(lines):
+            lines[mid + j] = b
+    return lines
+
+
 def render(app: App, cols: int, rows: int) -> list[str]:
     cols = max(40, cols)
     rows = max(12, rows)
     if app.view == "search" and app.search is None and not app.help:
-        return _splash(app, cols, rows)
+        return _overlay_confirm(_splash(app, cols, rows), app, cols, rows)
     lines: list[str] = []
     for L in _logo_lines():
         lines.append(" " * MARGIN + L)
@@ -712,7 +747,8 @@ def render(app: App, cols: int, rows: int) -> list[str]:
 
     lines.append("")
     lines.append(" " * MARGIN + _footer(app, cols - MARGIN))
-    return (lines + [""] * rows)[:rows]
+    lines = (lines + [""] * rows)[:rows]
+    return _overlay_confirm(lines, app, cols, rows)
 
 
 # -- self-check --------------------------------------------------------------
@@ -754,6 +790,19 @@ def selftest() -> None:
     assert app.cat == "games", app.cat
     app.on_key("tab")
     assert app.view == "downloads"
+    # quit confirmation: q arms it, esc cancels, q+enter quits; ^c is immediate
+    appq = App(eng=None)
+    appq.view = "downloads"
+    appq.on_key("q")
+    assert appq.confirm_quit and appq.running, "q should arm confirm, not quit"
+    appq.on_key("esc")
+    assert not appq.confirm_quit and appq.running, "esc cancels quit"
+    appq.on_key("q")
+    appq.on_key("enter")
+    assert not appq.running, "q then enter quits"
+    appq.running = True
+    appq.on_key("ctrl-c")
+    assert not appq.running, "ctrl-c quits immediately"
     print("interaction ok")
 
     # render: search nav, downloads, help — sized lines, no overflow, no crash
@@ -784,6 +833,15 @@ def selftest() -> None:
     f = "\n".join(strip_ansi(x) for x in render(app2, 100, 30))
     assert "Active.Movie.mkv" in f and "fetching metadata" in f, "downloads view"
     assert "█" in f or "░" in f, "no progress bar"
+    # quit-confirm modal stamps over the center, width-safe
+    app2.confirm_quit = True
+    cf = render(app2, 100, 30)
+    assert any("Quit trawl?" in strip_ansi(x) for x in cf), "confirm modal missing"
+    for ln in cf:
+        assert dwidth(strip_ansi(ln)) <= 100, "confirm overflow"
+    app2.confirm_quit = False
+    # the net motif glyphs render in the logo
+    assert any(g in "".join(_logo_lines()) for g in T.NET_GLYPHS), "net glyphs missing"
     # splash: fresh app (no search yet) shows the centered welcome
     app3 = App(eng=None)
     for cols, rows in [(100, 30), (80, 24), (140, 50)]:

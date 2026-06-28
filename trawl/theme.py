@@ -37,11 +37,13 @@ WARN_I = "⚠"
 BLOCK = "█"
 TRACK = "░"
 
-# trawl wordmark (2-row half-block; gradient applied at render time)
+# trawl wordmark + a trawling-net mesh (gradient on the word, aqua on the net)
 LOGO_LINES: list[str] = [
-    "▀█▀ █▀▄ ▄▀▄ █ ▄ █ █  ",
-    " █  █▀▄ █▀█ ▀▄▀▄▀ █▄▄",
+    "▀█▀ █▀▄ ▄▀▄ █ ▄ █ █     ╱╲╱╲",
+    " █  █▀▄ █▀█ ▀▄▀▄▀ █▄▄   ╲╱╲╱",
 ]
+NET_GLYPHS = set("╱╲╳▞▚◇")
+NET_COLOR = "#5fd0c5"  # aqua — reads as net-in-water against the violet
 
 # -- per-source tag + color (torlink SOURCE_STYLE) ---------------------------
 SOURCE_STYLE: dict[str, tuple[str, str]] = {
