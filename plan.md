@@ -60,8 +60,10 @@ Trawl/
 ```
 
 Split `sources.py` only if 1337x bloats it; collapse a file if it stays tiny.
-Build: `python -m zipapp trawl -o dist/trawl -p "/usr/bin/env python3"` → run
-`./dist/trawl` or symlink it into `/usr/local/bin/trawl`. (`dist/` is gitignored.)
+Build: `sh build.sh` → `dist/trawl` (single 63K stdlib zipapp). Install with the
+symlink it prints: `ln -sf "$PWD/dist/trawl" /usr/local/bin/trawl`. (`build/`,
+`dist/` are gitignored. The script nests the package under an absolute-import
+launcher so relative imports resolve inside the archive.)
 
 ### Data flow
 
