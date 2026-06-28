@@ -43,6 +43,7 @@ class Download:
     eta: float | None  # seconds remaining, None when unknown
     error: str = ""
     root: str = ""  # the gid we added (poll sets it); remove() takes this
+    path: str = ""  # on-disk path of the first file (for reveal-in-Finder)
 
     @property
     def progress(self) -> float:
@@ -92,7 +93,31 @@ def to_download(st: dict) -> Download:
         peers=int(st.get("connections") or 0),
         eta=eta,
         error=st.get("errorMessage", ""),
+        path=(st.get("files") or [{}])[0].get("path", ""),
     )
+
+
+def control_infohash(path: str) -> str | None:
+    """Read the BitTorrent infohash (40-hex) from an aria2 *.aria2 control file.
+
+    aria2's DefaultBtProgressInfoFile format, big-endian (network byte order):
+      [0:2] version  [2:6] extension (bit0 => BT)  [6:10] infoHashLen (=20)  [10:30] infoHash
+    Returns None for non-BT / unrecognised files. ponytail: parses the documented
+    BT prefix only; validate against a real .aria2 if aria2's format ever changes.
+    """
+    try:
+        with open(path, "rb") as f:
+            head = f.read(30)
+    except OSError:
+        return None
+    if len(head) < 30:
+        return None
+    version = int.from_bytes(head[0:2], "big")
+    ext = int.from_bytes(head[2:6], "big")
+    ih_len = int.from_bytes(head[6:10], "big")
+    if version not in (0, 1) or not (ext & 1) or ih_len != 20:
+        return None
+    return head[10:30].hex()
 
 
 class Aria2:
@@ -123,8 +148,6 @@ class Aria2:
         ]
         if self.conf and self.conf.is_file():
             args.append(f"--conf-path={self.conf}")
-        if self.session.is_file():
-            args.append(f"--input-file={self.session}")  # resume our own downloads
         self.proc = subprocess.Popen(
             args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
@@ -192,6 +215,26 @@ class Aria2:
 
     def global_stat(self) -> dict:
         return self._call("aria2.getGlobalStat")
+
+    def download_dir(self) -> str | None:
+        try:
+            return self._call("aria2.getGlobalOption").get("dir")
+        except Aria2Error:
+            return None
+
+    def active_infohashes(self) -> set[str]:
+        """infohashes aria2 already has in flight (so a scan never double-adds)."""
+        have: set[str] = set()
+        for method, params in (("aria2.tellActive", [["infoHash"]]),
+                               ("aria2.tellWaiting", [0, 1000, ["infoHash"]])):
+            try:
+                for t in self._call(method, params) or []:
+                    ih = (t.get("infoHash") or "").lower()
+                    if ih:
+                        have.add(ih)
+            except Aria2Error:
+                pass
+        return have
 
     def poll(self) -> list[Download]:
         """Current state of every tracked download, metadata->real gid resolved."""
@@ -269,6 +312,18 @@ def selftest() -> None:
     assert live.progress == 0.5 and live.eta == 5.0 and live.peers == 7, live
     assert _follow({"status": "complete", "followedBy": ["z"]}) == "z"
     assert _follow({"status": "active", "followedBy": ["z"]}) is None
+    # *.aria2 control-file infohash parse (synthetic, documented big-endian format)
+    import tempfile as _tf
+    ih = "dd8255ecdc7ca55fb0bbf81323d87062db1f6d1c"
+    blob = (1).to_bytes(2, "big") + (1).to_bytes(4, "big") + (20).to_bytes(4, "big") + bytes.fromhex(ih) + b"\x00" * 8
+    p = _tf.mktemp(suffix=".aria2")
+    with open(p, "wb") as _f:
+        _f.write(blob)
+    assert control_infohash(p) == ih, control_infohash(p)
+    with open(p, "wb") as _f:  # HTTP control file (no BT bit) -> skipped
+        _f.write((1).to_bytes(2, "big") + (0).to_bytes(4, "big") + b"\x00" * 24)
+    assert control_infohash(p) is None
+    os.remove(p)
     print("pure mapping ok")
 
     # live plumbing — temp state, temp dir, no user conf, removed before any bytes

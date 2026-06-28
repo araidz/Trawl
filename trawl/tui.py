@@ -13,6 +13,7 @@ import queue
 import re
 import select
 import shutil
+import subprocess
 import sys
 import termios
 import time
@@ -155,6 +156,24 @@ def clean(s: str) -> str:
     return re.sub(r"\s+", " ", s).strip()
 
 
+def copy_clipboard(text: str) -> bool:
+    try:
+        subprocess.run(["pbcopy"], input=text.encode(), check=True)
+        return True
+    except (OSError, subprocess.CalledProcessError):
+        return False
+
+
+def reveal(path: str) -> bool:
+    # reveal a file in Finder, or open a directory
+    args = ["open", "-R", path] if os.path.isfile(path) else ["open", path]
+    try:
+        subprocess.run(args, check=True)
+        return True
+    except (OSError, subprocess.CalledProcessError):
+        return False
+
+
 # -- progress bar ------------------------------------------------------------
 
 
@@ -292,6 +311,8 @@ class App:
         self.cat = "all"
         self.downloads: list[Download] = []
         self.dsel = 0
+        self.down_speed = 0  # aria2 global download speed (bytes/s)
+        self.num_active = 0
         self.help = False
         self.status = ""
         self.running = True
@@ -442,6 +463,11 @@ class App:
                 rs = self.visible_results()
                 if rs and 0 <= self.sel < len(rs):
                     self.grab(rs[self.sel].magnet, rs[self.sel].name)
+            elif k == "y":
+                rs = self.visible_results()
+                if rs and 0 <= self.sel < len(rs):
+                    ok = copy_clipboard(rs[self.sel].magnet)
+                    self.status = "magnet copied to clipboard" if ok else "copy failed"
         elif self.view == "downloads":
             if not self.downloads or not (0 <= self.dsel < len(self.downloads)):
                 return
@@ -460,6 +486,9 @@ class App:
                     if self.eng:
                         self.eng.pause(d.root)
                     self.status = f"paused: {clean(d.name)[:40]}"
+            elif k == "o":
+                self.status = (f"revealed: {clean(d.name)[:40]}"
+                               if reveal(d.path or "") else "couldn't open location")
 
 
 # -- rendering ---------------------------------------------------------------
@@ -651,10 +680,11 @@ def _help_panel(width: int, height: int) -> list[str]:
     inner_w = width - 4
     groups = [
         ("Search", [("type", "search (paste a magnet to grab)"), ("enter", "run search"),
-                    ("/  i", "edit query"), ("c", "clear results"), ("← →", "filter category")]),
+                    ("/  i", "edit query"), ("y", "copy magnet"), ("c", "clear results"),
+                    ("← →", "filter category")]),
         ("Navigate", [("↑ ↓  j k", "move selection"), ("tab", "switch search / downloads")]),
         ("Downloads", [("d  enter", "download selected"), ("p", "pause / resume"),
-                       ("x", "cancel / remove")]),
+                       ("x", "cancel / remove"), ("o", "reveal in Finder")]),
         ("General", [("?", "this help"), ("q", "quit (confirm)"), ("ctrl-c", "quit now")]),
     ]
     inner = [cell("Keys", inner_w, color=T.ACCENT, bold=True), cell("", inner_w)]
@@ -672,10 +702,10 @@ def _footer(app: App, width: int) -> str:
     elif app.view == "search" and app.editing:
         hints = [("enter", "search"), ("esc", "nav"), ("tab", "downloads"), ("^c", "quit")]
     elif app.view == "search":
-        hints = [("↑↓", "move"), ("d", "grab"), ("←→", "category"), ("/", "edit"),
-                 ("c", "clear"), ("tab", "downloads"), ("?", "keys"), ("q", "quit")]
+        hints = [("↑↓", "move"), ("d", "grab"), ("y", "copy"), ("←→", "category"),
+                 ("/", "edit"), ("c", "clear"), ("tab", "downloads"), ("?", "keys"), ("q", "quit")]
     else:
-        hints = [("↑↓", "move"), ("p", "pause/resume"), ("x", "cancel"),
+        hints = [("↑↓", "move"), ("p", "pause/resume"), ("x", "cancel"), ("o", "reveal"),
                  ("tab", "search"), ("?", "keys"), ("q", "quit")]
     out, used = "", 0
     if app.status:
@@ -684,16 +714,21 @@ def _footer(app: App, width: int) -> str:
         used = dwidth(st) + 3
     sep = "  " + T.DOT + "  "
     sep_w = dwidth(sep)
+    last = hints[-1]  # the quit hint must always survive truncation
+    last_w = sep_w + dwidth(last[0]) + 1 + dwidth(last[1])
     first = True
-    for k, v in hints:
+    for k, v in hints[:-1]:
         add = dwidth(k) + 1 + dwidth(v) + (0 if first else sep_w)
-        if used + add > width:
+        if used + add + last_w > width:  # keep room for the quit hint
             break
         if not first:
             out += style(sep, dim=True)
         out += style(k, T.ACCENT) + style(" " + v, dim=True)
         used += add
         first = False
+    if not first:
+        out += style(sep, dim=True)
+    out += style(last[0], T.ACCENT) + style(" " + last[1], dim=True)
     return out
 
 
@@ -765,7 +800,14 @@ def render(app: App, cols: int, rows: int) -> list[str]:
     lines: list[str] = []
     for L in _logo_lines():
         lines.append(" " * MARGIN + L)
-    lines.append(" " * MARGIN + style("─" * max(0, cols - 2 * MARGIN), T.RULE))
+    rule_w = max(0, cols - 2 * MARGIN)
+    if app.down_speed > 0 or app.num_active > 0:
+        stat = f" {T.DOWN} {fmt_speed(app.down_speed)}  {app.num_active} active "
+        dashes = max(0, rule_w - dwidth(stat) - 2)
+        lines.append(" " * MARGIN + style("─" * dashes + "─", T.RULE)
+                     + style(stat, T.ALT) + style("─", T.RULE))
+    else:
+        lines.append(" " * MARGIN + style("─" * rule_w, T.RULE))
 
     header_h = len(T.LOGO_LINES) + 1
     footer_h = 2
@@ -873,6 +915,22 @@ def selftest() -> None:
     assert calls[-1] == ("resume", "r1"), calls
     appd.on_key("x")
     assert calls[-1] == ("remove", "r1"), calls
+    # copy magnet (y) and reveal (o) route to the helpers
+    g = globals()
+    orig_copy, orig_reveal, hit = g["copy_clipboard"], g["reveal"], []
+    g["copy_clipboard"] = lambda t: hit.append(("copy", t)) or True
+    g["reveal"] = lambda p: hit.append(("reveal", p)) or True
+    appy = App(eng=None)
+    appy.search = Search.__new__(Search)
+    appy.editing = False
+    appy.results = [Result("a" * 40, "X", 1, 1, 0, "yts", "magnet:?xt=test")]
+    appy.on_key("y")
+    assert hit == [("copy", "magnet:?xt=test")], hit
+    appy.view = "downloads"
+    appy.downloads = [Download("g", "F", "complete", 1, 1, 0, 0, None, root="r", path="/tmp/F")]
+    appy.on_key("o")
+    assert hit[-1] == ("reveal", "/tmp/F"), hit
+    g["copy_clipboard"], g["reveal"] = orig_copy, orig_reveal
     print("interaction ok")
 
     # render: search nav, downloads, help — sized lines, no overflow, no crash
@@ -889,6 +947,7 @@ def selftest() -> None:
         Download("g4", "Paused.Movie.mkv", "paused", 100, 60, 0, 4, None, root="r4"),
         Download("g5", "Bad.Movie.mkv", "error", 100, 5, 0, 0, None, error="no peers", root="r5"),
     ]
+    app2.down_speed, app2.num_active = 5_000_000, 2  # exercise the header readout
     for cols, rows in [(100, 30), (80, 24), (140, 50)]:
         for view, help_ in [("search", False), ("downloads", False), ("search", True)]:
             app2.view, app2.help = view, help_
