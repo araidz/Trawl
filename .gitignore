@@ -3,7 +3,7 @@ __pycache__/
 *.py[cod]
 
 # zipapp build output
-/trawl
+/dist/
 
 # macOS
 .DS_Store
