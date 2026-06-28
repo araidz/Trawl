@@ -41,6 +41,8 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     app = App(eng)
+    if app.download_dir:
+        eng.set_dir(app.download_dir)
     if initial:
         pm = parse_magnet(initial)
         if pm:

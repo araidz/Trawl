@@ -222,6 +222,12 @@ class Aria2:
         except Aria2Error:
             return None
 
+    def set_dir(self, path: str) -> None:
+        try:
+            self._call("aria2.changeGlobalOption", [{"dir": path}])
+        except Aria2Error:
+            pass
+
     def active_infohashes(self) -> set[str]:
         """infohashes aria2 already has in flight (so a scan never double-adds)."""
         have: set[str] = set()

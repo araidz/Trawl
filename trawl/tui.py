@@ -50,6 +50,47 @@ def save_history(hist: list[str]) -> None:
     except OSError:
         pass
 
+DL_HIST_FILE = STATE_DIR / "downloads.jsonl"
+DL_HIST_MAX = 100
+CONFIG_FILE = STATE_DIR / "config.json"
+
+
+def load_dl_history() -> list[dict]:
+    out: list[dict] = []
+    try:
+        for ln in DL_HIST_FILE.read_text().splitlines()[-DL_HIST_MAX:]:
+            try:
+                out.append(json.loads(ln))
+            except ValueError:
+                pass
+    except OSError:
+        pass
+    return out
+
+
+def append_dl_history(rec: dict) -> None:
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        with DL_HIST_FILE.open("a") as f:
+            f.write(json.dumps(rec) + "\n")
+    except OSError:
+        pass
+
+
+def load_config() -> dict:
+    try:
+        return json.loads(CONFIG_FILE.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def save_config(cfg: dict) -> None:
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        CONFIG_FILE.write_text(json.dumps(cfg))
+    except OSError:
+        pass
+
 RAIL_W = 16  # fits "Downloads (NN)"
 MARGIN = 2
 GAP = 2
@@ -380,6 +421,14 @@ class App:
         self.running = True
         self.confirm_quit = False
         self.detail: Result | None = None  # search result shown in the details view
+        cfg = load_config()
+        self.disabled_sources: set[str] = set(cfg.get("disabled_sources", []))
+        self.download_dir: str | None = cfg.get("download_dir")
+        self.dl_history: list[dict] = load_dl_history()  # completed downloads, oldest->newest
+        self.settings = False  # settings overlay open
+        self.set_sel = 0  # 0 = download-dir row, 1.. = sources
+        self.dir_editing = False
+        self.dir_buf = ""
         self.start = time.monotonic()
 
     # -- derived
@@ -391,6 +440,9 @@ class App:
 
     def animating(self) -> bool:
         return any(d.status in ("active", "metadata") for d in self.downloads)
+
+    def enabled_sources(self) -> list:
+        return [s for s in SOURCES if s.id not in self.disabled_sources]
 
     @property
     def tick(self) -> float:
@@ -405,7 +457,9 @@ class App:
             self.query = ""
             self.editing = False
             return
-        self.search = Search(q)
+        srcs = self.enabled_sources()
+        self.search = Search(q, srcs)
+        self.search_total = len(srcs)
         self.results, self.errors, self.search_done, self.sel = [], {}, 0, 0
         self.editing = False
         self.detail = None
@@ -471,6 +525,41 @@ class App:
                 pass
         return n
 
+    def _save_settings(self) -> None:
+        save_config({"disabled_sources": sorted(self.disabled_sources),
+                     "download_dir": self.download_dir})
+
+    def _settings_key(self, k: str) -> None:
+        rows = 1 + len(SOURCES)  # row 0 = download dir, 1.. = sources
+        if self.dir_editing:
+            if k == "enter":
+                self.download_dir = self.dir_buf.strip() or None
+                if self.eng and self.download_dir:
+                    self.eng.set_dir(self.download_dir)
+                self._save_settings()
+                self.dir_editing = False
+            elif k == "esc":
+                self.dir_editing = False
+            elif k == "backspace":
+                self.dir_buf = self.dir_buf[:-1]
+            elif len(k) == 1 and k >= " ":
+                self.dir_buf += k
+            return
+        if k in ("g", "esc", "q"):
+            self.settings = False
+        elif k in ("up", "k"):
+            self.set_sel = (self.set_sel - 1) % rows
+        elif k in ("down", "j"):
+            self.set_sel = (self.set_sel + 1) % rows
+        elif k in ("enter", " "):
+            if self.set_sel == 0:
+                self.dir_editing = True
+                self.dir_buf = self.download_dir or (self.eng.download_dir() if self.eng else "") or ""
+            else:
+                sid = SOURCES[self.set_sel - 1].id
+                self.disabled_sources.symmetric_difference_update({sid})
+                self._save_settings()
+
     def drain_search(self) -> None:
         if not self.search:
             return
@@ -515,6 +604,9 @@ class App:
             was = prev.get(d.root)
             if d.status == "complete" and was is not None and was != "complete":
                 notify("trawl — download complete", d.name)
+                rec = {"name": d.name, "size": d.total, "ts": int(time.time()), "path": d.path}
+                self.dl_history.append(rec)
+                append_dl_history(rec)
         self.downloads = downloads
 
     def _move(self, d: int) -> None:
@@ -542,6 +634,9 @@ class App:
                 self.running = False
             elif k == "esc":
                 self.confirm_quit = False
+            return
+        if self.settings:
+            self._settings_key(k)
             return
         if self.detail is not None:
             if k in ("esc", "enter", "q"):
@@ -597,6 +692,9 @@ class App:
             self.confirm_quit = True
         elif k == "?":
             self.help = True
+        elif k == "g":
+            self.settings = True
+            self.set_sel = 0
         elif k == "tab":
             self.view = "downloads" if self.view == "search" else "search"
             self.detail = None
@@ -859,16 +957,24 @@ def _results_panel(app: App, width: int, height: int) -> list[str]:
 
 def _downloads_panel(app: App, width: int, height: int) -> list[str]:
     inner_w = width - 4
+    body_h = height - 2
+    live = app.downloads
+    here_names = {d.name for d in live}
+    # Recently = past-session completions not currently in the live list (no dupes)
+    recent = [r for r in reversed(app.dl_history) if r.get("name") not in here_names]
     inner: list[str] = []
-    if not app.downloads:
+    if not live and not recent:
         inner.append(cell("No downloads yet. Find something and press d to grab it.", inner_w, dim=True))
-    else:
-        app.dsel = min(app.dsel, len(app.downloads) - 1)
-        per = 3  # name line, bar line, blank spacer
-        list_h = max(1, (height - 2) // per)
-        start = _window(app.dsel, len(app.downloads), list_h)
-        for idx in range(start, min(start + list_h, len(app.downloads))):
-            d = app.downloads[idx]
+        inner.append(cell("Press s to resume partial downloads on disk.", inner_w, dim=True))
+        return _wrap_panel("Downloads", inner, width, height, app.view == "downloads")
+    app.dsel = min(app.dsel, max(0, len(live) - 1))
+    reserve = 2 if recent else 0
+    max_items = max(0, (body_h - reserve) // 3)
+    if live and max_items:
+        list_h = min(len(live), max(1, max_items))
+        start = _window(app.dsel, len(live), list_h)
+        for idx in range(start, min(start + list_h, len(live))):
+            d = live[idx]
             here = idx == app.dsel
             pct = int(d.progress * 100)
             if d.status == "error":
@@ -887,17 +993,47 @@ def _downloads_panel(app: App, width: int, height: int) -> list[str]:
                 icon, ic, base = T.DOWN, T.ACCENT, T.ACCENT
                 stats = f"{pct}%  {fmt_speed(d.speed)}  {T.PEER}{d.peers}" + (f"  {fmt_eta(d.eta)}" if d.eta else "")
             stat_w = min(dwidth(stats) + 1, inner_w - 6)
-            name_w = inner_w - 2 - stat_w
             inner.append(
-                cell(icon, 2, color=ic) + cell(clean(d.name) or "…", name_w,
+                cell(icon, 2, color=ic) + cell(clean(d.name) or "…", inner_w - 2 - stat_w,
                                                color=T.ACCENT if here else None, bold=here, dim=not here)
                 + cell(stats, stat_w, "right", dim=True))
-            animate = d.status in ("active", "metadata")
-            inner.append("  " + render_bar(d.progress, inner_w - 2, app.tick, animate, base))
-            inner.append(cell("", inner_w))  # spacer between entries
-    n = len(app.downloads)
+            inner.append("  " + render_bar(d.progress, inner_w - 2, app.tick,
+                                           d.status in ("active", "metadata"), base))
+            inner.append(cell("", inner_w))
+    if recent and len(inner) < body_h:
+        inner.append(cell("Recently downloaded", inner_w, color=T.ALT, bold=True))
+        for rec in recent:
+            if len(inner) >= body_h:
+                break
+            right = f"{fmt_bytes(rec.get('size', 0))}  {fmt_rel(rec.get('ts'))}"
+            rw = min(dwidth(right) + 1, inner_w - 6)
+            inner.append(cell(T.DONE, 2, color=T.GOOD)
+                         + cell(clean(rec.get("name", "?")), inner_w - 2 - rw, dim=True)
+                         + cell(right, rw, "right", dim=True))
     return _wrap_panel("Downloads", inner, width, height, app.view == "downloads",
-                           f"({n})" if n else None)
+                       f"({len(live)})" if live else None)
+
+
+def _settings_panel(app: App, width: int, height: int) -> list[str]:
+    inner_w = width - 4
+    sel0 = app.set_sel == 0
+    val = (app.dir_buf + "▌") if app.dir_editing else (app.download_dir or "(from aria2.conf)")
+    inner = [
+        cell("Download dir", inner_w, color=T.ALT, bold=True),
+        cell(T.PTR if sel0 else "", 2, color=T.ACCENT)
+        + cell(val, inner_w - 2, color=T.TEXT if (app.download_dir or app.dir_editing) else None,
+               dim=not (app.download_dir or app.dir_editing)),
+        cell("", inner_w),
+        cell("Sources  (enter / space toggles)", inner_w, color=T.ALT, bold=True),
+    ]
+    for i, s in enumerate(SOURCES):
+        sel = app.set_sel == i + 1
+        on = s.id not in app.disabled_sources
+        inner.append(cell(T.PTR if sel else "", 2, color=T.ACCENT)
+                     + cell("[x]" if on else "[ ]", 4, color=T.GOOD if on else T.RULE)
+                     + cell(f"{s.label}  ·  {s.group}", inner_w - 6,
+                            color=T.ACCENT if sel else None, bold=sel, dim=not sel and not on))
+    return _wrap_panel("Settings", inner, width, height, True)
 
 
 def _help_panel(width: int, height: int) -> list[str]:
@@ -912,7 +1048,8 @@ def _help_panel(width: int, height: int) -> list[str]:
                       ("tab", "switch search / downloads")]),
         ("Downloads", [("p", "pause / resume"), ("x", "cancel / remove"),
                        ("o", "reveal in Finder"), ("s", "resume partial downloads on disk")]),
-        ("General", [("?", "this help"), ("q", "quit (confirm)"), ("ctrl-c", "quit now")]),
+        ("General", [("g", "settings (sources, download dir)"), ("?", "this help"),
+                     ("q", "quit (confirm)"), ("ctrl-c", "quit now")]),
     ]
     inner = [cell("Keys", inner_w, color=T.ACCENT, bold=True), cell("", inner_w)]
     for title, items in groups:
@@ -926,17 +1063,19 @@ def _help_panel(width: int, height: int) -> list[str]:
 def _footer(app: App, width: int) -> str:
     if app.help:
         hints = [("any key", "close")]
+    elif app.settings:
+        hints = ([("type", "path"), ("enter", "save"), ("esc", "cancel")] if app.dir_editing
+                 else [("↑↓", "move"), ("enter/space", "toggle/edit"), ("g/esc", "close")])
     elif app.detail is not None:
         hints = [("d", "download"), ("o", "page"), ("y", "copy magnet"), ("esc", "back"), ("q", "back")]
     elif app.view == "search" and app.editing:
         hints = [("enter", "search"), ("↑↓", "history"), ("esc", "nav"), ("tab", "downloads"), ("^c", "quit")]
     elif app.view == "search":
         hints = [("↑↓", "move"), ("enter", "details"), ("d", "grab"), ("o", "page"), ("y", "copy"),
-                 ("S", "sort"), ("←→", "category"), ("v", "paste"), ("c", "clear"), ("s", "resume"),
-                 ("q", "quit")]
+                 ("S", "sort"), ("←→", "category"), ("v", "paste"), ("g", "settings"), ("q", "quit")]
     else:
         hints = [("↑↓", "move"), ("p", "pause/resume"), ("x", "cancel"), ("o", "reveal"),
-                 ("s", "resume"), ("tab", "search"), ("?", "keys"), ("q", "quit")]
+                 ("s", "resume"), ("g", "settings"), ("tab", "search"), ("q", "quit")]
     out, used = "", 0
     if app.status:
         st = dtrunc(clean(app.status), max(10, width // 2))
@@ -1025,7 +1164,7 @@ def _overlay_confirm(lines: list[str], app: App, cols: int, rows: int) -> list[s
 def render(app: App, cols: int, rows: int) -> list[str]:
     cols = max(40, cols)
     rows = max(12, rows)
-    if app.view == "search" and app.search is None and not app.help:
+    if app.view == "search" and app.search is None and not app.help and not app.settings:
         return _overlay_confirm(_splash(app, cols, rows), app, cols, rows)
     lines: list[str] = []
     for L in _logo_lines():
@@ -1046,6 +1185,9 @@ def render(app: App, cols: int, rows: int) -> list[str]:
 
     if app.help:
         content = _help_panel(content_w, body_h)
+        rail = [cell("", RAIL_W)] * body_h
+    elif app.settings:
+        content = _settings_panel(app, content_w, body_h)
         rail = [cell("", RAIL_W)] * body_h
     else:
         rail = _rail(app, body_h)
@@ -1203,18 +1345,22 @@ def selftest() -> None:
     assert "metadata" in apps.status, apps.status
     # completion notification: once on active->complete, never for pre-complete/staying
     gn = globals()
-    orig_notify, notes = gn["notify"], []
+    orig_notify, orig_append, notes = gn["notify"], gn["append_dl_history"], []
     gn["notify"] = lambda t, m: notes.append((t, m))
+    gn["append_dl_history"] = lambda r: None  # don't touch the real file
     appn = App(eng=None)
+    appn.dl_history = []
     appn.update_downloads([Download("g", "Movie", "active", 100, 50, 1, 1, None, root="r1"),
                            Download("g2", "Old", "complete", 1, 1, 0, 0, None, root="r2")])
     assert notes == [], "no notify on first sight (incl already-complete)"
     appn.update_downloads([Download("g", "Movie", "complete", 100, 100, 0, 0, None, root="r1"),
                            Download("g2", "Old", "complete", 1, 1, 0, 0, None, root="r2")])
     assert notes == [("trawl — download complete", "Movie")], notes
+    assert appn.dl_history and appn.dl_history[-1]["name"] == "Movie", appn.dl_history
     appn.update_downloads([Download("g", "Movie", "complete", 100, 100, 0, 0, None, root="r1")])
     assert len(notes) == 1, "no re-notify while staying complete"
-    gn["notify"] = orig_notify
+    assert len(appn.dl_history) == 1, "history recorded once"
+    gn["notify"], gn["append_dl_history"] = orig_notify, orig_append
     # search history: ↑/↓ recall past queries; add dedups + moves to end + saves
     gh = globals()
     orig_load, orig_save, saved = gh["load_history"], gh["save_history"], []
@@ -1262,6 +1408,33 @@ def selftest() -> None:
     appv.on_key("v")
     assert appv.status == "no magnet in clipboard", appv.status
     gp["paste_clipboard"] = orig_paste
+    # settings overlay: toggle a source (persisted), edit download dir (persisted)
+    gc = globals()
+    o_load_cfg, o_save_cfg, saved_cfg = gc["load_config"], gc["save_config"], {}
+    gc["load_config"] = lambda: {}
+    gc["save_config"] = lambda c: saved_cfg.update(c)
+    appg = App(eng=None)
+    appg.view = "downloads"  # g on the splash landing types; open from a nav view
+    assert appg.disabled_sources == set() and not appg.settings
+    appg.on_key("g")
+    assert appg.settings, "g opens settings"
+    appg.set_sel = 1  # first source row
+    sid = SOURCES[0].id
+    appg.on_key(" ")
+    assert sid in appg.disabled_sources and sid in saved_cfg["disabled_sources"], saved_cfg
+    assert SOURCES[0] not in appg.enabled_sources()
+    appg.on_key(" ")
+    assert sid not in appg.disabled_sources, "toggle back on"
+    appg.set_sel = 0  # download-dir row
+    appg.on_key("enter")
+    assert appg.dir_editing
+    for ch in "/tmp/dl":
+        appg.on_key(ch)
+    appg.on_key("enter")
+    assert appg.download_dir == "/tmp/dl" and saved_cfg["download_dir"] == "/tmp/dl", saved_cfg
+    appg.on_key("g")
+    assert not appg.settings, "g closes settings"
+    gc["load_config"], gc["save_config"] = o_load_cfg, o_save_cfg
     print("interaction ok")
 
     # render: search nav, downloads, help — sized lines, no overflow, no crash
@@ -1295,6 +1468,20 @@ def selftest() -> None:
     f = "\n".join(strip_ansi(x) for x in render(app2, 100, 30))
     assert "Active.Movie.mkv" in f and "fetching metadata" in f, "downloads view"
     assert "█" in f or "░" in f, "no progress bar"
+    # recently-downloaded section + settings overlay render, width-safe
+    app2.dl_history = [{"name": "OldSession.iso", "size": 10**9, "ts": int(time.time()), "path": "/x"}]
+    rf = render(app2, 100, 30)  # view is "downloads" here
+    for ln in rf:
+        assert dwidth(strip_ansi(ln)) <= 100, "downloads overflow"
+    assert any("Recently downloaded" in strip_ansi(x) for x in rf), "recent section"
+    app2.dl_history = []
+    app2.settings = True
+    gf = render(app2, 100, 30)
+    for ln in gf:
+        assert dwidth(strip_ansi(ln)) <= 100, "settings overflow"
+    joined = "\n".join(strip_ansi(x) for x in gf)
+    assert "Settings" in joined and "Sources" in joined and "FitGirl" in joined, "settings view"
+    app2.settings = False
     # details view renders, width-safe
     app2.view, app2.detail = "search", app2.results[0]
     df = render(app2, 100, 30)
