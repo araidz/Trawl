@@ -13,7 +13,7 @@ import time
 
 from .aria2 import Aria2, Aria2Error
 from .sources import parse_magnet
-from .tui import App, Terminal, render
+from .tui import App, Terminal, paste_clipboard, render
 
 HELP = ("trawl — terminal torrent finder over aria2.\n"
         "  trawl            start (press s to resume partial downloads on disk)\n"
@@ -48,6 +48,8 @@ def main(argv: list[str] | None = None) -> int:
         if pm:
             app.grab(pm.magnet, pm.name)
             app.view, app.editing = "downloads", False
+    elif parse_magnet(paste_clipboard()):
+        app.status = "magnet detected in clipboard — press v to grab it"
 
     term = Terminal()
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))

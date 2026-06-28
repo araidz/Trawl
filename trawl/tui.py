@@ -1133,6 +1133,9 @@ def _splash(app: App, cols: int, rows: int) -> list[str]:
         parts.append(style(k, T.ALT) + style(" " + v, dim=True))
         plain += dwidth(k) + 1 + dwidth(v)
     block += ["", _center("".join(parts), plain, cols)]
+    if app.status:
+        st = dtrunc(clean(app.status), cols - 4)
+        block += ["", _center(style(st, T.ALT), dwidth(st), cols)]
     top = max(0, (rows - len(block)) // 2)
     return ([""] * top + block + [""] * rows)[:rows]
 
