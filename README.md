@@ -39,7 +39,7 @@ Trawl is a from-scratch Python TUI inspired by
 ## Install
 
 ```sh
-git clone <your-repo-url> Trawl && cd Trawl
+git clone https://github.com/araidz/Trawl.git && cd Trawl
 sh build.sh                                  # -> dist/trawl (one self-contained file)
 ln -sf "$PWD/dist/trawl" /opt/homebrew/bin/trawl   # or anywhere on your PATH
 trawl
