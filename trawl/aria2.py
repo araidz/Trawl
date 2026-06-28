@@ -1,0 +1,283 @@
+"""aria2 engine: spawn a private aria2c and drive it over JSON-RPC.
+
+Forces only the RPC keys plus a trawl-private session file; everything else
+(download dir, splits, leech-only seed-time=0, resume) is inherited from the
+user's ~/.aria2/aria2.conf. Transliterated from Riptide's Aria2Client.swift.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import secrets
+import socket
+import subprocess
+import time
+import urllib.error
+import urllib.request
+from dataclasses import dataclass
+from pathlib import Path
+from shutil import which
+
+USER_CONF = Path.home() / ".aria2" / "aria2.conf"
+STATE_DIR = Path.home() / "Library" / "Application Support" / "Trawl"
+
+_METADATA = "[METADATA]"
+
+
+class Aria2Error(Exception):
+    pass
+
+
+@dataclass
+class Download:
+    """One tracked download, mapped from aria2's tellStatus for the UI."""
+
+    gid: str
+    name: str
+    status: str  # active | waiting | paused | complete | error | metadata
+    total: int
+    completed: int
+    speed: int
+    peers: int
+    eta: float | None  # seconds remaining, None when unknown
+    error: str = ""
+
+    @property
+    def progress(self) -> float:
+        return self.completed / self.total if self.total else 0.0
+
+
+def _free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _name(st: dict) -> str:
+    info = (st.get("bittorrent") or {}).get("info") or {}
+    if info.get("name"):
+        return info["name"]
+    files = st.get("files") or []
+    if files and files[0].get("path"):
+        return os.path.basename(files[0]["path"])
+    return st.get("gid", "?")
+
+
+def _follow(st: dict) -> str | None:
+    """The gid a finished metadata task hands off to, else None. Pure (testable)."""
+    fb = st.get("followedBy") or []
+    return fb[0] if st.get("status") == "complete" and fb else None
+
+
+def to_download(st: dict) -> Download:
+    """Map an aria2 tellStatus dict to a Download. Pure (testable)."""
+    total = int(st.get("totalLength") or 0)
+    completed = int(st.get("completedLength") or 0)
+    speed = int(st.get("downloadSpeed") or 0)
+    status = st.get("status") or ""
+    name = _name(st)
+    if name.startswith(_METADATA):  # magnet still resolving its .torrent
+        name = name[len(_METADATA):] or "fetching metadata"
+        status = "metadata"
+    eta = (total - completed) / speed if speed > 0 and total > completed else None
+    return Download(
+        gid=st.get("gid", "?"),
+        name=name,
+        status=status,
+        total=total,
+        completed=completed,
+        speed=speed,
+        peers=int(st.get("connections") or 0),
+        eta=eta,
+        error=st.get("errorMessage", ""),
+    )
+
+
+class Aria2:
+    TIMEOUT = 5  # seconds per RPC call
+
+    def __init__(self, conf: Path | None = USER_CONF, state_dir: Path = STATE_DIR):
+        self.port = _free_port()
+        self.secret = secrets.token_hex(8)
+        self.endpoint = f"http://127.0.0.1:{self.port}/jsonrpc"
+        self.conf = Path(conf) if conf else None
+        self.state_dir = Path(state_dir)
+        self.session = self.state_dir / "aria2-session.txt"
+        self.proc: subprocess.Popen | None = None
+        self.roots: list[str] = []  # gids we added, in add order
+        self._resolved: dict[str, str] = {}  # root gid -> current effective gid
+
+    # -- lifecycle -----------------------------------------------------------
+
+    def start(self, timeout: float = 10.0) -> None:
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        args = [
+            _binary(),
+            "--enable-rpc",
+            f"--rpc-listen-port={self.port}",
+            f"--rpc-secret={self.secret}",
+            "--rpc-listen-all=false",
+            f"--save-session={self.session}",  # private: never touch the user's session
+        ]
+        if self.conf and self.conf.is_file():
+            args.append(f"--conf-path={self.conf}")
+        if self.session.is_file():
+            args.append(f"--input-file={self.session}")  # resume our own downloads
+        self.proc = subprocess.Popen(
+            args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                self._call("aria2.getVersion")
+                return
+            except Aria2Error:
+                if self.proc.poll() is not None:
+                    raise Aria2Error("aria2c exited during startup")
+                time.sleep(0.1)
+        raise Aria2Error("aria2c RPC did not come up")
+
+    def stop(self) -> None:
+        try:
+            self._call("aria2.shutdown")
+        except Aria2Error:
+            pass
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+
+    def __enter__(self) -> "Aria2":
+        self.start()
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.stop()
+
+    # -- commands ------------------------------------------------------------
+
+    def add(self, magnet: str, options: dict | None = None) -> str:
+        gid = self._call("aria2.addUri", [[magnet], options or {}])
+        self.roots.append(gid)
+        self._resolved[gid] = gid
+        return gid
+
+    def remove(self, root: str) -> None:
+        gid = self._resolved.get(root, root)
+        for method in ("aria2.forceRemove", "aria2.removeDownloadResult"):
+            try:
+                self._call(method, [gid])
+            except Aria2Error:
+                pass
+        if root in self.roots:
+            self.roots.remove(root)
+        self._resolved.pop(root, None)
+
+    def global_stat(self) -> dict:
+        return self._call("aria2.getGlobalStat")
+
+    def poll(self) -> list[Download]:
+        """Current state of every tracked download, metadata->real gid resolved."""
+        out: list[Download] = []
+        for root in list(self.roots):
+            try:
+                st = self._call("aria2.tellStatus", [self._resolve(root)])
+            except Aria2Error:
+                continue
+            out.append(to_download(st))
+        return out
+
+    # -- internals -----------------------------------------------------------
+
+    def _resolve(self, root: str) -> str:
+        gid = self._resolved.get(root, root)
+        for _ in range(8):  # ponytail: cap the walk; a magnet is one hop
+            st = self._call("aria2.tellStatus", [gid, ["status", "followedBy"]])
+            nxt = _follow(st)
+            if nxt is None:
+                break
+            gid = nxt
+        self._resolved[root] = gid
+        return gid
+
+    def _call(self, method: str, params: list | None = None):
+        payload = {
+            "jsonrpc": "2.0",
+            "id": "trawl",
+            "method": method,
+            "params": [f"token:{self.secret}", *(params or [])],
+        }
+        req = urllib.request.Request(
+            self.endpoint,
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=self.TIMEOUT) as resp:
+                body = json.loads(resp.read().decode())
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            raise Aria2Error(f"{method}: {e}") from e
+        if isinstance(body, dict) and body.get("error"):
+            raise Aria2Error(f"{method}: {body['error'].get('message', '?')}")
+        return body.get("result")
+
+
+def _binary() -> str:
+    path = which("aria2c")
+    if not path:
+        raise Aria2Error("aria2c not found on PATH (brew install aria2)")
+    return path
+
+
+# -- self-check --------------------------------------------------------------
+
+
+def selftest() -> None:
+    """Exercise the engine end to end without depending on swarm health.
+
+    ponytail: deliberately does NOT wait for real download bytes (that needs a
+    live swarm + burns bandwidth). It proves spawn/RPC/add/poll/remove/shutdown
+    and the pure metadata/eta mapping. Real progress is verified in the TUI E2E.
+    """
+    # pure logic — no network
+    meta = to_download({"gid": "a", "status": "active", "totalLength": "0",
+                        "completedLength": "0", "downloadSpeed": "0",
+                        "files": [{"path": "/x/[METADATA]Some.Movie"}]})
+    assert meta.status == "metadata" and meta.name == "Some.Movie", meta
+    live = to_download({"gid": "b", "status": "active", "totalLength": "100",
+                       "completedLength": "50", "downloadSpeed": "10",
+                       "connections": "7", "files": [{"path": "/x/Some.Movie.mkv"}]})
+    assert live.progress == 0.5 and live.eta == 5.0 and live.peers == 7, live
+    assert _follow({"status": "complete", "followedBy": ["z"]}) == "z"
+    assert _follow({"status": "active", "followedBy": ["z"]}) is None
+    print("pure mapping ok")
+
+    # live plumbing — temp state, temp dir, no user conf, removed before any bytes
+    import tempfile
+    tmp = Path(tempfile.mkdtemp(prefix="trawl-selftest-"))
+    eng = Aria2(conf=None, state_dir=tmp)
+    with eng:
+        ver = eng._call("aria2.getVersion")
+        print(f"aria2 {ver['version']} up on :{eng.port}")
+        assert "numActive" in eng.global_stat()
+        # Big Buck Bunny — a real, valid infohash; removed immediately, no download.
+        magnet = ("magnet:?xt=urn:btih:dd8255ecdc7ca55fb0bbf81323d87062db1f6d1c"
+                  "&dn=trawl-selftest")
+        root = eng.add(magnet, {"dir": str(tmp)})
+        assert root, "addUri returned no gid"
+        rows = eng.poll()
+        assert any(d.gid for d in rows), f"added magnet not listed: {rows}"
+        print(f"added + polled ok ({len(rows)} row, status={rows[0].status})")
+        eng.remove(root)
+        assert eng.poll() == [], "remove left a row behind"
+        print("remove ok")
+    assert eng.proc.poll() is not None, "aria2c did not shut down"
+    print("shutdown ok")
+    print("\nPhase 1 selftest passed.")
+
+
+if __name__ == "__main__":
+    selftest()
