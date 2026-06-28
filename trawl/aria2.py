@@ -42,6 +42,7 @@ class Download:
     peers: int
     eta: float | None  # seconds remaining, None when unknown
     error: str = ""
+    root: str = ""  # the gid we added (poll sets it); remove() takes this
 
     @property
     def progress(self) -> float:
@@ -187,7 +188,9 @@ class Aria2:
                 st = self._call("aria2.tellStatus", [self._resolve(root)])
             except Aria2Error:
                 continue
-            out.append(to_download(st))
+            d = to_download(st)
+            d.root = root
+            out.append(d)
         return out
 
     # -- internals -----------------------------------------------------------
