@@ -11,6 +11,7 @@ import signal
 import sys
 import time
 
+from . import __version__
 from .aria2 import Aria2, Aria2Error
 from .sources import parse_magnet
 from .tui import App, Terminal, paste_clipboard, render
@@ -26,6 +27,9 @@ def main(argv: list[str] | None = None) -> int:
     for a in argv:
         if a in ("-h", "--help"):
             print(HELP)
+            return 0
+        if a in ("-V", "--version"):
+            print(f"trawl {__version__}")
             return 0
         if a.lower().startswith("magnet:?"):
             initial = a

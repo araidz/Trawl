@@ -5,6 +5,12 @@
  █  █▀▄ █▀█ ▀▄▀▄▀ █▄▄   ╲╱╲╱
 ```
 
+![macOS](https://img.shields.io/badge/macOS-000?logo=apple&logoColor=white)
+![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)
+![dependencies](https://img.shields.io/badge/dependencies-stdlib%20only-success)
+![release](https://img.shields.io/github/v/release/araidz/Trawl?color=a78bfa)
+![license](https://img.shields.io/badge/license-MIT-blue)
+
 A curated, terminal-native torrent finder. One search trawls a short list of
 reputable sources at once; pick a result and **aria2** downloads it. Just type
 `trawl` — no Node, no `npx`, no install step.
@@ -13,6 +19,41 @@ Trawl is a from-scratch Python TUI inspired by
 [torlink](https://github.com/baairon/torlink) (the look and feel) and driven by
 [aria2](https://aria2.github.io/) like its sibling
 [Riptide](https://github.com/araidz/Riptide) — **zero third-party packages, stdlib only.**
+
+## Preview
+
+```
+                      ▀█▀ █▀▄ ▄▀▄ █ ▄ █ █     ╱╲╱╲
+                       █  █▀▄ █▀█ ▀▄▀▄▀ █▄▄   ╲╱╲╱
+
+               A curated, terminal-native torrent finder.
+                   games  ·  movies  ·  tv  ·  anime
+
+    ╭─ Search ─────────────────────────────────────────────────────╮
+    │ ❯ Search or paste a magnet link…                             │
+    ╰──────────────────────────────────────────────────────────────╯
+
+                   type to search   ↵ browse   q quit
+```
+
+```
+  ▀█▀ █▀▄ ▄▀▄ █ ▄ █ █     ╱╲╱╲
+   █  █▀▄ █▀█ ▀▄▀▄▀ █▄▄   ╲╱╲╱
+  ────────────────────────────────────────────────────────────────────
+                    ╭─ Search ────────────────────────────────────────╮
+  ▌ All             │ ❯ oppenheimer                                   │
+    Games           ╰─────────────────────────────────────────────────╯
+    Movies
+    TV              ╭─ Results · seeders ─────────────────────── (3) ─╮
+    Anime           │ 3 results                                       │
+                    │    Name                     Size       S:L   Src │
+    Downloads       │ ❯  Oppenheimer (2023)…   1.83 GB   1240:88   YTS │
+                    │    Oppenheimer 2023 2…  14.90 GB    910:41   KNB │
+                    │    Oppenheimer.2023.P…   1.96 GB    540:30   TPB │
+                    ╰─────────────────────────────────────────────────╯
+
+  ↑↓ move  ·  enter details  ·  d grab  ·  o page  ·  y copy  ·  q quit
+```
 
 ## Features
 
@@ -27,25 +68,35 @@ Trawl is a from-scratch Python TUI inspired by
 - **Resume** — `s` scans the download folder for partial `*.aria2` files and resumes them.
 - **Quality of life** — persistent search history, completion notifications,
   clipboard magnet auto-detect, mouse-wheel scrolling, a settings overlay
-  (toggle sources, set the download dir), and a confirm-on-quit.
+  (toggle sources, set the download dir), and confirm-on-quit.
 - **Single file** — ships as one stdlib zipapp executable on your `PATH`.
 
 ## Requirements
 
 - **macOS** (uses `open`, `pbcopy`/`pbpaste`, `osascript`)
-- **Python 3** (developed on 3.14)
-- **[aria2](https://aria2.github.io/)** — `brew install aria2`
+- **[aria2](https://aria2.github.io/)** (Homebrew installs it for you)
+- **Python 3.10+**
 
 ## Install
 
+### Homebrew
+
 ```sh
-git clone https://github.com/araidz/Trawl.git && cd Trawl
-sh build.sh                                  # -> dist/trawl (one self-contained file)
-ln -sf "$PWD/dist/trawl" /opt/homebrew/bin/trawl   # or anywhere on your PATH
-trawl
+brew tap araidz/trawl https://github.com/araidz/Trawl
+brew install trawl
 ```
 
-Or run from source without building: `python3 -m trawl`.
+`brew` pulls in `aria2` and Python automatically. Update later with `brew upgrade trawl`.
+
+### From source
+
+```sh
+git clone https://github.com/araidz/Trawl.git && cd Trawl
+sh build.sh                                       # -> dist/trawl (one self-contained file)
+ln -sf "$PWD/dist/trawl" /opt/homebrew/bin/trawl  # or anywhere on your PATH
+```
+
+Needs `aria2` (`brew install aria2`). Or run without building: `python3 -m trawl`.
 
 ## Usage
 
@@ -61,11 +112,11 @@ empty box to browse the latest, or paste a magnet link to grab it directly.
 | `Enter` | result details |
 | `d` | download selected |
 | `o` | open the torrent's page in your browser |
-| `y` | copy magnet · `v` grab a magnet from the clipboard |
+| `y` copy magnet · `v` | grab a magnet from the clipboard |
 | `S` | cycle sort (seeders / size / newest) |
-| `← →` | filter by category · `c` clear results |
+| `← →` filter category · `c` | clear results |
 | `s` | resume partial downloads found on disk |
-| `g` | settings · `?` keys · `q` quit |
+| `g` settings · `?` keys · `q` | quit |
 
 **Downloads** (`Tab` to switch)
 
@@ -74,7 +125,7 @@ empty box to browse the latest, or paste a magnet link to grab it directly.
 | `↑ ↓` | move / scroll |
 | `p` | pause / resume · `x` cancel |
 | `o` | reveal the file in Finder |
-| `s` | resume partials · `g` settings · `q` quit |
+| `s` resume · `g` settings · `q` | quit |
 
 ## What it searches
 
