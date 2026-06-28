@@ -40,7 +40,7 @@ Trawl is a from-scratch Python TUI inspired by
 
 ```sh
 git clone <your-repo-url> Trawl && cd Trawl
-sh build.sh                                  # -> dist/trawl (single ~70 KB file)
+sh build.sh                                  # -> dist/trawl (one self-contained file)
 ln -sf "$PWD/dist/trawl" /opt/homebrew/bin/trawl   # or anywhere on your PATH
 trawl
 ```
