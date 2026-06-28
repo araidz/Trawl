@@ -61,7 +61,7 @@ def main(argv: list[str] | None = None) -> int:
             now = time.monotonic()
             if now - last_poll > 0.5:
                 try:
-                    app.downloads = eng.poll()
+                    app.update_downloads(eng.poll())
                     g = eng.global_stat()
                     app.down_speed = int(g.get("downloadSpeed", 0) or 0)
                     app.num_active = int(g.get("numActive", 0) or 0)

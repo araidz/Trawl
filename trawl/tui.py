@@ -9,6 +9,7 @@ without a terminal or aria2 (so render/keys are testable).
 from __future__ import annotations
 
 import glob
+import json
 import os
 import queue
 import re
@@ -182,6 +183,16 @@ def open_url(url: str) -> bool:
         return True
     except (OSError, subprocess.CalledProcessError):
         return False
+
+
+def notify(title: str, message: str) -> None:
+    """Fire-and-forget macOS desktop notification (never blocks the UI)."""
+    script = f"display notification {json.dumps(clean(message)[:200])} with title {json.dumps(title)}"
+    try:
+        subprocess.Popen(["osascript", "-e", script],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        pass
 
 
 # -- progress bar ------------------------------------------------------------
@@ -418,6 +429,17 @@ class App:
         if changed:
             self.results = sort_results(dedupe(self.results))
             self.sel = min(self.sel, max(0, len(self.visible_results()) - 1))
+
+    def update_downloads(self, downloads: list[Download]) -> None:
+        """Replace the download list, notifying on any active->complete transition
+        seen this session (not for downloads that were already complete when first
+        polled, so launching with finished items stays quiet)."""
+        prev = {d.root: d.status for d in self.downloads}
+        for d in downloads:
+            was = prev.get(d.root)
+            if d.status == "complete" and was is not None and was != "complete":
+                notify("trawl — download complete", d.name)
+        self.downloads = downloads
 
     def _move(self, d: int) -> None:
         if self.view == "downloads":
@@ -1081,6 +1103,20 @@ def selftest() -> None:
     apps.dsel = 0
     apps.on_key("o")
     assert "metadata" in apps.status, apps.status
+    # completion notification: once on active->complete, never for pre-complete/staying
+    gn = globals()
+    orig_notify, notes = gn["notify"], []
+    gn["notify"] = lambda t, m: notes.append((t, m))
+    appn = App(eng=None)
+    appn.update_downloads([Download("g", "Movie", "active", 100, 50, 1, 1, None, root="r1"),
+                           Download("g2", "Old", "complete", 1, 1, 0, 0, None, root="r2")])
+    assert notes == [], "no notify on first sight (incl already-complete)"
+    appn.update_downloads([Download("g", "Movie", "complete", 100, 100, 0, 0, None, root="r1"),
+                           Download("g2", "Old", "complete", 1, 1, 0, 0, None, root="r2")])
+    assert notes == [("trawl — download complete", "Movie")], notes
+    appn.update_downloads([Download("g", "Movie", "complete", 100, 100, 0, 0, None, root="r1")])
+    assert len(notes) == 1, "no re-notify while staying complete"
+    gn["notify"] = orig_notify
     print("interaction ok")
 
     # render: search nav, downloads, help — sized lines, no overflow, no crash
