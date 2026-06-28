@@ -8,6 +8,7 @@ without a terminal or aria2 (so render/keys are testable).
 
 from __future__ import annotations
 
+import glob
 import os
 import queue
 import re
@@ -21,8 +22,9 @@ import tty
 import unicodedata
 
 from . import theme as T
-from .aria2 import Aria2Error, Download
-from .sources import (SOURCES, Result, Search, dedupe, parse_magnet, sort_results)
+from .aria2 import Aria2Error, Download, control_infohash
+from .sources import (SOURCES, Result, Search, build_magnet, dedupe, parse_magnet,
+                      sort_results)
 
 GROUP_OF = {s.id: s.group for s in SOURCES}
 CATS = [("all", "All"), ("games", "Games"), ("movies", "Movies"),
@@ -325,6 +327,7 @@ class App:
         self.status = ""
         self.running = True
         self.confirm_quit = False
+        self.detail: Result | None = None  # search result shown in the details view
         self.start = time.monotonic()
 
     # -- derived
@@ -353,6 +356,7 @@ class App:
         self.search = Search(q)
         self.results, self.errors, self.search_done, self.sel = [], {}, 0, 0
         self.editing = False
+        self.detail = None
         self.status = f'searching "{clean(q)}"' if q else "loading latest"
 
     def clear(self) -> None:
@@ -361,6 +365,7 @@ class App:
         self.results, self.errors, self.search_done, self.sel = [], {}, 0, 0
         self.query = ""
         self.editing = False
+        self.detail = None
         self.status = ""
 
     def grab(self, magnet: str, name: str) -> None:
@@ -372,6 +377,28 @@ class App:
             self.status = f"grabbing: {clean(name)[:48]}"
         except Aria2Error as e:
             self.status = f"error: {e}"
+
+    def scan_resume(self) -> int:
+        """Re-add incomplete BT downloads (*.aria2 control files) found in the
+        download dir that aria2 isn't already running."""
+        if not self.eng:
+            return 0
+        dir_path = self.eng.download_dir()
+        if not dir_path or not os.path.isdir(dir_path):
+            return 0
+        have = self.eng.active_infohashes()
+        n = 0
+        for ctrl in glob.glob(os.path.join(dir_path, "*.aria2")):
+            ih = control_infohash(ctrl)
+            if not ih or ih in have:
+                continue
+            try:
+                self.eng.add(build_magnet(ih, os.path.basename(ctrl)[:-7]), {"dir": dir_path})
+                have.add(ih)
+                n += 1
+            except Aria2Error:
+                pass
+        return n
 
     def drain_search(self) -> None:
         if not self.search:
@@ -418,6 +445,21 @@ class App:
             elif k == "esc":
                 self.confirm_quit = False
             return
+        if self.detail is not None:
+            if k in ("esc", "enter", "q"):
+                self.detail = None
+            elif k == "d":
+                self.grab(self.detail.magnet, self.detail.name)
+                self.detail = None
+            elif k == "o":
+                page = self.detail.page
+                self.status = ("opened in browser" if page and open_url(page)
+                               else "no page for this source" if not page
+                               else "couldn't open browser")
+            elif k == "y":
+                self.status = ("magnet copied to clipboard"
+                               if copy_clipboard(self.detail.magnet) else "copy failed")
+            return
         if self.view == "search" and self.editing:
             if k == "enter":
                 self.submit()
@@ -454,6 +496,13 @@ class App:
             self.help = True
         elif k == "tab":
             self.view = "downloads" if self.view == "search" else "search"
+            self.detail = None
+        elif k == "s":
+            n = self.scan_resume()
+            self.status = (f"resumed {n} download{'' if n == 1 else 's'}" if n
+                           else "nothing to resume on disk")
+            if n:
+                self.view = "downloads"
         elif k in ("up", "k"):
             self._move(-1)
         elif k in ("down", "j"):
@@ -467,10 +516,14 @@ class App:
                 self.editing = True
             elif k == "c":
                 self.clear()
-            elif k in ("d", "enter"):
+            elif k == "d":
                 rs = self.visible_results()
                 if rs and 0 <= self.sel < len(rs):
                     self.grab(rs[self.sel].magnet, rs[self.sel].name)
+            elif k == "enter":
+                rs = self.visible_results()
+                if rs and 0 <= self.sel < len(rs):
+                    self.detail = rs[self.sel]
             elif k == "y":
                 rs = self.visible_results()
                 if rs and 0 <= self.sel < len(rs):
@@ -505,8 +558,12 @@ class App:
                         self.eng.pause(d.root)
                     self.status = f"paused: {clean(d.name)[:40]}"
             elif k == "o":
-                self.status = (f"revealed: {clean(d.name)[:40]}"
-                               if reveal(d.path or "") else "couldn't open location")
+                if not d.path or d.status == "metadata":
+                    self.status = "location not ready yet — fetching metadata"
+                elif reveal(d.path):
+                    self.status = f"revealed: {clean(d.name)[:40]}"
+                else:
+                    self.status = "couldn't open location"
 
 
 # -- rendering ---------------------------------------------------------------
@@ -516,6 +573,43 @@ def _window(sel: int, total: int, h: int) -> int:
     if total <= h:
         return 0
     return max(0, min(sel - h // 2, total - h))
+
+
+def _wrap(text: str, width: int) -> list[str]:
+    lines, cur = [], ""
+    for w in text.split():
+        if cur and dwidth(cur) + 1 + dwidth(w) > width:
+            lines.append(cur)
+            cur = w
+        else:
+            cur = f"{cur} {w}" if cur else w
+    if cur:
+        lines.append(cur)
+    return lines or [""]
+
+
+def _detail_panel(r: Result, width: int, height: int) -> list[str]:
+    inner_w = width - 4
+    inner = [cell(line, inner_w, color=T.ACCENT, bold=True) for line in _wrap(clean(r.name), inner_w)]
+    inner.append(cell("", inner_w))
+
+    def field(label: str, value: str, color: str | None = None) -> str:
+        return "  " + cell(label, 7, dim=True) + cell(value, inner_w - 9, color=color)
+
+    tag, _ = T.source_style(r.source)
+    health = (f"{r.seeders} seeders · {r.leechers} leechers"
+              if (r.seeders or r.leechers) else "unknown")
+    inner.append(field("Source", tag))
+    inner.append(field("Size", fmt_bytes(r.size)))
+    inner.append(field("Health", health, T.GOOD if r.seeders else None))
+    if r.added:
+        inner.append(field("Added", fmt_rel(r.added)))
+    if r.num_files:
+        inner.append(field("Files", str(r.num_files)))
+    inner.append(field("Hash", r.info_hash))
+    if r.page:
+        inner.append(field("Page", r.page))
+    return _wrap_panel("Details", inner, width, height, True)
 
 
 def _panel_top(title: str, width: int, count: str | None, bw: str) -> str:
@@ -697,12 +791,12 @@ def _downloads_panel(app: App, width: int, height: int) -> list[str]:
 def _help_panel(width: int, height: int) -> list[str]:
     inner_w = width - 4
     groups = [
-        ("Search", [("type", "search (paste a magnet to grab)"), ("enter", "run search"),
-                    ("/  i", "edit query"), ("o", "open torrent page in browser"),
-                    ("y", "copy magnet"), ("c", "clear results"), ("← →", "filter category")]),
+        ("Search", [("type", "search (paste a magnet to grab)"), ("enter", "details"),
+                    ("d", "download"), ("o", "open page in browser"), ("y", "copy magnet"),
+                    ("/  i", "edit query"), ("c", "clear results"), ("← →", "filter category")]),
         ("Navigate", [("↑ ↓  j k", "move selection"), ("tab", "switch search / downloads")]),
-        ("Downloads", [("d  enter", "download selected"), ("p", "pause / resume"),
-                       ("x", "cancel / remove"), ("o", "reveal in Finder")]),
+        ("Downloads", [("p", "pause / resume"), ("x", "cancel / remove"),
+                       ("o", "reveal in Finder"), ("s", "resume partial downloads on disk")]),
         ("General", [("?", "this help"), ("q", "quit (confirm)"), ("ctrl-c", "quit now")]),
     ]
     inner = [cell("Keys", inner_w, color=T.ACCENT, bold=True), cell("", inner_w)]
@@ -717,14 +811,16 @@ def _help_panel(width: int, height: int) -> list[str]:
 def _footer(app: App, width: int) -> str:
     if app.help:
         hints = [("any key", "close")]
+    elif app.detail is not None:
+        hints = [("d", "download"), ("o", "page"), ("y", "copy magnet"), ("esc", "back"), ("q", "back")]
     elif app.view == "search" and app.editing:
         hints = [("enter", "search"), ("esc", "nav"), ("tab", "downloads"), ("^c", "quit")]
     elif app.view == "search":
-        hints = [("↑↓", "move"), ("d", "grab"), ("o", "page"), ("y", "copy"), ("←→", "category"),
-                 ("/", "edit"), ("c", "clear"), ("tab", "downloads"), ("?", "keys"), ("q", "quit")]
+        hints = [("↑↓", "move"), ("enter", "details"), ("d", "grab"), ("o", "page"), ("y", "copy"),
+                 ("←→", "category"), ("/", "edit"), ("c", "clear"), ("s", "resume"), ("q", "quit")]
     else:
         hints = [("↑↓", "move"), ("p", "pause/resume"), ("x", "cancel"), ("o", "reveal"),
-                 ("tab", "search"), ("?", "keys"), ("q", "quit")]
+                 ("s", "resume"), ("tab", "search"), ("?", "keys"), ("q", "quit")]
     out, used = "", 0
     if app.status:
         st = dtrunc(clean(app.status), max(10, width // 2))
@@ -840,7 +936,9 @@ def render(app: App, cols: int, rows: int) -> list[str]:
         search_h = 3
         content = _search_panel(app, content_w) + [""]
         panel_h = body_h - search_h - 1
-        if app.view == "search":
+        if app.view == "search" and app.detail is not None:
+            content += _detail_panel(app.detail, content_w, panel_h)
+        elif app.view == "search":
             content += _results_panel(app, content_w, panel_h)
         else:
             content += _downloads_panel(app, content_w, panel_h)
@@ -955,6 +1053,34 @@ def selftest() -> None:
     assert hit[-1] == ("reveal", "/tmp/F"), hit
     for k, v in orig.items():
         g[k] = v
+    # details view: enter opens, esc closes, d grabs from it
+    appx = App(eng=None)
+    appx.search = Search.__new__(Search)
+    appx.editing = False
+    appx.results = [Result("c" * 40, "Some Movie", 1, 5, 1, "yts", "magnet:?xt=z", page="http://p")]
+    appx.on_key("enter")
+    assert appx.detail is appx.results[0], "enter opens details"
+    appx.on_key("esc")
+    assert appx.detail is None, "esc closes details"
+    appx.on_key("enter")
+    grabbed2 = {}
+    appx.grab = lambda m, n: grabbed2.update(m=m)  # type: ignore
+    appx.on_key("d")
+    assert grabbed2.get("m") == "magnet:?xt=z" and appx.detail is None, "d grabs from details"
+
+    # s scans for resumables via the engine; metadata reveal gives a clear message
+    class _ScanEng:
+        def download_dir(self): return "/no-such-dir-xyz"
+        def active_infohashes(self): return set()
+
+    apps = App(eng=_ScanEng())
+    apps.view = "downloads"
+    apps.on_key("s")
+    assert apps.status == "nothing to resume on disk", apps.status
+    apps.downloads = [Download("g", "m", "metadata", 0, 0, 0, 0, None, root="r", path="")]
+    apps.dsel = 0
+    apps.on_key("o")
+    assert "metadata" in apps.status, apps.status
     print("interaction ok")
 
     # render: search nav, downloads, help — sized lines, no overflow, no crash
@@ -988,6 +1114,13 @@ def selftest() -> None:
     f = "\n".join(strip_ansi(x) for x in render(app2, 100, 30))
     assert "Active.Movie.mkv" in f and "fetching metadata" in f, "downloads view"
     assert "█" in f or "░" in f, "no progress bar"
+    # details view renders, width-safe
+    app2.view, app2.detail = "search", app2.results[0]
+    df = render(app2, 100, 30)
+    for ln in df:
+        assert dwidth(strip_ansi(ln)) <= 100, "details overflow"
+    assert any("Details" in strip_ansi(x) for x in df) and any("Health" in strip_ansi(x) for x in df), "details view"
+    app2.detail = None
     # quit-confirm modal stamps over the center, width-safe
     app2.confirm_quit = True
     cf = render(app2, 100, 30)
