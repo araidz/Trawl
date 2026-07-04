@@ -55,12 +55,15 @@ SOURCE_STYLE: dict[str, tuple[str, str]] = {
     "solid": ("SLD", "#60a5fa"),
     "tpb-movies": ("TPB", "#5fd0c5"),
     "tpb-tv": ("TPB", "#5fd0c5"),
+    "tpb-books": ("TPB", "#5fd0c5"),
     "x1337-movies": ("1337", "#f6a55c"),
     "x1337-tv": ("1337", "#f6a55c"),
     "dodi": ("DODI", "#e0af68"),
     "animetosho": ("ATSH", "#bb9af7"),
     "knaben": ("KNB", "#7dcfff"),
     "torrentgalaxy": ("TGx", "#9ece6a"),
+    "nyaa-books": ("NYAA", BRIGHT),
+    "libgen": ("LGEN", "#8fd694"),
 }
 
 

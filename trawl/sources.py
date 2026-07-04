@@ -60,7 +60,8 @@ class Result:
 class ParsedMagnet:
     info_hash: str
     name: str
-    magnet: str
+    magnet: str  # the URI handed to aria2: a magnet or an http(s) link
+    kind: str = "magnet"  # magnet | link | torrent (.torrent link)
 
 
 @dataclass(frozen=True)
@@ -149,6 +150,21 @@ def parse_magnet(s: str) -> ParsedMagnet | None:
     if dn:
         name = dn[0]
     return ParsedMagnet(info_hash, name, s)
+
+
+def parse_source(s: str) -> ParsedMagnet | None:
+    """A grabbable input: a magnet or a direct http(s) link. Both go straight to
+    aria2's addUri; the name is only a UI label. info_hash is "" for links."""
+    s = s.strip()
+    pm = parse_magnet(s)
+    if pm:
+        return pm
+    if s.lower().startswith(("http://", "https://")):
+        p = urllib.parse.urlparse(s)
+        name = urllib.parse.unquote(p.path.rsplit("/", 1)[-1]) or p.netloc or s
+        kind = "torrent" if p.path.lower().endswith(".torrent") else "link"
+        return ParsedMagnet("", name, s, kind)
+    return None
 
 
 _SIZE_UNITS = {"B": 1, "KIB": 1024, "MIB": 1024 ** 2, "GIB": 1024 ** 3,
@@ -270,6 +286,13 @@ def _tpb_tv(q: str) -> list[Result]:
     return _tpb(q, _TPB_TV_CATS, f"{_TPB}/precompiled/data_top100_208.json", "tpb-tv")
 
 
+_TPB_BOOK_CATS = {601, 602}  # 601 e-books, 602 comics
+
+
+def _tpb_books(q: str) -> list[Result]:
+    return _tpb(q, _TPB_BOOK_CATS, f"{_TPB}/precompiled/data_top100_601.json", "tpb-books")
+
+
 def _eztv(query: str) -> list[Result]:
     if query.strip():  # EZTV API has no text search — browse only
         return []
@@ -373,8 +396,8 @@ def _dodi(query: str) -> list[Result]:
     return _wordpress_repacks("https://dodi-repacks.site", "dodi", query)
 
 
-def _nyaa(query: str) -> list[Result]:
-    params = {"page": "rss", "q": query.strip(), "c": "0_0", "f": "0"}
+def _nyaa(query: str, cat: str = "0_0", source: str = "nyaa") -> list[Result]:
+    params = {"page": "rss", "q": query.strip(), "c": cat, "f": "0"}
     out = []
     for item in _rss_items(fetch(f"https://nyaa.si/?{urllib.parse.urlencode(params)}")):
         h = _tag(item, "nyaa:infoHash").lower()
@@ -385,7 +408,7 @@ def _nyaa(query: str) -> list[Result]:
         page = f"https://nyaa.si/view/{vid.group(1)}" if vid else None
         out.append(Result(h, name, parse_size(_tag(item, "nyaa:size")),
                           _int(_tag(item, "nyaa:seeders")), _int(_tag(item, "nyaa:leechers")),
-                          "nyaa", build_magnet(h, name), _rfc822_unix(_tag(item, "pubDate")),
+                          source, build_magnet(h, name), _rfc822_unix(_tag(item, "pubDate")),
                           page=page))
     return out
 
@@ -474,6 +497,8 @@ def _knaben_group(category: str | None) -> str | None:
     c = category or ""
     if c.startswith("XXX"):
         return "SKIP"
+    if "Book" in c or "Comic" in c:
+        return "Books"
     for token in ("Anime", "Movies", "TV", "Games"):
         if token in c:
             return token
@@ -568,6 +593,59 @@ def _tgx(query: str) -> list[Result]:
     return out
 
 
+# -- sources: libgen (direct-download library, not a tracker) ----------------
+
+_LG_HOSTS = ["libgen.li", "libgen.vg", "libgen.la"]
+
+
+def _strip_tags(s: str) -> str:
+    return re.sub(r"<[^>]+>", "", s).strip()
+
+
+def _libgen(query: str) -> list[Result]:
+    """Library Genesis: HTML search; download is a direct http link via
+    get.php?md5= (aria2 follows the CDN redirect and keeps the real filename).
+    info_hash carries the md5 (dedupe key, not a btih); it's a link, not a magnet.
+    ponytail: rotating domains + HTML scrape — breaks if libgen reshuffles its
+    markup/hosts; upgrade path is a stable JSON API if one appears."""
+    q = query.strip()
+    if not q:  # a library, not a feed — search only, no browse
+        return []
+    page = host = last = None
+    for h in _LG_HOSTS:
+        try:
+            host = h
+            page = fetch(f"https://{h}/index.php?req={urllib.parse.quote_plus(q)}", retries=1, timeout=12)
+            break
+        except SourceError as e:
+            last = e
+    if page is None:
+        raise last or SourceError("libgen unreachable")
+    out = []
+    for row in re.split(r"<tr[\s>]", page):
+        mm = re.search(r"get\.php\?md5=([a-fA-F0-9]{32})", row)
+        if not mm:
+            continue
+        cells = re.findall(r"<td[^>]*>(.*?)</td>", row, re.S)
+        dl = next((i for i, c in enumerate(cells) if "get.php?md5=" in c), -1)
+        if dl < 2:
+            continue
+        md5 = mm.group(1).lower()
+        gt = re.search(r'color="gray">.*?<br>\s*(.*?)\s*<br>', cells[0], re.S)
+        at = re.search(r"<a [^>]*>([^<]+)</a>", cells[0])
+        title = html.unescape(_strip_tags(gt.group(1) if gt else (at.group(1) if at else "")))
+        if not title:
+            continue
+        author = html.unescape(_strip_tags(cells[1]))
+        ext = _strip_tags(cells[dl - 1]).lower()
+        size = parse_size(_strip_tags(cells[dl - 2]))
+        name = f"{title} [{ext}]" + (f" — {author}" if author else "")
+        out.append(Result(md5, name, size, 0, 0, "libgen",
+                          f"https://{host}/get.php?md5={md5}",
+                          page=f"https://{host}/ads.php?md5={md5}", group="Books"))
+    return out
+
+
 # -- registry ----------------------------------------------------------------
 
 SOURCES: list[Source] = [
@@ -583,6 +661,9 @@ SOURCES: list[Source] = [
     Source("nyaa", "Nyaa", "Anime", _nyaa),
     Source("subsplease", "SubsPlease", "Anime", _subsplease),
     Source("animetosho", "AnimeTosho", "Anime", _animetosho),
+    Source("tpb-books", "TPB", "Books", _tpb_books),
+    Source("nyaa-books", "Nyaa", "Books", lambda q: _nyaa(q, "3_1", "nyaa-books")),
+    Source("libgen", "LibGen", "Books", _libgen),
     Source("knaben", "Knaben", "Other", _knaben),
     Source("torrentgalaxy", "TGx", "Other", _tgx),
 ]
@@ -660,6 +741,14 @@ def selftest() -> None:
     b32 = base64.b32encode(bytes.fromhex(h40)).decode()
     assert normalize_info_hash(b32) == h40, "base32->hex"
     assert parse_magnet("not a magnet") is None
+    # parse_source: magnet passes through; http(s) becomes a grabbable link with
+    # a filename label; anything else (a search query) is not grabbable.
+    assert parse_source(build_magnet(h40, "x")).kind == "magnet"
+    lk = parse_source("https://example.com/files/My%20Book.epub")
+    assert lk and lk.info_hash == "" and lk.name == "My Book.epub" and lk.kind == "link", lk
+    assert parse_source("https://example.com").name == "example.com"
+    assert parse_source("https://x.org/a/b.torrent").kind == "torrent"
+    assert parse_source("oppenheimer 2023") is None
     merged = dedupe([
         Result(h40, "lo", 1, 5, 0, "a", "m"),
         Result(h40, "hi", 1, 50, 0, "b", "m"),
@@ -687,7 +776,7 @@ def selftest() -> None:
     assert _knaben_group("PC / Games") == "Games"
     assert _knaben_group("Anime / Subbed") == "Anime"
     assert _knaben_group("XXX / Video") == "SKIP"
-    assert _knaben_group("Books / EBooks") is None
+    assert _knaben_group("Books / EBooks") == "Books"
     # TGx + DODI parsers (synthetic pages; fetch monkeypatched — real sites unverified here)
     _g = globals()
     _of = _g["fetch"]
@@ -713,6 +802,21 @@ def selftest() -> None:
     dd = _dodi("cyberpunk")
     assert len(dd) == 1 and dd[0].source == "dodi" and dd[0].name == "Cyberpunk 2077", dd
     assert dd[0].page == "https://dodi-repacks.site/cyberpunk-2077/", dd[0].page
+    _g["fetch"] = lambda *a, **k: (
+        '<table><tr>'
+        '<td><a href="edition.php?id=1">x</a>'
+        '<font size=1 color="gray"><br>The Hobbit <br></font></td>'
+        '<td>J.R.R. Tolkien</td><td>Allen</td><td>1937</td><td>English</td><td>300</td>'
+        '<td><a href="/file.php?id=1">2 MB</a></td><td>epub</td>'
+        '<td><a href="/get.php?md5=aabbccddeeff00112233445566778899">Libgen</a></td>'
+        '</tr></table>')
+    lg = _libgen("hobbit")
+    assert len(lg) == 1 and lg[0].source == "libgen" and lg[0].group == "Books", lg
+    assert lg[0].info_hash == "aabbccddeeff00112233445566778899", lg[0].info_hash
+    assert lg[0].name == "The Hobbit [epub] — J.R.R. Tolkien", lg[0].name
+    assert lg[0].size == 2_000_000, lg[0].size
+    assert lg[0].magnet == "https://libgen.li/get.php?md5=aabbccddeeff00112233445566778899", lg[0].magnet
+    assert _libgen("") == [], "libgen browse is search-only"
     _g["fetch"] = _of
     print("pure logic ok")
 
@@ -735,8 +839,13 @@ def selftest() -> None:
         else:
             counts[u.source] = len(u.results)
             for r in u.results:
-                assert re.fullmatch(r"[a-f0-9]{40}", r.info_hash), f"bad hash from {u.source}: {r.info_hash!r}"
-                assert r.magnet.lower().startswith("magnet:?"), f"bad magnet from {u.source}"
+                # torrent rows: btih + magnet. direct-download rows (libgen): a
+                # 32-hex md5 + an http link. Both must be a grabbable uri aria2 takes.
+                if r.magnet.lower().startswith("magnet:?"):
+                    assert re.fullmatch(r"[a-f0-9]{40}", r.info_hash), f"bad hash from {u.source}: {r.info_hash!r}"
+                else:
+                    assert r.magnet.lower().startswith("http"), f"bad uri from {u.source}: {r.magnet!r}"
+                    assert re.fullmatch(r"[a-f0-9]{32}", r.info_hash), f"bad md5 from {u.source}: {r.info_hash!r}"
                 if r.page:
                     assert r.page.startswith("http"), f"bad page from {u.source}: {r.page!r}"
                     pages[u.source] = pages.get(u.source, 0) + 1

@@ -30,7 +30,7 @@ Trawl is a from-scratch Python TUI inspired by
                    games  ·  movies  ·  tv  ·  anime
 
     ╭─ Search ─────────────────────────────────────────────────────╮
-    │ ❯ Search or paste a magnet link…                             │
+    │ ❯ Search, or paste a magnet or link…                         │
     ╰──────────────────────────────────────────────────────────────╯
 
                    type to search   ↵ browse   q quit
@@ -46,7 +46,7 @@ Trawl is a from-scratch Python TUI inspired by
     Movies
     TV              ╭─ Results · seeders ─────────────────────── (3) ─╮
     Anime           │ 3 results                                       │
-                    │    Name                     Size       S:L   Src │
+    Books           │    Name                     Size       S:L   Src │
     Downloads       │ ❯  Oppenheimer (2023)…   1.83 GB   1240:88   YTS │
                     │    Oppenheimer 2023 2…  14.90 GB    910:41   KNB │
                     │    Oppenheimer.2023.P…   1.96 GB    540:30   TPB │
@@ -57,10 +57,11 @@ Trawl is a from-scratch Python TUI inspired by
 
 ## Features
 
-- **Multi-source search** — 14 sources (incl. the Knaben meta-aggregator) queried
+- **Multi-source search** — 17 sources (incl. the Knaben meta-aggregator) queried
   concurrently, results streamed in and merged, sorted by seeders (toggle to size / newest).
 - **aria2 engine** — spawns a private `aria2c` over JSON-RPC; honors your
-  `~/.aria2/aria2.conf`. Magnet metadata → real download handoff handled.
+  `~/.aria2/aria2.conf`. Magnet metadata → real download handoff handled; direct
+  http(s) links download too.
 - **Downloads pane** — live progress (animated bar), speed, ETA, peers;
   pause / resume / cancel; reveal in Finder; a persistent *Recently downloaded* list.
 - **Inspect before grabbing** — a details view, open the torrent's page in your
@@ -101,18 +102,18 @@ Needs `aria2` (`brew install aria2`). Or run without building: `python3 -m trawl
 ## Usage
 
 Trawl opens to a search bar. Type and press Enter to search, press Enter on an
-empty box to browse the latest, or paste a magnet link to grab it directly.
+empty box to browse the latest, or paste a magnet or direct http(s) link to grab it.
 
 **Search**
 
 | Key | Action |
 | --- | --- |
-| type · `Enter` | search (paste a magnet to grab) |
+| type · `Enter` | search (paste a magnet or link to grab) |
 | `↑ ↓` | recall past searches / scroll results |
 | `Enter` | result details |
 | `d` | download selected |
 | `o` | open the torrent's page in your browser |
-| `y` copy magnet · `v` | grab a magnet from the clipboard |
+| `y` copy magnet · `v` | grab a magnet or link from the clipboard |
 | `S` | cycle sort (seeders / size / newest) |
 | `← →` filter category · `c` | clear results |
 | `s` | resume partial downloads found on disk |
@@ -135,6 +136,7 @@ empty box to browse the latest, or paste a magnet link to grab it directly.
 | Movies | YTS · The Pirate Bay · 1337x |
 | TV | EZTV · SolidTorrents · The Pirate Bay · 1337x |
 | Anime | Nyaa · SubsPlease · AnimeTosho |
+| Books | The Pirate Bay · Nyaa (literature) · Library Genesis |
 | All | Knaben (meta-aggregator) · TorrentGalaxy |
 
 Toggle any source on or off in the settings overlay (`g`). If a source is down,

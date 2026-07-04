@@ -24,12 +24,13 @@ import unicodedata
 
 from . import theme as T
 from .aria2 import STATE_DIR, Aria2Error, Download, control_infohash
-from .sources import (SOURCES, Result, Search, build_magnet, dedupe, parse_magnet)
+from .sources import (SOURCES, Result, Search, build_magnet, dedupe, parse_source)
 
 GROUP_OF = {s.id: s.group for s in SOURCES}
 CATS = [("all", "All"), ("games", "Games"), ("movies", "Movies"),
-        ("tv", "TV"), ("anime", "Anime")]
-CAT_GROUP = {"games": "Games", "movies": "Movies", "tv": "TV", "anime": "Anime"}
+        ("tv", "TV"), ("anime", "Anime"), ("books", "Books")]
+CAT_GROUP = {"games": "Games", "movies": "Movies", "tv": "TV", "anime": "Anime",
+             "books": "Books"}
 
 HIST_MAX = 100
 HIST_FILE = STATE_DIR / "history.txt"
@@ -420,6 +421,7 @@ class App:
         self.status = ""
         self.running = True
         self.confirm_quit = False
+        self.torrent_prompt = None  # ParsedMagnet of a pending .torrent link (file vs contents)
         self.detail: Result | None = None  # search result shown in the details view
         cfg = load_config()
         self.disabled_sources: set[str] = set(cfg.get("disabled_sources", []))
@@ -451,9 +453,9 @@ class App:
     # -- actions
     def submit(self) -> None:
         q = self.query.strip()
-        pm = parse_magnet(q)
+        pm = parse_source(q)
         if pm:
-            self.grab(pm.magnet, pm.name)
+            self._grab_source(pm)
             self.query = ""
             self.editing = False
             return
@@ -500,6 +502,27 @@ class App:
         try:
             self.eng.add(magnet)
             self.status = f"grabbing: {clean(name)[:48]}"
+        except Aria2Error as e:
+            self.status = f"error: {e}"
+
+    def _grab_source(self, pm) -> None:
+        """Grab a parsed input; a .torrent link first asks file-vs-contents."""
+        if pm.kind == "torrent":
+            self.torrent_prompt = pm
+        else:
+            self.grab(pm.magnet, pm.name)
+
+    def grab_torrent(self, url: str, name: str, contents: bool) -> None:
+        """A .torrent link: follow-torrent=mem grabs its contents; =false saves
+        just the .torrent file. aria2 handles both natively."""
+        if not self.eng:
+            self.status = f"(no engine) {clean(name)[:48]}"
+            return
+        try:
+            self.eng.add(url, {"follow-torrent": "mem" if contents else "false"})
+            self.status = (f"grabbing torrent: {clean(name)[:40]}" if contents
+                           else f"downloading .torrent file: {clean(name)[:40]}")
+            self.view = "downloads"
         except Aria2Error as e:
             self.status = f"error: {e}"
 
@@ -635,6 +658,17 @@ class App:
             elif k == "esc":
                 self.confirm_quit = False
             return
+        if self.torrent_prompt is not None:
+            pm = self.torrent_prompt
+            if k in ("t", "enter"):
+                self.grab_torrent(pm.magnet, pm.name, True)
+                self.torrent_prompt = None
+            elif k == "f":
+                self.grab_torrent(pm.magnet, pm.name, False)
+                self.torrent_prompt = None
+            elif k in ("esc", "q"):
+                self.torrent_prompt = None
+            return
         if self.settings:
             self._settings_key(k)
             return
@@ -705,11 +739,11 @@ class App:
             if n:
                 self.view = "downloads"
         elif k == "v":
-            pm = parse_magnet(paste_clipboard())
+            pm = parse_source(paste_clipboard())
             if pm:
-                self.grab(pm.magnet, pm.name)
+                self._grab_source(pm)
             else:
-                self.status = "no magnet in clipboard"
+                self.status = "no magnet or link in clipboard"
         elif k in ("up", "k"):
             self._move(-1)
         elif k in ("down", "j"):
@@ -891,7 +925,7 @@ def _search_line(app: App, inner_w: int) -> str:
         cur = style("█", T.ACCENT) if editing else ""
         line = prompt + style(text, T.TEXT) + cur
         return line + " " * max(0, inner_w - 2 - dwidth(text) - (1 if editing else 0))
-    ph = dtrunc("Search or paste a magnet link…", inner_w - 2)
+    ph = dtrunc("Search, or paste a magnet or link…", inner_w - 2)
     return prompt + style(ph, dim=True) + " " * max(0, inner_w - 2 - dwidth(ph))
 
 
@@ -906,7 +940,7 @@ def _status_line(app: App, results: list[Result], inner_w: int) -> str:
     errs = len(app.errors)
     if not results:
         if app.search is None:
-            return cell("Type to search. Enter runs it; paste a magnet to grab it.", inner_w, dim=True)
+            return cell("Type to search. Enter runs it; paste a magnet or link to grab it.", inner_w, dim=True)
         if errs >= app.search_total:
             return cell("Couldn't reach any source — they may be down.", inner_w, color=T.WARN)
         q = clean(app.query)
@@ -1039,11 +1073,11 @@ def _settings_panel(app: App, width: int, height: int) -> list[str]:
 def _help_panel(width: int, height: int) -> list[str]:
     inner_w = width - 4
     groups = [
-        ("Search", [("type", "search (paste a magnet to grab)"), ("enter", "details"),
+        ("Search", [("type", "search (paste a magnet or link to grab)"), ("enter", "details"),
                     ("d", "download"), ("o", "open page in browser"), ("y", "copy magnet"),
                     ("/  i", "edit query"), ("↑ ↓", "recall past searches"),
                     ("S", "cycle sort (seeders/size/newest)"), ("c", "clear results"),
-                    ("← →", "filter category"), ("v", "grab magnet from clipboard")]),
+                    ("← →", "filter category"), ("v", "grab magnet/link from clipboard")]),
         ("Navigate", [("↑ ↓  j k", "move selection / scroll wheel"),
                       ("tab", "switch search / downloads")]),
         ("Downloads", [("p", "pause / resume"), ("x", "cancel / remove"),
@@ -1061,7 +1095,9 @@ def _help_panel(width: int, height: int) -> list[str]:
 
 
 def _footer(app: App, width: int) -> str:
-    if app.help:
+    if app.torrent_prompt is not None:
+        hints = [("t", "contents"), ("f", ".torrent file"), ("esc", "cancel")]
+    elif app.help:
         hints = [("any key", "close")]
     elif app.settings:
         hints = ([("type", "path"), ("enter", "save"), ("esc", "cancel")] if app.dir_editing
@@ -1139,26 +1175,38 @@ def _splash(app: App, cols: int, rows: int) -> list[str]:
     top = max(0, (rows - len(block)) // 2)
     return ([""] * top + block + [""] * rows)[:rows]
 
-def _confirm(cols: int) -> list[str]:
-    label = "Quit trawl?"
-    inner_plain = f"  {label}   ↵ yes  ·  esc no  "
-    box_w = dwidth(inner_plain) + 2
+def _modal_box(cols: int, label: str, hints: list[tuple[str, str]], color: str) -> list[str]:
+    plain = "  " + label + "   " + "  ·  ".join(f"{k} {v}" for k, v in hints) + "  "
+    box_w = dwidth(plain) + 2
     pre = " " * max(0, (cols - box_w) // 2)
-    inner = ("  " + style(label, T.WARN, bold=True) + "   "
-             + style("↵", T.ACCENT) + style(" yes", dim=True) + style("  ·  ", dim=True)
-             + style("esc", T.ACCENT) + style(" no", dim=True) + "  ")
+    inner = "  " + style(label, color, bold=True) + "   "
+    for i, (k, v) in enumerate(hints):
+        if i:
+            inner += style("  ·  ", dim=True)
+        inner += style(k, T.ACCENT) + style(" " + v, dim=True)
+    inner += "  "
     return [
-        pre + style("╭" + "─" * (box_w - 2) + "╮", T.WARN),
-        pre + style("│", T.WARN) + inner + style("│", T.WARN),
-        pre + style("╰" + "─" * (box_w - 2) + "╯", T.WARN),
+        pre + style("╭" + "─" * (box_w - 2) + "╮", color),
+        pre + style("│", color) + inner + style("│", color),
+        pre + style("╰" + "─" * (box_w - 2) + "╯", color),
     ]
 
 
-def _overlay_confirm(lines: list[str], app: App, cols: int, rows: int) -> list[str]:
-    if not app.confirm_quit:
+def _confirm(cols: int) -> list[str]:
+    return _modal_box(cols, "Quit trawl?", [("↵", "yes"), ("esc", "no")], T.WARN)
+
+
+def _torrent_box(cols: int) -> list[str]:
+    return _modal_box(cols, ".torrent link — download",
+                      [("t", "contents"), ("f", "the .torrent"), ("esc", "cancel")], T.ACCENT)
+
+
+def _overlay(lines: list[str], app: App, cols: int, rows: int) -> list[str]:
+    box = _confirm(cols) if app.confirm_quit else _torrent_box(cols) if app.torrent_prompt else None
+    if not box:
         return lines
     mid = max(0, rows // 2 - 1)
-    for j, b in enumerate(_confirm(cols)):
+    for j, b in enumerate(box):
         if mid + j < len(lines):
             lines[mid + j] = b
     return lines
@@ -1168,7 +1216,7 @@ def render(app: App, cols: int, rows: int) -> list[str]:
     cols = max(40, cols)
     rows = max(12, rows)
     if app.view == "search" and app.search is None and not app.help and not app.settings:
-        return _overlay_confirm(_splash(app, cols, rows), app, cols, rows)
+        return _overlay(_splash(app, cols, rows), app, cols, rows)
     lines: list[str] = []
     for L in _logo_lines():
         lines.append(" " * MARGIN + L)
@@ -1211,7 +1259,7 @@ def render(app: App, cols: int, rows: int) -> list[str]:
     lines.append("")
     lines.append(" " * MARGIN + _footer(app, cols - MARGIN))
     lines = (lines + [""] * rows)[:rows]
-    return _overlay_confirm(lines, app, cols, rows)
+    return _overlay(lines, app, cols, rows)
 
 
 # -- self-check --------------------------------------------------------------
@@ -1407,10 +1455,31 @@ def selftest() -> None:
     appv.grab = lambda m, n: got.update(m=m)  # type: ignore
     appv.on_key("v")
     assert got.get("m", "").startswith("magnet:?"), got
-    gp["paste_clipboard"] = lambda: "not a magnet"
+    gp["paste_clipboard"] = lambda: "https://example.com/f.iso"  # a direct link grabs too
     appv.on_key("v")
-    assert appv.status == "no magnet in clipboard", appv.status
+    assert got.get("m") == "https://example.com/f.iso", got
+    gp["paste_clipboard"] = lambda: "not a magnet or link"
+    appv.on_key("v")
+    assert appv.status == "no magnet or link in clipboard", appv.status
     gp["paste_clipboard"] = orig_paste
+    # .torrent link: submit opens the file-vs-contents prompt (no immediate grab);
+    # t = contents (follow-torrent), f = the .torrent file; a plain link grabs directly.
+    appt = App(eng=None)
+    grabbed: dict = {}
+    appt.grab = lambda m, n: grabbed.update(direct=m)  # type: ignore
+    appt.grab_torrent = lambda u, n, contents: grabbed.update(url=u, tor=contents)  # type: ignore
+    appt.query, appt.editing = "https://s.org/book.torrent", True
+    appt.submit()
+    assert appt.torrent_prompt is not None and "url" not in grabbed, grabbed
+    appt.on_key("f")
+    assert grabbed == {"url": "https://s.org/book.torrent", "tor": False}, grabbed
+    assert appt.torrent_prompt is None
+    appt.query, appt.editing = "https://s.org/b2.torrent", True
+    appt.submit(); appt.on_key("t")
+    assert grabbed["tor"] is True and grabbed["url"].endswith("b2.torrent"), grabbed
+    appt.query, appt.editing = "https://s.org/file.iso", True
+    appt.submit()
+    assert grabbed.get("direct") == "https://s.org/file.iso" and appt.torrent_prompt is None
     # settings overlay: toggle a source (persisted), edit download dir (persisted)
     gc = globals()
     o_load_cfg, o_save_cfg, saved_cfg = gc["load_config"], gc["save_config"], {}
@@ -1499,6 +1568,14 @@ def selftest() -> None:
     for ln in cf:
         assert dwidth(strip_ansi(ln)) <= 100, "confirm overflow"
     app2.confirm_quit = False
+    # .torrent modal stamps over the center, width-safe
+    from .sources import ParsedMagnet
+    app2.torrent_prompt = ParsedMagnet("", "book.torrent", "https://s.org/book.torrent", "torrent")
+    tf = render(app2, 100, 30)
+    assert any(".torrent link" in strip_ansi(x) for x in tf), "torrent modal missing"
+    for ln in tf:
+        assert dwidth(strip_ansi(ln)) <= 100, "torrent modal overflow"
+    app2.torrent_prompt = None
     # the net motif glyphs render in the logo
     assert any(g in "".join(_logo_lines()) for g in T.NET_GLYPHS), "net glyphs missing"
     # splash: fresh app (no search yet) shows the centered welcome
