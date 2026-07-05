@@ -255,6 +255,14 @@ class Aria2:
             out.append(d)
         return out
 
+    def file_paths(self, root: str) -> list[str]:
+        """On-disk paths of a download's files (for delete-on-cancel)."""
+        try:
+            st = self._call("aria2.tellStatus", [self._resolve(root), ["files"]])
+        except Aria2Error:
+            return []
+        return [f.get("path", "") for f in (st.get("files") or []) if f.get("path")]
+
     # -- internals -----------------------------------------------------------
 
     def _resolve(self, root: str) -> str:

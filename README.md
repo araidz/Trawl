@@ -125,7 +125,7 @@ empty box to browse the latest, or paste a magnet or direct http(s) link to grab
 | Key | Action |
 | --- | --- |
 | `↑ ↓` | move / scroll |
-| `p` | pause / resume · `x` cancel |
+| `p` | pause / resume · `x` cancel (asks: delete files or keep) |
 | `o` | reveal the file in Finder |
 | `s` resume · `g` settings · `q` | quit |
 

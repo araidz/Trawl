@@ -244,6 +244,31 @@ def reveal(path: str) -> bool:
         return False
 
 
+def remove_download_files(paths: list[str], dl_dir: str | None, name: str) -> int:
+    """Delete a download's files + aria2 control files off disk; prune emptied
+    subfolders (never the download dir itself). Returns files removed."""
+    n = 0
+    for p in paths:
+        for f in (p, p + ".aria2"):
+            try:
+                os.remove(f)
+                n += 1
+            except OSError:
+                pass
+    if dl_dir:  # torrents keep one control file at the download-dir root
+        try:
+            os.remove(os.path.join(dl_dir, name + ".aria2"))
+        except OSError:
+            pass
+    for d in sorted({os.path.dirname(p) for p in paths}, key=len, reverse=True):
+        if dl_dir and os.path.abspath(d) != os.path.abspath(dl_dir):
+            try:
+                os.rmdir(d)  # only if now empty
+            except OSError:
+                pass
+    return n
+
+
 def open_url(url: str) -> bool:
     try:
         subprocess.run(["open", url], check=True)
@@ -422,6 +447,7 @@ class App:
         self.running = True
         self.confirm_quit = False
         self.torrent_prompt = None  # ParsedMagnet of a pending .torrent link (file vs contents)
+        self.cancel_prompt = None  # Download pending cancel (delete files vs keep)
         self.detail: Result | None = None  # search result shown in the details view
         cfg = load_config()
         self.disabled_sources: set[str] = set(cfg.get("disabled_sources", []))
@@ -435,10 +461,20 @@ class App:
 
     # -- derived
     def visible_results(self) -> list[Result]:
-        if self.cat == "all":
-            return self.results
-        g = CAT_GROUP[self.cat]
-        return [r for r in self.results if (r.group or GROUP_OF.get(r.source)) == g]
+        if self.cat != "all":
+            g = CAT_GROUP[self.cat]
+            return [r for r in self.results if (r.group or GROUP_OF.get(r.source)) == g]
+        # All: round-robin across categories so one prolific group (e.g. anime)
+        # can't monopolize the top. Buckets keep first-seen order (= current sort),
+        # so the group holding the overall-top result still leads.
+        buckets: dict[str, list[Result]] = {}
+        for r in self.results:
+            buckets.setdefault(r.group or GROUP_OF.get(r.source) or "Other", []).append(r)
+        cols = list(buckets.values())
+        out: list[Result] = []
+        for i in range(max((len(c) for c in cols), default=0)):
+            out += [c[i] for c in cols if i < len(c)]
+        return out
 
     def animating(self) -> bool:
         return any(d.status in ("active", "metadata") for d in self.downloads)
@@ -525,6 +561,18 @@ class App:
             self.view = "downloads"
         except Aria2Error as e:
             self.status = f"error: {e}"
+
+    def _cancel(self, d: Download, delete_files: bool) -> None:
+        """Remove a download from aria2; optionally delete its files off disk."""
+        paths = self.eng.file_paths(d.root) if (self.eng and delete_files) else []
+        if self.eng:
+            self.eng.remove(d.root)
+        if delete_files:
+            remove_download_files(paths, self.eng.download_dir() if self.eng else None, d.name)
+            self.status = f"cancelled + deleted files: {clean(d.name)[:34]}"
+        else:
+            self.status = f"cancelled (files kept): {clean(d.name)[:36]}"
+        self.dsel = max(0, self.dsel - 1)
 
     def scan_resume(self) -> int:
         """Re-add incomplete BT downloads (*.aria2 control files) found in the
@@ -669,6 +717,17 @@ class App:
             elif k in ("esc", "q"):
                 self.torrent_prompt = None
             return
+        if self.cancel_prompt is not None:
+            d = self.cancel_prompt
+            if k == "d":
+                self._cancel(d, True)
+                self.cancel_prompt = None
+            elif k == "k":
+                self._cancel(d, False)
+                self.cancel_prompt = None
+            elif k in ("esc", "q"):
+                self.cancel_prompt = None
+            return
         if self.settings:
             self._settings_key(k)
             return
@@ -787,10 +846,7 @@ class App:
                 return
             d = self.downloads[self.dsel]
             if k == "x":
-                if self.eng:
-                    self.eng.remove(d.root)
-                self.status = f"cancelled: {clean(d.name)[:40]}"
-                self.dsel = max(0, self.dsel - 1)
+                self.cancel_prompt = d
             elif k == "p":
                 if d.status == "paused":
                     if self.eng:
@@ -1080,7 +1136,7 @@ def _help_panel(width: int, height: int) -> list[str]:
                     ("← →", "filter category"), ("v", "grab magnet/link from clipboard")]),
         ("Navigate", [("↑ ↓  j k", "move selection / scroll wheel"),
                       ("tab", "switch search / downloads")]),
-        ("Downloads", [("p", "pause / resume"), ("x", "cancel / remove"),
+        ("Downloads", [("p", "pause / resume"), ("x", "cancel (ask: delete or keep files)"),
                        ("o", "reveal in Finder"), ("s", "resume partial downloads on disk")]),
         ("General", [("g", "settings (sources, download dir)"), ("?", "this help"),
                      ("q", "quit (confirm)"), ("ctrl-c", "quit now")]),
@@ -1095,7 +1151,9 @@ def _help_panel(width: int, height: int) -> list[str]:
 
 
 def _footer(app: App, width: int) -> str:
-    if app.torrent_prompt is not None:
+    if app.cancel_prompt is not None:
+        hints = [("d", "delete files"), ("k", "keep files"), ("esc", "abort")]
+    elif app.torrent_prompt is not None:
         hints = [("t", "contents"), ("f", ".torrent file"), ("esc", "cancel")]
     elif app.help:
         hints = [("any key", "close")]
@@ -1201,8 +1259,16 @@ def _torrent_box(cols: int) -> list[str]:
                       [("t", "contents"), ("f", "the .torrent"), ("esc", "cancel")], T.ACCENT)
 
 
+def _cancel_box(cols: int) -> list[str]:
+    return _modal_box(cols, "Cancel download",
+                      [("d", "delete files"), ("k", "keep files"), ("esc", "abort")], T.WARN)
+
+
 def _overlay(lines: list[str], app: App, cols: int, rows: int) -> list[str]:
-    box = _confirm(cols) if app.confirm_quit else _torrent_box(cols) if app.torrent_prompt else None
+    box = (_confirm(cols) if app.confirm_quit
+           else _torrent_box(cols) if app.torrent_prompt
+           else _cancel_box(cols) if app.cancel_prompt
+           else None)
     if not box:
         return lines
     mid = max(0, rows // 2 - 1)
@@ -1333,6 +1399,8 @@ def selftest() -> None:
         def pause(self, r): calls.append(("pause", r))
         def resume(self, r): calls.append(("resume", r))
         def remove(self, r): calls.append(("remove", r))
+        def file_paths(self, r): calls.append(("files", r)); return []
+        def download_dir(self): return None
 
     appd = App(eng=_FakeEng())
     appd.view = "downloads"
@@ -1342,8 +1410,18 @@ def selftest() -> None:
     appd.downloads[0].status = "paused"
     appd.on_key("p")
     assert calls[-1] == ("resume", "r1"), calls
-    appd.on_key("x")
-    assert calls[-1] == ("remove", "r1"), calls
+    appd.on_key("x")  # x opens the cancel prompt; nothing removed yet
+    assert appd.cancel_prompt is appd.downloads[0] and "remove" not in [c[0] for c in calls], calls
+    appd.on_key("d")  # delete files + entry
+    assert ("files", "r1") in calls and calls[-1] == ("remove", "r1") and appd.cancel_prompt is None, calls
+    # remove_download_files: deletes file + .aria2, prunes the emptied subfolder,
+    # keeps the download dir itself.
+    import tempfile
+    _td = tempfile.mkdtemp()
+    _sub = os.path.join(_td, "Show"); os.makedirs(_sub)
+    _f = os.path.join(_sub, "ep.mkv"); open(_f, "w").close(); open(_f + ".aria2", "w").close()
+    assert remove_download_files([_f], _td, "Show") == 2, "deleted file + control file"
+    assert not os.path.exists(_sub) and os.path.isdir(_td), "subfolder pruned, dl dir kept"
     # copy magnet (y), open page (o, search), reveal (o, downloads) route to helpers
     g = globals()
     orig = {k: g[k] for k in ("copy_clipboard", "reveal", "open_url")}
@@ -1444,6 +1522,16 @@ def selftest() -> None:
     assert appso.sort == "newest"
     appso.on_key("S")
     assert appso.sort == "seeders" and appso.results[0].name == "small-many"
+    # "All" interleaves categories so a prolific group can't monopolize the top
+    appi = App(eng=None)
+    appi.results = [
+        Result("a1" + "x" * 38, "anime1", 1, 500, 0, "nyaa", "m"),
+        Result("a2" + "x" * 38, "anime2", 1, 400, 0, "nyaa", "m"),
+        Result("a3" + "x" * 38, "anime3", 1, 300, 0, "nyaa", "m"),
+        Result("t1" + "x" * 38, "tv1", 1, 50, 0, "tpb-tv", "m"),
+    ]
+    assert [r.name for r in appi.visible_results()] == ["anime1", "tv1", "anime2", "anime3"], \
+        [r.name for r in appi.visible_results()]
     # clipboard grab (v): a magnet on the clipboard gets grabbed
     gp = globals()
     orig_paste = gp["paste_clipboard"]
@@ -1576,6 +1664,14 @@ def selftest() -> None:
     for ln in tf:
         assert dwidth(strip_ansi(ln)) <= 100, "torrent modal overflow"
     app2.torrent_prompt = None
+    # cancel modal stamps over the center, width-safe
+    app2.view = "downloads"
+    app2.cancel_prompt = app2.downloads[0]
+    xf = render(app2, 100, 30)
+    assert any("Cancel download" in strip_ansi(x) for x in xf), "cancel modal missing"
+    for ln in xf:
+        assert dwidth(strip_ansi(ln)) <= 100, "cancel modal overflow"
+    app2.cancel_prompt = None
     # the net motif glyphs render in the logo
     assert any(g in "".join(_logo_lines()) for g in T.NET_GLYPHS), "net glyphs missing"
     # splash: fresh app (no search yet) shows the centered welcome
