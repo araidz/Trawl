@@ -1,8 +1,8 @@
 class Trawl < Formula
   desc "Curated, terminal-native torrent finder over aria2"
   homepage "https://github.com/araidz/Trawl"
-  url "https://github.com/araidz/Trawl/archive/refs/tags/v0.2.1.tar.gz"
-  sha256 "e9b07828c872cb1138e574fee1877fd3aadc7e0167e25ded68e039c8f28a26a2"
+  url "https://github.com/araidz/Trawl/archive/refs/tags/v0.2.2.tar.gz"
+  sha256 "69d900564ff5bcbded71b72091b344804b93b213b970a6031dae0d417f20fcba"
   license "MIT"
 
   depends_on "aria2"
