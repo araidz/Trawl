@@ -57,7 +57,7 @@ Trawl is a from-scratch Python TUI inspired by
 
 ## Features
 
-- **Multi-source search** — 17 sources (incl. the Knaben meta-aggregator) queried
+- **Multi-source search** — 18 sources (incl. the Knaben meta-aggregator) queried
   concurrently, results streamed in and merged, sorted by seeders (toggle to size / newest).
 - **aria2 engine** — spawns a private `aria2c` over JSON-RPC; honors your
   `~/.aria2/aria2.conf`. Magnet metadata → real download handoff handled; direct
@@ -136,7 +136,7 @@ empty box to browse the latest, or paste a magnet or direct http(s) link to grab
 | Movies | YTS · The Pirate Bay · 1337x |
 | TV | EZTV · SolidTorrents · The Pirate Bay · 1337x |
 | Anime | Nyaa · SubsPlease · AnimeTosho |
-| Books | The Pirate Bay · Nyaa (literature) · Library Genesis |
+| Books | The Pirate Bay · Nyaa (literature) · Library Genesis · Anna's Archive |
 | All | Knaben (meta-aggregator) · TorrentGalaxy |
 
 Toggle any source on or off in the settings overlay (`g`). If a source is down,

@@ -64,6 +64,7 @@ SOURCE_STYLE: dict[str, tuple[str, str]] = {
     "torrentgalaxy": ("TGx", "#9ece6a"),
     "nyaa-books": ("NYAA", BRIGHT),
     "libgen": ("LGEN", "#8fd694"),
+    "annas": ("ANNA", "#f7768e"),
 }
 
 

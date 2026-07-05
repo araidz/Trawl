@@ -602,6 +602,12 @@ def _strip_tags(s: str) -> str:
     return re.sub(r"<[^>]+>", "", s).strip()
 
 
+def _book_name(ext: str, title: str, author: str) -> str:
+    """Book label with the format up front so pdf/epub/etc. is unmistakable."""
+    tag = f"[{ext.upper()}] " if ext else ""
+    return tag + title + (f" — {author}" if author else "")
+
+
 def _libgen(query: str) -> list[Result]:
     """Library Genesis: HTML search; download is a direct http link via
     get.php?md5= (aria2 follows the CDN redirect and keeps the real filename).
@@ -639,10 +645,56 @@ def _libgen(query: str) -> list[Result]:
         author = html.unescape(_strip_tags(cells[1]))
         ext = _strip_tags(cells[dl - 1]).lower()
         size = parse_size(_strip_tags(cells[dl - 2]))
-        name = f"{title} [{ext}]" + (f" — {author}" if author else "")
+        name = _book_name(ext, title, author)
         out.append(Result(md5, name, size, 0, 0, "libgen",
                           f"https://{host}/get.php?md5={md5}",
                           page=f"https://{host}/ads.php?md5={md5}", group="Books"))
+    return out
+
+
+_ANNAS_HOSTS = ["annas-archive.org", "annas-archive.se", "annas-archive.gl"]
+
+
+def _annas(query: str) -> list[Result]:
+    """Anna's Archive: the aggregator (libgen forks + z-library + more) — real
+    book search by title/author, with format + size. Grab attempts a direct
+    libgen download; `page` is the Anna's record for browser download of what
+    libgen doesn't host directly.
+    ponytail: HTML scrape of a Cloudflare-fronted site; the mirror list + graceful
+    per-source failure absorb host churn. Direct download only for libgen-hosted
+    files — press o to open the record for everything else."""
+    q = query.strip()
+    if not q:  # search-only; no browse feed
+        return []
+    page = host = last = None
+    for h in _ANNAS_HOSTS:
+        try:
+            host = h
+            page = fetch(f"https://{h}/search?q={urllib.parse.quote_plus(q)}", retries=1, timeout=12)
+            break
+        except SourceError as e:
+            last = e
+    if page is None:
+        raise last or SourceError("Anna's Archive unreachable")
+    out = []
+    for m in re.finditer(r'<a href="/md5/([a-f0-9]{32})"[^>]*text-lg[^>]*>(.*?)</a>', page, re.S):
+        md5 = m.group(1)
+        title = html.unescape(_strip_tags(m.group(2)))
+        if not title:
+            continue
+        tail = page[m.end():m.end() + 4000]
+        au = re.search(r"user-edit[^>]*></span>\s*(.*?)</a>", tail, re.S)
+        author = html.unescape(_strip_tags(au.group(1))) if au else ""
+        meta = re.search(r'font-semibold text-sm[^"]*"[^>]*>(.*?)</div>', tail, re.S)
+        ext = size = ""
+        if meta:
+            fields = [f.strip() for f in html.unescape(_strip_tags(meta.group(1))).split("·")]
+            if len(fields) > 1 and re.fullmatch(r"[A-Za-z0-9]{2,5}", fields[1]):
+                ext = fields[1]
+            size = next((f for f in fields if re.match(r"[\d.]+\s*[KMGT]B", f, re.I)), "")
+        out.append(Result(md5, _book_name(ext, title, author), parse_size(size), 0, 0,
+                          "annas", f"https://libgen.li/get.php?md5={md5}",
+                          page=f"https://{host}/md5/{md5}", group="Books"))
     return out
 
 
@@ -664,6 +716,7 @@ SOURCES: list[Source] = [
     Source("tpb-books", "TPB", "Books", _tpb_books),
     Source("nyaa-books", "Nyaa", "Books", lambda q: _nyaa(q, "3_1", "nyaa-books")),
     Source("libgen", "LibGen", "Books", _libgen),
+    Source("annas", "Anna's", "Books", _annas),
     Source("knaben", "Knaben", "Other", _knaben),
     Source("torrentgalaxy", "TGx", "Other", _tgx),
 ]
@@ -813,10 +866,22 @@ def selftest() -> None:
     lg = _libgen("hobbit")
     assert len(lg) == 1 and lg[0].source == "libgen" and lg[0].group == "Books", lg
     assert lg[0].info_hash == "aabbccddeeff00112233445566778899", lg[0].info_hash
-    assert lg[0].name == "The Hobbit [epub] — J.R.R. Tolkien", lg[0].name
+    assert lg[0].name == "[EPUB] The Hobbit — J.R.R. Tolkien", lg[0].name
     assert lg[0].size == 2_000_000, lg[0].size
     assert lg[0].magnet == "https://libgen.li/get.php?md5=aabbccddeeff00112233445566778899", lg[0].magnet
     assert _libgen("") == [], "libgen browse is search-only"
+    _g["fetch"] = lambda *a, **k: (
+        '<a href="/md5/aabbccddeeff00112233445566778899" class="custom-a font-semibold text-lg leading-[1.2]">Sapiens: A Brief History</a>'
+        '<a href="/search?q=x" class="custom-a text-sm"><span class="icon-[mdi--user-edit] text-base"></span> Yuval Noah Harari</a>'
+        '<div class="text-gray-800 dark:text-slate-400 font-semibold text-sm leading-[1.2] mt-2">✅ English [en] · EPUB · 3.3MB · 2015 · 📘 Book (non-fiction)</div>')
+    an = _annas("harari")
+    assert len(an) == 1 and an[0].source == "annas" and an[0].group == "Books", an
+    assert an[0].info_hash == "aabbccddeeff00112233445566778899", an[0].info_hash
+    assert an[0].name == "[EPUB] Sapiens: A Brief History — Yuval Noah Harari", an[0].name
+    assert an[0].size == 3_300_000, an[0].size
+    assert an[0].magnet == "https://libgen.li/get.php?md5=aabbccddeeff00112233445566778899", an[0].magnet
+    assert an[0].page == "https://annas-archive.org/md5/aabbccddeeff00112233445566778899", an[0].page
+    assert _annas("") == [], "annas search-only"
     _g["fetch"] = _of
     print("pure logic ok")
 
