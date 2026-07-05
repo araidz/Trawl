@@ -39,8 +39,8 @@ TRACK = "░"
 
 # trawl wordmark + a trawling-net mesh (gradient on the word, aqua on the net)
 LOGO_LINES: list[str] = [
-    "▀█▀ █▀▄ ▄▀▄ █ ▄ █ █     ╱╲╱╲",
-    " █  █▀▄ █▀█ ▀▄▀▄▀ █▄▄   ╲╱╲╱",
+    "▀█▀ █▀▄ ▄▀▄ █ ▄ █ █     ╱╲╱╲╱╲",
+    " █  █▀▄ █▀█ ▀▄▀▄▀ █▄▄   ╲╱╲╱╲╱",
 ]
 NET_GLYPHS = set("╱╲╳▞▚◇")
 NET_COLOR = "#5fd0c5"  # aqua — reads as net-in-water against the violet

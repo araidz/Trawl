@@ -1137,8 +1137,8 @@ def _footer(app: App, width: int) -> str:
     return out
 
 
-TAGLINE = "A curated, terminal-native torrent finder."
-CATS_LINE = "games  ·  movies  ·  tv  ·  anime"
+TAGLINE = "A curated, terminal-native torrent & book finder."
+CATS_LINE = "games  ·  movies  ·  tv  ·  anime  ·  books"
 
 
 def _center(line: str, plain_w: int, cols: int) -> str:

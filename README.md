@@ -1,8 +1,8 @@
 # Trawl
 
 ```
-▀█▀ █▀▄ ▄▀▄ █ ▄ █ █     ╱╲╱╲
- █  █▀▄ █▀█ ▀▄▀▄▀ █▄▄   ╲╱╲╱
+▀█▀ █▀▄ ▄▀▄ █ ▄ █ █     ╱╲╱╲╱╲
+ █  █▀▄ █▀█ ▀▄▀▄▀ █▄▄   ╲╱╲╱╲╱
 ```
 
 ![macOS](https://img.shields.io/badge/macOS-000?logo=apple&logoColor=white)
@@ -11,9 +11,10 @@
 ![release](https://img.shields.io/github/v/release/araidz/Trawl?color=a78bfa)
 ![license](https://img.shields.io/badge/license-MIT-blue)
 
-A curated, terminal-native torrent finder. One search trawls a short list of
-reputable sources at once; pick a result and **aria2** downloads it. Just type
-`trawl` — no Node, no `npx`, no install step.
+A curated, terminal-native torrent & book finder. One search trawls a short
+list of reputable sources — games, movies, TV, anime, books — at once; pick a
+result and **aria2** downloads it (magnets, direct http links, and ebooks).
+Just type `trawl` — no Node, no `npx`, no install step.
 
 Trawl is a from-scratch Python TUI inspired by
 [torlink](https://github.com/baairon/torlink) (the look and feel) and driven by
@@ -23,11 +24,11 @@ Trawl is a from-scratch Python TUI inspired by
 ## Preview
 
 ```
-                      ▀█▀ █▀▄ ▄▀▄ █ ▄ █ █     ╱╲╱╲
-                       █  █▀▄ █▀█ ▀▄▀▄▀ █▄▄   ╲╱╲╱
+                      ▀█▀ █▀▄ ▄▀▄ █ ▄ █ █     ╱╲╱╲╱╲
+                       █  █▀▄ █▀█ ▀▄▀▄▀ █▄▄   ╲╱╲╱╲╱
 
-               A curated, terminal-native torrent finder.
-                   games  ·  movies  ·  tv  ·  anime
+           A curated, terminal-native torrent & book finder.
+               games  ·  movies  ·  tv  ·  anime  ·  books
 
     ╭─ Search ─────────────────────────────────────────────────────╮
     │ ❯ Search, or paste a magnet or link…                         │
@@ -37,8 +38,8 @@ Trawl is a from-scratch Python TUI inspired by
 ```
 
 ```
-  ▀█▀ █▀▄ ▄▀▄ █ ▄ █ █     ╱╲╱╲
-   █  █▀▄ █▀█ ▀▄▀▄▀ █▄▄   ╲╱╲╱
+  ▀█▀ █▀▄ ▄▀▄ █ ▄ █ █     ╱╲╱╲╱╲
+   █  █▀▄ █▀█ ▀▄▀▄▀ █▄▄   ╲╱╲╱╲╱
   ────────────────────────────────────────────────────────────────────
                     ╭─ Search ────────────────────────────────────────╮
   ▌ All             │ ❯ oppenheimer                                   │
