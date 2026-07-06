@@ -427,6 +427,7 @@ class App:
         self.view = "search"  # search | downloads
         self.editing = False  # splash is a landing (q quits); typing/"/" starts editing
         self.query = ""
+        self.cursor = 0  # caret index into query (edit position)
         self.history = load_history()  # past queries, oldest -> newest
         self.hist_idx = len(self.history)  # cursor; == len means "live draft"
         self.draft = ""  # query in progress before browsing history
@@ -493,6 +494,7 @@ class App:
         if pm:
             self._grab_source(pm)
             self.query = ""
+            self.cursor = 0
             self.editing = False
             return
         srcs = self.enabled_sources()
@@ -521,12 +523,14 @@ class App:
             self.draft = self.query
         self.hist_idx = max(0, min(self.hist_idx + delta, len(self.history)))
         self.query = self.history[self.hist_idx] if self.hist_idx < len(self.history) else self.draft
+        self.cursor = len(self.query)
 
     def clear(self) -> None:
         """Drop search results and return to the splash."""
         self.search = None
         self.results, self.errors, self.search_done, self.sel = [], {}, 0, 0
         self.query = ""
+        self.cursor = 0
         self.editing = False
         self.detail = None
         self.status = ""
@@ -752,8 +756,14 @@ class App:
             elif k == "esc":
                 self.editing = False
             elif k == "backspace":
-                self.query = self.query[:-1]
+                if self.cursor > 0:
+                    self.query = self.query[:self.cursor - 1] + self.query[self.cursor:]
+                    self.cursor -= 1
                 self.hist_idx = len(self.history)
+            elif k == "left":
+                self.cursor = max(0, self.cursor - 1)
+            elif k == "right":
+                self.cursor = min(len(self.query), self.cursor + 1)
             elif k == "tab":
                 self.view, self.editing = "downloads", False
             elif k == "up":
@@ -761,7 +771,8 @@ class App:
             elif k == "down":
                 self._hist(1)
             elif len(k) == 1 and k >= " ":
-                self.query += k
+                self.query = self.query[:self.cursor] + k + self.query[self.cursor:]
+                self.cursor += 1
                 self.hist_idx = len(self.history)
             return
         if self.view == "search" and self.search is None and not self.editing:
@@ -778,7 +789,8 @@ class App:
                 self._hist(-1)
             elif len(k) == 1 and k >= " ":
                 self.editing = True
-                self.query += k
+                self.query = self.query[:self.cursor] + k + self.query[self.cursor:]
+                self.cursor += 1
             return
         # nav (results) / downloads
         if k == "q":
@@ -973,16 +985,40 @@ def _rail(app: App, h: int) -> list[str]:
     return (lines + [cell("", RAIL_W)] * h)[:h]
 
 
+def _caret_view(q: str, cur: int, avail: int) -> tuple[str, str, str]:
+    """Slice q to <= avail display cols keeping the caret (index cur) visible.
+    Returns (before, at, after); `at` is the char under the caret, "" past the end."""
+    caret_w = _cw(q[cur]) if cur < len(q) else 1
+    left_budget = max(0, avail - caret_w)
+    start, used = cur, 0
+    while start > 0 and used + _cw(q[start - 1]) <= left_budget:
+        start -= 1
+        used += _cw(q[start])
+    remaining = avail - dwidth(q[start:cur]) - caret_w
+    end, used = cur + (1 if cur < len(q) else 0), 0
+    while end < len(q) and used + _cw(q[end]) <= remaining:
+        used += _cw(q[end])
+        end += 1
+    if cur < len(q):
+        return q[start:cur], q[cur], q[cur + 1:end]
+    return q[start:cur], "", ""
+
+
 def _search_line(app: App, inner_w: int) -> str:
     editing = app.view == "search" and app.editing
     prompt = style(T.PTR + " ", T.ACCENT)
-    if app.query:
-        text = dtrunc(app.query, inner_w - 3)
-        cur = style("█", T.ACCENT) if editing else ""
-        line = prompt + style(text, T.TEXT) + cur
-        return line + " " * max(0, inner_w - 2 - dwidth(text) - (1 if editing else 0))
-    ph = dtrunc("Search, or paste a magnet or link…", inner_w - 2)
-    return prompt + style(ph, dim=True) + " " * max(0, inner_w - 2 - dwidth(ph))
+    avail = inner_w - 2  # columns after the prompt
+    if not app.query:
+        ph = dtrunc("Search, or paste a magnet or link…", avail)
+        return prompt + style(ph, dim=True) + " " * max(0, avail - dwidth(ph))
+    if not editing:
+        text = dtrunc(app.query, avail)
+        return prompt + style(text, T.TEXT) + " " * max(0, avail - dwidth(text))
+    cur = max(0, min(app.cursor, len(app.query)))
+    before, at, after = _caret_view(app.query, cur, avail)
+    caret = f"\x1b[7m{at or ' '}\x1b[0m"  # reverse-video block cursor
+    used = dwidth(before) + (_cw(at) if at else 1) + dwidth(after)
+    return prompt + style(before, T.TEXT) + caret + style(after, T.TEXT) + " " * max(0, avail - used)
 
 
 def _search_panel(app: App, width: int) -> list[str]:
@@ -1360,6 +1396,19 @@ def selftest() -> None:
     assert app.query == "matrix" and app.editing, "typing starts editing"
     app.on_key("backspace")
     assert app.query == "matri"
+    # arrow-key editing: caret moves, inserts/deletes land mid-string
+    assert app.cursor == 5, app.cursor  # caret at end of "matri"
+    app.on_key("left"); app.on_key("left")
+    assert app.cursor == 3, app.cursor
+    app.on_key("x")  # insert at caret -> "matxri"
+    assert app.query == "matxri" and app.cursor == 4, (app.query, app.cursor)
+    app.on_key("backspace")  # delete char before caret -> "matri"
+    assert app.query == "matri" and app.cursor == 3, (app.query, app.cursor)
+    for _ in range(5):
+        app.on_key("left")
+    assert app.cursor == 0, app.cursor  # clamps at start
+    app.on_key("right")
+    assert app.cursor == 1, app.cursor
     app.search = Search.__new__(Search)  # simulate a completed search -> browse nav
     app.search_done = app.search_total
     app.results = [
