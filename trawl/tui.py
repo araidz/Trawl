@@ -18,6 +18,7 @@ import shutil
 import subprocess
 import sys
 import termios
+import threading
 import time
 import tty
 import unicodedata
@@ -25,6 +26,7 @@ import unicodedata
 from . import theme as T
 from .aria2 import STATE_DIR, Aria2Error, Download, control_infohash
 from .sources import (SOURCES, Result, Search, build_magnet, dedupe, parse_source)
+from .meta import Meta, kind_for, lookup
 
 GROUP_OF = {s.id: s.group for s in SOURCES}
 CATS = [("all", "All"), ("games", "Games"), ("movies", "Movies"),
@@ -455,10 +457,14 @@ class App:
         self.download_dir: str | None = cfg.get("download_dir")
         self.dl_history: list[dict] = load_dl_history()  # completed downloads, oldest->newest
         self.settings = False  # settings overlay open
-        self.set_sel = 0  # 0 = download-dir row, 1.. = sources
-        self.dir_editing = False
-        self.dir_buf = ""
+        self.set_sel = 0  # 0 dir, 1 provider, 2 key, 3.. sources
+        self.edit_field: str | None = None  # settings text-edit: "dir" | "key"
+        self.edit_buf = ""
         self.start = time.monotonic()
+        self.meta_provider = cfg.get("meta_provider", "tmdb")  # tmdb | omdb
+        self.tmdb_key = cfg.get("tmdb_key") or os.environ.get("TMDB_API_KEY")
+        self.omdb_key = cfg.get("omdb_key") or os.environ.get("OMDB_API_KEY")
+        self.meta: dict[str, object] = {}  # "provider:kind:name" -> "loading" | Meta | None
 
     # -- derived
     def visible_results(self) -> list[Result]:
@@ -476,6 +482,47 @@ class App:
         for i in range(max((len(c) for c in cols), default=0)):
             out += [c[i] for c in cols if i < len(c)]
         return out
+
+    def _cur(self) -> Result | None:
+        """The selected search result, or None if the list is empty/out of range."""
+        rs = self.visible_results()
+        return rs[self.sel] if 0 <= self.sel < len(rs) else None
+
+    def _meta_kind(self, r: Result) -> str | None:
+        return kind_for(r.group or GROUP_OF.get(r.source))
+
+    def _provider_key(self) -> str | None:
+        return self.omdb_key if self.meta_provider == "omdb" else self.tmdb_key
+
+    def _set_provider_key(self, key: str | None) -> None:
+        if self.meta_provider == "omdb":
+            self.omdb_key = key
+        else:
+            self.tmdb_key = key
+
+    def _detail_meta(self):
+        """Cached metadata for the open detail result: Meta | "loading" | None."""
+        r = self.detail
+        kind = self._meta_kind(r) if r else None
+        return self.meta.get(f"{self.meta_provider}:{kind}:{r.name}") if kind else None
+
+    def _ensure_meta(self, r: Result) -> None:
+        """Kick a one-shot background metadata lookup for a movie/series result."""
+        kind = self._meta_kind(r)
+        key = self._provider_key()
+        if not kind or not key:
+            return
+        ckey = f"{self.meta_provider}:{kind}:{r.name}"
+        if ckey in self.meta:
+            return
+        self.meta[ckey] = "loading"
+        threading.Thread(target=self._fetch_meta, args=(ckey, r.name, kind), daemon=True).start()
+
+    def _fetch_meta(self, ckey: str, name: str, kind: str) -> None:
+        try:
+            self.meta[ckey] = lookup(name, kind, self.meta_provider, self._provider_key())
+        except Exception:
+            self.meta[ckey] = None
 
     def animating(self) -> bool:
         return any(d.status in ("active", "metadata") for d in self.downloads)
@@ -498,6 +545,8 @@ class App:
             self.editing = False
             return
         srcs = self.enabled_sources()
+        if not q:  # Latest: only sources that browse without a query
+            srcs = [s for s in srcs if s.browse]
         self.search = Search(q, srcs)
         self.search_total = len(srcs)
         self.results, self.errors, self.search_done, self.sel = [], {}, 0, 0
@@ -602,23 +651,20 @@ class App:
 
     def _save_settings(self) -> None:
         save_config({"disabled_sources": sorted(self.disabled_sources),
-                     "download_dir": self.download_dir})
+                     "download_dir": self.download_dir, "meta_provider": self.meta_provider,
+                     "tmdb_key": self.tmdb_key, "omdb_key": self.omdb_key})
 
     def _settings_key(self, k: str) -> None:
-        rows = 1 + len(SOURCES)  # row 0 = download dir, 1.. = sources
-        if self.dir_editing:
+        rows = 3 + len(SOURCES)  # 0 dir, 1 provider, 2 key, 3.. sources
+        if self.edit_field:
             if k == "enter":
-                self.download_dir = self.dir_buf.strip() or None
-                if self.eng and self.download_dir:
-                    self.eng.set_dir(self.download_dir)
-                self._save_settings()
-                self.dir_editing = False
+                self._commit_edit()
             elif k == "esc":
-                self.dir_editing = False
+                self.edit_field = None
             elif k == "backspace":
-                self.dir_buf = self.dir_buf[:-1]
+                self.edit_buf = self.edit_buf[:-1]
             elif len(k) == 1 and k >= " ":
-                self.dir_buf += k
+                self.edit_buf += k
             return
         if k in ("g", "esc", "q"):
             self.settings = False
@@ -628,12 +674,30 @@ class App:
             self.set_sel = (self.set_sel + 1) % rows
         elif k in ("enter", " "):
             if self.set_sel == 0:
-                self.dir_editing = True
-                self.dir_buf = self.download_dir or (self.eng.download_dir() if self.eng else "") or ""
+                self.edit_field = "dir"
+                self.edit_buf = self.download_dir or (self.eng.download_dir() if self.eng else "") or ""
+            elif self.set_sel == 1:
+                self.meta_provider = "omdb" if self.meta_provider == "tmdb" else "tmdb"
+                self.meta.clear()  # cached results are provider-specific
+                self._save_settings()
+            elif self.set_sel == 2:
+                self.edit_field = "key"
+                self.edit_buf = self._provider_key() or ""
             else:
-                sid = SOURCES[self.set_sel - 1].id
+                sid = SOURCES[self.set_sel - 3].id
                 self.disabled_sources.symmetric_difference_update({sid})
                 self._save_settings()
+
+    def _commit_edit(self) -> None:
+        if self.edit_field == "dir":
+            self.download_dir = self.edit_buf.strip() or None
+            if self.eng and self.download_dir:
+                self.eng.set_dir(self.download_dir)
+        elif self.edit_field == "key":
+            self._set_provider_key(self.edit_buf.strip() or None)
+            self.meta.clear()  # re-fetch with the new key
+        self.edit_field = None
+        self._save_settings()
 
     def drain_search(self) -> None:
         if not self.search:
@@ -749,6 +813,11 @@ class App:
             elif k == "y":
                 self.status = ("magnet copied to clipboard"
                                if copy_clipboard(self.detail.magnet) else "copy failed")
+            elif k == "p":
+                m = self._detail_meta()
+                poster = m.poster if isinstance(m, Meta) else ""
+                self.status = ("opened poster" if poster and open_url(poster)
+                               else "no poster available")
             return
         if self.view == "search" and self.editing:
             if k == "enter":
@@ -831,28 +900,22 @@ class App:
             elif k == "S":
                 self._cycle_sort()
             elif k == "d":
-                rs = self.visible_results()
-                if rs and 0 <= self.sel < len(rs):
-                    self.grab(rs[self.sel].magnet, rs[self.sel].name)
+                if (r := self._cur()):
+                    self.grab(r.magnet, r.name)
             elif k == "enter":
-                rs = self.visible_results()
-                if rs and 0 <= self.sel < len(rs):
-                    self.detail = rs[self.sel]
+                if (r := self._cur()):
+                    self.detail = r
+                    self._ensure_meta(r)
             elif k == "y":
-                rs = self.visible_results()
-                if rs and 0 <= self.sel < len(rs):
-                    ok = copy_clipboard(rs[self.sel].magnet)
-                    self.status = "magnet copied to clipboard" if ok else "copy failed"
+                if (r := self._cur()):
+                    self.status = ("magnet copied to clipboard"
+                                   if copy_clipboard(r.magnet) else "copy failed")
             elif k == "o":
-                rs = self.visible_results()
-                if rs and 0 <= self.sel < len(rs):
-                    page = rs[self.sel].page
-                    if not page:
-                        self.status = "no page for this source"
-                    elif open_url(page):
-                        self.status = "opened in browser"
-                    else:
-                        self.status = "couldn't open browser"
+                if (r := self._cur()):
+                    page = r.page
+                    self.status = ("opened in browser" if page and open_url(page)
+                                   else "no page for this source" if not page
+                                   else "couldn't open browser")
         elif self.view == "downloads":
             if not self.downloads or not (0 <= self.dsel < len(self.downloads)):
                 return
@@ -899,7 +962,7 @@ def _wrap(text: str, width: int) -> list[str]:
     return lines or [""]
 
 
-def _detail_panel(r: Result, width: int, height: int) -> list[str]:
+def _detail_panel(app: App, r: Result, width: int, height: int) -> list[str]:
     inner_w = width - 4
     inner = [cell(line, inner_w, color=T.ACCENT, bold=True) for line in _wrap(clean(r.name), inner_w)]
     inner.append(cell("", inner_w))
@@ -920,6 +983,28 @@ def _detail_panel(r: Result, width: int, height: int) -> list[str]:
     inner.append(field("Hash", r.info_hash))
     if r.page:
         inner.append(field("Page", r.page))
+    kind = app._meta_kind(r)
+    if kind and app._provider_key():
+        m = app._detail_meta()
+        rlabel = "IMDb" if app.meta_provider == "omdb" else "TMDb"
+        inner.append(cell("", inner_w))
+        if m == "loading":
+            inner.append(field("Info", "fetching…", T.ALT))
+        elif isinstance(m, Meta):
+            if m.rating:
+                inner.append(field(rlabel, f"{m.rating:.1f}/10  ({m.votes:,} votes)", T.WARN))
+            if m.genres:
+                inner.append(field("Genre", ", ".join(m.genres)))
+            if m.cast:
+                inner.append(field("Cast", ", ".join(m.cast)))
+            if m.poster:
+                inner.append(field("Poster", "press p to open", T.ALT))
+            if m.overview:
+                inner.append(cell("", inner_w))
+                for ln in _wrap(m.overview, inner_w - 2):
+                    inner.append("  " + cell(ln, inner_w - 2, dim=True))
+        else:  # fetched, no match
+            inner.append(field("Info", f"no match on {app.meta_provider.upper()}", T.RULE))
     return _wrap_panel("Details", inner, width, height, True)
 
 
@@ -1038,7 +1123,7 @@ def _status_line(app: App, results: list[Result], inner_w: int) -> str:
         q = clean(app.query)
         return cell(f'No results for "{q}".' if q else "Nothing new right now.", inner_w, dim=True)
     note = f"  ({errs} source{'' if errs == 1 else 's'} down)" if errs else ""
-    head = "newest across all sources" if not app.query.strip() else f"{len(results)} result{'' if len(results) == 1 else 's'}"
+    head = "popular now" if not app.query.strip() else f"{len(results)} result{'' if len(results) == 1 else 's'}"
     return cell(head + note, inner_w, dim=True)
 
 
@@ -1142,18 +1227,29 @@ def _downloads_panel(app: App, width: int, height: int) -> list[str]:
 
 def _settings_panel(app: App, width: int, height: int) -> list[str]:
     inner_w = width - 4
-    sel0 = app.set_sel == 0
-    val = (app.dir_buf + "▌") if app.dir_editing else (app.download_dir or "(from aria2.conf)")
+    editing = app.edit_field
+
+    def row(idx: int, val: str, active: bool) -> str:
+        return (cell(T.PTR if app.set_sel == idx else "", 2, color=T.ACCENT)
+                + cell(val, inner_w - 2, color=T.TEXT if active else None, dim=not active))
+
+    dir_ed = editing == "dir"
+    dir_val = (app.edit_buf + "▌") if dir_ed else (app.download_dir or "(from aria2.conf)")
+    key = app._provider_key()
+    key_ed = editing == "key"
+    key_val = (app.edit_buf + "▌") if key_ed else ("•" * min(len(key), 12) if key else "(not set)")
     inner = [
         cell("Download dir", inner_w, color=T.ALT, bold=True),
-        cell(T.PTR if sel0 else "", 2, color=T.ACCENT)
-        + cell(val, inner_w - 2, color=T.TEXT if (app.download_dir or app.dir_editing) else None,
-               dim=not (app.download_dir or app.dir_editing)),
+        row(0, dir_val, bool(app.download_dir or dir_ed)),
+        cell("", inner_w),
+        cell("Metadata  (enter / space)", inner_w, color=T.ALT, bold=True),
+        row(1, f"provider: {app.meta_provider.upper()}", True),
+        row(2, f"{app.meta_provider.upper()} key: {key_val}", bool(key or key_ed)),
         cell("", inner_w),
         cell("Sources  (enter / space toggles)", inner_w, color=T.ALT, bold=True),
     ]
     for i, s in enumerate(SOURCES):
-        sel = app.set_sel == i + 1
+        sel = app.set_sel == i + 3
         on = s.id not in app.disabled_sources
         inner.append(cell(T.PTR if sel else "", 2, color=T.ACCENT)
                      + cell("[x]" if on else "[ ]", 4, color=T.GOOD if on else T.RULE)
@@ -1194,10 +1290,10 @@ def _footer(app: App, width: int) -> str:
     elif app.help:
         hints = [("any key", "close")]
     elif app.settings:
-        hints = ([("type", "path"), ("enter", "save"), ("esc", "cancel")] if app.dir_editing
+        hints = ([("type", "value"), ("enter", "save"), ("esc", "cancel")] if app.edit_field
                  else [("↑↓", "move"), ("enter/space", "toggle/edit"), ("g/esc", "close")])
     elif app.detail is not None:
-        hints = [("d", "download"), ("o", "page"), ("y", "copy magnet"), ("esc", "back"), ("q", "back")]
+        hints = [("d", "download"), ("o", "page"), ("y", "copy magnet"), ("p", "poster"), ("esc", "back"), ("q", "back")]
     elif app.view == "search" and app.editing:
         hints = [("enter", "search"), ("↑↓", "history"), ("esc", "nav"), ("tab", "downloads"), ("^c", "quit")]
     elif app.view == "search":
@@ -1348,7 +1444,7 @@ def render(app: App, cols: int, rows: int) -> list[str]:
         content = _search_panel(app, content_w) + [""]
         panel_h = body_h - search_h - 1
         if app.view == "search" and app.detail is not None:
-            content += _detail_panel(app.detail, content_w, panel_h)
+            content += _detail_panel(app, app.detail, content_w, panel_h)
         elif app.view == "search":
             content += _results_panel(app, content_w, panel_h)
         else:
@@ -1497,6 +1593,7 @@ def selftest() -> None:
     appx = App(eng=None)
     appx.search = Search.__new__(Search)
     appx.editing = False
+    appx.tmdb_key = None  # keep offline; the meta lookup path is tested separately
     appx.results = [Result("c" * 40, "Some Movie", 1, 5, 1, "yts", "magnet:?xt=z", page="http://p")]
     appx.on_key("enter")
     assert appx.detail is appx.results[0], "enter opens details"
@@ -1571,6 +1668,19 @@ def selftest() -> None:
     assert appso.sort == "newest"
     appso.on_key("S")
     assert appso.sort == "seeders" and appso.results[0].name == "small-many"
+    # Latest (empty query) fans out only to browse-capable sources
+    gsr = globals()
+    o_search = gsr["Search"]
+    cap = {}
+    class _CapSearch:
+        def __init__(self, q, srcs=None):
+            cap["srcs"] = srcs
+    gsr["Search"] = _CapSearch
+    appl = App(eng=None)
+    appl.submit()  # empty query -> Latest
+    assert cap["srcs"] and all(s.browse for s in cap["srcs"]), "Latest skips non-browse sources"
+    assert len(cap["srcs"]) == sum(1 for s in SOURCES if s.browse) == appl.search_total, cap
+    gsr["Search"] = o_search
     # "All" interleaves categories so a prolific group can't monopolize the top
     appi = App(eng=None)
     appi.results = [
@@ -1617,7 +1727,7 @@ def selftest() -> None:
     appt.query, appt.editing = "https://s.org/file.iso", True
     appt.submit()
     assert grabbed.get("direct") == "https://s.org/file.iso" and appt.torrent_prompt is None
-    # settings overlay: toggle a source (persisted), edit download dir (persisted)
+    # settings overlay: rows are 0 dir, 1 provider, 2 key, 3.. sources — all persisted
     gc = globals()
     o_load_cfg, o_save_cfg, saved_cfg = gc["load_config"], gc["save_config"], {}
     gc["load_config"] = lambda: {}
@@ -1627,16 +1737,34 @@ def selftest() -> None:
     assert appg.disabled_sources == set() and not appg.settings
     appg.on_key("g")
     assert appg.settings, "g opens settings"
-    appg.set_sel = 1  # first source row
+    # provider toggle (row 1) flips tmdb<->omdb and persists
+    assert appg.meta_provider == "tmdb"
+    appg.set_sel = 1
+    appg.on_key(" ")
+    assert appg.meta_provider == "omdb" and saved_cfg["meta_provider"] == "omdb", saved_cfg
+    appg.on_key(" ")
+    assert appg.meta_provider == "tmdb", "provider toggles back"
+    # key entry (row 2) writes the active provider's key
+    appg.set_sel = 2
+    appg.tmdb_key = None
+    appg.on_key("enter")
+    assert appg.edit_field == "key"
+    for ch in "abc123":
+        appg.on_key(ch)
+    appg.on_key("enter")
+    assert appg.tmdb_key == "abc123" and saved_cfg["tmdb_key"] == "abc123", saved_cfg
+    # source toggle (row 3+)
+    appg.set_sel = 3
     sid = SOURCES[0].id
     appg.on_key(" ")
     assert sid in appg.disabled_sources and sid in saved_cfg["disabled_sources"], saved_cfg
     assert SOURCES[0] not in appg.enabled_sources()
     appg.on_key(" ")
     assert sid not in appg.disabled_sources, "toggle back on"
-    appg.set_sel = 0  # download-dir row
+    # download dir (row 0)
+    appg.set_sel = 0
     appg.on_key("enter")
-    assert appg.dir_editing
+    assert appg.edit_field == "dir"
     for ch in "/tmp/dl":
         appg.on_key(ch)
     appg.on_key("enter")
@@ -1698,6 +1826,25 @@ def selftest() -> None:
         assert dwidth(strip_ansi(ln)) <= 100, "details overflow"
     assert any("Details" in strip_ansi(x) for x in df) and any("Health" in strip_ansi(x) for x in df), "details view"
     app2.detail = None
+    # details shows info, provider-labeled, with a poster hint; cache is per-provider
+    app2.meta_provider, app2.tmdb_key = "tmdb", "test-key"
+    app2.meta[f"tmdb:movie:{app2.results[0].name}"] = Meta(
+        "The Matrix", "1999", 8.2, 25000, ["Action", "Sci-Fi"], ["Keanu Reeves"],
+        "Neo learns the truth.", "http://img/p.jpg")
+    app2.view, app2.detail = "search", app2.results[0]
+    jm = "\n".join(strip_ansi(x) for x in render(app2, 100, 30))
+    assert "TMDb" in jm and "8.2/10" in jm and "Action" in jm and "Keanu Reeves" in jm, jm
+    assert "Neo learns" in jm and "press p to open" in jm, jm
+    # OMDb provider labels the rating IMDb and reads its own cache slot
+    app2.meta_provider, app2.omdb_key = "omdb", "omdb-key"
+    app2.meta[f"omdb:movie:{app2.results[0].name}"] = Meta(
+        "The Matrix", "1999", 8.7, 1999001, ["Action"], ["Keanu Reeves"], "A sim.", "")
+    of = render(app2, 100, 30)
+    jo = "\n".join(strip_ansi(x) for x in of)
+    assert "IMDb" in jo and "8.7/10" in jo, jo
+    for ln in of:
+        assert dwidth(strip_ansi(ln)) <= 100, "meta detail overflow"
+    app2.detail, app2.tmdb_key, app2.omdb_key, app2.meta_provider = None, None, None, "tmdb"
     # quit-confirm modal stamps over the center, width-safe
     app2.confirm_quit = True
     cf = render(app2, 100, 30)

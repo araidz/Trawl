@@ -70,6 +70,7 @@ class Source:
     label: str
     group: str
     fn: Callable[[str], list[Result]]
+    browse: bool = True  # False = search-only (no empty-query latest feed)
 
 
 @dataclass
@@ -369,9 +370,10 @@ def _subsplease(query: str) -> list[Result]:
 # -- sources: RSS ------------------------------------------------------------
 
 
-def _wordpress_repacks(home: str, source: str, query: str) -> list[Result]:
-    """WordPress repack sites (FitGirl, DODI): magnet links live in the RSS items."""
+def _fitgirl(query: str) -> list[Result]:
+    """FitGirl repacks: magnet links live in the WordPress RSS items."""
     q = query.strip()
+    home = "https://fitgirl-repacks.site"
     url = f"{home}/?s={urllib.parse.quote(q)}&feed=rss2" if q else f"{home}/feed/"
     out = []
     for item in _rss_items(fetch(url)):
@@ -383,17 +385,9 @@ def _wordpress_repacks(home: str, source: str, query: str) -> list[Result]:
         if not hm:
             continue
         name = html.unescape(_tag(item, "title") or "Unknown Title")
-        out.append(Result(normalize_info_hash(hm.group(1)), name, 0, 0, 0, source, magnet,
+        out.append(Result(normalize_info_hash(hm.group(1)), name, 0, 0, 0, "fitgirl", magnet,
                           _rfc822_unix(_tag(item, "pubDate")), page=_tag(item, "link") or None))
     return out
-
-
-def _fitgirl(query: str) -> list[Result]:
-    return _wordpress_repacks("https://fitgirl-repacks.site", "fitgirl", query)
-
-
-def _dodi(query: str) -> list[Result]:
-    return _wordpress_repacks("https://dodi-repacks.site", "dodi", query)
 
 
 def _nyaa(query: str, cat: str = "0_0", source: str = "nyaa") -> list[Result]:
@@ -702,7 +696,6 @@ def _annas(query: str) -> list[Result]:
 
 SOURCES: list[Source] = [
     Source("fitgirl", "FitGirl", "Games", _fitgirl),
-    Source("dodi", "DODI", "Games", _dodi),
     Source("yts", "YTS", "Movies", _yts),
     Source("tpb-movies", "TPB", "Movies", _tpb_movies),
     Source("x1337-movies", "1337x", "Movies", lambda q: _x1337(q, "Movies", "x1337-movies")),
@@ -715,10 +708,10 @@ SOURCES: list[Source] = [
     Source("animetosho", "AnimeTosho", "Anime", _animetosho),
     Source("tpb-books", "TPB", "Books", _tpb_books),
     Source("nyaa-books", "Nyaa", "Books", lambda q: _nyaa(q, "3_1", "nyaa-books")),
-    Source("libgen", "LibGen", "Books", _libgen),
-    Source("annas", "Anna's", "Books", _annas),
-    Source("knaben", "Knaben", "Other", _knaben),
-    Source("torrentgalaxy", "TGx", "Other", _tgx),
+    Source("libgen", "LibGen", "Books", _libgen, browse=False),
+    Source("annas", "Anna's", "Books", _annas, browse=False),
+    Source("knaben", "Knaben", "Other", _knaben, browse=False),
+    Source("torrentgalaxy", "TGx", "Other", _tgx, browse=False),
 ]
 
 
@@ -733,10 +726,6 @@ def dedupe(results: list[Result]) -> list[Result]:
         if ex is None or r.seeders > ex.seeders:
             by_hash[r.info_hash] = r
     return list(by_hash.values())
-
-
-def sort_results(results: list[Result]) -> list[Result]:
-    return sorted(results, key=lambda r: (r.seeders, r.added or 0), reverse=True)
 
 
 # -- concurrent search -------------------------------------------------------
@@ -758,26 +747,6 @@ class Search:
             self.updates.put(SourceUpdate(s.id, s.fn(query)))
         except Exception as e:  # one source's failure never sinks the search
             self.updates.put(SourceUpdate(s.id, None, str(e) or type(e).__name__))
-
-
-def search_all(query: str, timeout: float = 25.0) -> list[Result]:
-    """Blocking concurrent search → merged, deduped, seeder-sorted results."""
-    s = Search(query)
-    out: list[Result] = []
-    got = 0
-    end = time.monotonic() + timeout
-    while got < s.total:
-        remaining = end - time.monotonic()
-        if remaining <= 0:
-            break
-        try:
-            u = s.updates.get(timeout=remaining)
-        except queue.Empty:
-            break
-        got += 1
-        if u.results:
-            out.extend(u.results)
-    return sort_results(dedupe(out))
 
 
 # -- self-check --------------------------------------------------------------
@@ -807,11 +776,9 @@ def selftest() -> None:
         Result(h40, "hi", 1, 50, 0, "b", "m"),
     ])
     assert len(merged) == 1 and merged[0].seeders == 50, "dedupe keeps higher seeders"
-    order = sort_results([
-        Result("1", "a", 0, 10, 0, "x", "m"),
-        Result("2", "b", 0, 99, 0, "x", "m"),
-    ])
-    assert order[0].seeders == 99, "sort by seeders desc"
+    # browse flag: only search-only sources are excluded from empty-query Latest
+    assert {s.id for s in SOURCES if not s.browse} == {"libgen", "annas", "knaben", "torrentgalaxy"}, \
+        [s.id for s in SOURCES if not s.browse]
     x_page = (
         '<table class="table-list"><tbody><tr>'
         '<td class="coll-1 name"><a href="/sort-here/">x</a>'
@@ -830,7 +797,7 @@ def selftest() -> None:
     assert _knaben_group("Anime / Subbed") == "Anime"
     assert _knaben_group("XXX / Video") == "SKIP"
     assert _knaben_group("Books / EBooks") == "Books"
-    # TGx + DODI parsers (synthetic pages; fetch monkeypatched — real sites unverified here)
+    # TGx + FitGirl parsers (synthetic pages; fetch monkeypatched — real sites unverified here)
     _g = globals()
     _of = _g["fetch"]
     _g["fetch"] = lambda *a, **k: (
@@ -847,14 +814,14 @@ def selftest() -> None:
     assert tg[0].page.endswith("/torrent/55/The-Matrix/"), tg[0].page
     _g["fetch"] = lambda *a, **k: (
         '<rss><channel><item><title>Cyberpunk 2077</title>'
-        '<link>https://dodi-repacks.site/cyberpunk-2077/</link>'
+        '<link>https://fitgirl-repacks.site/cyberpunk-2077/</link>'
         '<pubDate>Mon, 01 Jan 2024 00:00:00 +0000</pubDate>'
         '<description>x <a href="magnet:?xt=urn:btih:'
         'dd8255ecdc7ca55fb0bbf81323d87062db1f6d1c&dn=cp">here</a></description>'
         '</item></channel></rss>')
-    dd = _dodi("cyberpunk")
-    assert len(dd) == 1 and dd[0].source == "dodi" and dd[0].name == "Cyberpunk 2077", dd
-    assert dd[0].page == "https://dodi-repacks.site/cyberpunk-2077/", dd[0].page
+    dd = _fitgirl("cyberpunk")
+    assert len(dd) == 1 and dd[0].source == "fitgirl" and dd[0].name == "Cyberpunk 2077", dd
+    assert dd[0].page == "https://fitgirl-repacks.site/cyberpunk-2077/", dd[0].page
     _g["fetch"] = lambda *a, **k: (
         '<table><tr>'
         '<td><a href="edition.php?id=1">x</a>'
