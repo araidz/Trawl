@@ -171,7 +171,7 @@ class Aria2:
             self.proc.terminate()
             try:
                 self.proc.wait(timeout=3)
-            except subprocess.TimeoutExpired:
+            except (subprocess.TimeoutExpired, KeyboardInterrupt):
                 self.proc.kill()
 
     def __enter__(self) -> "Aria2":
