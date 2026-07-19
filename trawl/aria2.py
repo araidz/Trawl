@@ -14,6 +14,7 @@ import socket
 import subprocess
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -133,6 +134,7 @@ class Aria2:
         self.proc: subprocess.Popen | None = None
         self.roots: list[str] = []  # gids we added, in add order
         self._resolved: dict[str, str] = {}  # root gid -> current effective gid
+        self._uris: dict[str, tuple[str, dict]] = {}  # root gid -> (uri, options) for retry
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -145,7 +147,10 @@ class Aria2:
             f"--rpc-secret={self.secret}",
             "--rpc-listen-all=false",
             f"--save-session={self.session}",  # private: never touch the user's session
+            "--save-session-interval=30",  # survive crashes, not just clean quits
         ]
+        if self.session.is_file():  # auto-resume last session's unfinished downloads
+            args.append(f"--input-file={self.session}")
         if self.conf and self.conf.is_file():
             args.append(f"--conf-path={self.conf}")
         self.proc = subprocess.Popen(
@@ -155,6 +160,7 @@ class Aria2:
         while time.monotonic() < deadline:
             try:
                 self._call("aria2.getVersion")
+                self._adopt()
                 return
             except Aria2Error:
                 if self.proc.poll() is not None:
@@ -183,10 +189,24 @@ class Aria2:
 
     # -- commands ------------------------------------------------------------
 
+    def _adopt(self) -> None:
+        """Track downloads aria2 restored from the session file at startup."""
+        for method, params in (("aria2.tellActive", [["gid"]]),
+                               ("aria2.tellWaiting", [0, 1000, ["gid"]])):
+            try:
+                for t in self._call(method, params) or []:
+                    gid = t.get("gid")
+                    if gid and gid not in self.roots:
+                        self.roots.append(gid)
+                        self._resolved[gid] = gid
+            except Aria2Error:
+                pass
+
     def add(self, magnet: str, options: dict | None = None) -> str:
         gid = self._call("aria2.addUri", [[magnet], options or {}])
         self.roots.append(gid)
         self._resolved[gid] = gid
+        self._uris[gid] = (magnet, options or {})
         return gid
 
     def remove(self, root: str) -> None:
@@ -199,6 +219,29 @@ class Aria2:
         if root in self.roots:
             self.roots.remove(root)
         self._resolved.pop(root, None)
+        self._uris.pop(root, None)
+
+    def retry(self, root: str) -> str | None:
+        """Remove a failed download and re-add it from its original uri. Adopted
+        session downloads fall back to a bare magnet from the infohash (DHT).
+        Returns the new root gid, or None if there's nothing to re-add from."""
+        uri, opts = self._uris.get(root, ("", {}))
+        if not uri:
+            try:
+                st = self._call("aria2.tellStatus",
+                                [self._resolved.get(root, root), ["infoHash", "bittorrent"]])
+            except Aria2Error:
+                st = {}
+            ih = st.get("infoHash") or ""
+            if not ih:
+                return None
+            name = ((st.get("bittorrent") or {}).get("info") or {}).get("name", ih)
+            uri = f"magnet:?xt=urn:btih:{ih}&dn={urllib.parse.quote(name)}"
+        self.remove(root)
+        try:
+            return self.add(uri, opts)
+        except Aria2Error:
+            return None
 
     def pause(self, root: str) -> None:
         # forcePause stops a BT download immediately (no tracker round-trip)
@@ -254,6 +297,26 @@ class Aria2:
             d.root = root
             out.append(d)
         return out
+
+    def files(self, root: str) -> list[dict]:
+        """A download's file list for the picker: index, path, length, selected."""
+        try:
+            st = self._call("aria2.tellStatus", [self._resolve(root), ["files"]])
+        except Aria2Error:
+            return []
+        return [{"index": int(f.get("index") or 0), "path": f.get("path", ""),
+                 "length": int(f.get("length") or 0), "selected": f.get("selected") == "true"}
+                for f in (st.get("files") or [])]
+
+    def select_files(self, root: str, indices: list[int]) -> bool:
+        """Restrict a BT download to the given 1-based file indices."""
+        try:
+            self._call("aria2.changeOption",
+                       [self._resolved.get(root, root),
+                        {"select-file": ",".join(str(i) for i in sorted(indices))}])
+            return True
+        except Aria2Error:
+            return False
 
     def file_paths(self, root: str) -> list[str]:
         """On-disk paths of a download's files (for delete-on-cancel)."""
@@ -356,11 +419,31 @@ def selftest() -> None:
         rows = eng.poll()
         assert any(d.gid for d in rows), f"added magnet not listed: {rows}"
         print(f"added + polled ok ({len(rows)} row, status={rows[0].status})")
-        eng.remove(root)
+        # retry: re-adds from the remembered uri under a new gid
+        new = eng.retry(root)
+        assert new and new != root and eng._uris[new][0] == magnet, (new, root)
+        assert root not in eng.roots and new in eng.roots
+        print("retry ok")
+        eng.remove(new)
         assert eng.poll() == [], "remove left a row behind"
         print("remove ok")
     assert eng.proc.poll() is not None, "aria2c did not shut down"
     print("shutdown ok")
+
+    # session resume: a paused download saved on shutdown is adopted on restart
+    eng2 = Aria2(conf=None, state_dir=tmp)
+    with eng2:
+        magnet2 = ("magnet:?xt=urn:btih:dd8255ecdc7ca55fb0bbf81323d87062db1f6d1c"
+                   "&dn=trawl-resume-test")
+        r2 = eng2.add(magnet2, {"dir": str(tmp), "pause": "true"})
+        eng2._call("aria2.saveSession")
+    eng3 = Aria2(conf=None, state_dir=tmp)
+    with eng3:
+        assert eng3.roots, "restart did not adopt the saved session download"
+        assert eng3.files(eng3.roots[0]) is not None  # files() tolerates metadata state
+        for r in list(eng3.roots):
+            eng3.remove(r)
+    print("session resume ok")
     print("\nPhase 1 selftest passed.")
 
 

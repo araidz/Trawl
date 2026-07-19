@@ -22,6 +22,8 @@ from datetime import datetime
 from email.utils import parsedate_to_datetime
 from typing import Callable
 
+from .aria2 import STATE_DIR
+
 UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
 RETRY_STATUS = {408, 425, 429, 500, 502, 503, 504}
@@ -35,6 +37,38 @@ TRACKERS = [
     "udp://open.stealth.si:80/announce",
     "udp://tracker.dler.org:6969/announce",
 ]
+
+_TRACKERS_URL = "https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_best.txt"
+_TRACKERS_CACHE = STATE_DIR / "trackers.txt"
+_TRACKERS_TTL = 7 * 86400  # refresh weekly
+
+
+def _parse_trackers(text: str) -> list[str]:
+    return [ln for ln in (ln.strip() for ln in text.splitlines())
+            if ln.startswith(("udp://", "http://", "https://", "wss://"))]
+
+
+def refresh_trackers() -> None:
+    """Swap TRACKERS for a fresh ngosang/trackerslist copy, cached a week on
+    disk. Never blocks a search (call it from a daemon thread); any failure
+    leaves the hardcoded fallback list in place."""
+    try:
+        if (time.time() - _TRACKERS_CACHE.stat().st_mtime) < _TRACKERS_TTL:
+            fresh = _parse_trackers(_TRACKERS_CACHE.read_text())
+            if fresh:
+                TRACKERS[:] = fresh
+                return
+    except OSError:
+        pass
+    try:
+        text = fetch(_TRACKERS_URL, timeout=10)
+        fresh = _parse_trackers(text)
+        if fresh:
+            TRACKERS[:] = fresh
+            _TRACKERS_CACHE.parent.mkdir(parents=True, exist_ok=True)
+            _TRACKERS_CACHE.write_text(text)
+    except (SourceError, OSError):
+        pass  # keep the hardcoded fallback
 
 
 class SourceError(Exception):
@@ -467,11 +501,19 @@ def _x1337(query: str, cat: str, source: str) -> list[Result]:
     if need:
         rows = [r for r in rows if all(t in r["name"].lower() for t in need)]
     rows.sort(key=lambda r: r["seeders"], reverse=True)
+    rows = rows[:_X_MAX]
+    # detail pages fetched in parallel; order preserved, failures dropped
+    magnets: list[str | None] = [None] * len(rows)
+    def _get(i: int, path: str) -> None:
+        magnets[i] = _x_magnet(base, path)
+    threads = [threading.Thread(target=_get, args=(i, r["path"]), daemon=True)
+               for i, r in enumerate(rows)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=20)
     out = []
-    # ponytail: detail magnets fetched sequentially (<=8). Parallelize with daemon
-    # threads if 1337x latency becomes the bottleneck.
-    for r in rows[:_X_MAX]:
-        magnet = _x_magnet(base, r["path"])
+    for r, magnet in zip(rows, magnets):
         if not magnet:
             continue
         hm = re.search(r"urn:btih:([a-zA-Z0-9]+)", magnet, re.I)
@@ -779,6 +821,9 @@ def selftest() -> None:
     # browse flag: only search-only sources are excluded from empty-query Latest
     assert {s.id for s in SOURCES if not s.browse} == {"libgen", "annas", "knaben", "torrentgalaxy"}, \
         [s.id for s in SOURCES if not s.browse]
+    # tracker-list parse: keeps only announce urls, junk lines dropped
+    tl = _parse_trackers("udp://a:1/announce\n\n# comment\nhttps://b/announce\nnot a url\n")
+    assert tl == ["udp://a:1/announce", "https://b/announce"], tl
     x_page = (
         '<table class="table-list"><tbody><tr>'
         '<td class="coll-1 name"><a href="/sort-here/">x</a>'

@@ -451,6 +451,10 @@ class App:
         self.confirm_quit = False
         self.torrent_prompt = None  # ParsedMagnet of a pending .torrent link (file vs contents)
         self.cancel_prompt = None  # Download pending cancel (delete files vs keep)
+        self.picker: Download | None = None  # download whose files are being picked
+        self.picker_files: list[dict] = []  # engine file dicts for the picker
+        self.picker_sel = 0
+        self.picker_on: set[int] = set()  # selected 1-based file indices
         self.detail: Result | None = None  # search result shown in the details view
         cfg = load_config()
         self.disabled_sources: set[str] = set(cfg.get("disabled_sources", []))
@@ -699,6 +703,39 @@ class App:
         self.edit_field = None
         self._save_settings()
 
+    def _open_picker(self, d: Download) -> None:
+        files = self.eng.files(d.root) if self.eng else []
+        if len(files) < 2:
+            self.status = ("single-file download — nothing to pick" if files
+                           else "file list not ready yet — fetching metadata")
+            return
+        self.picker = d
+        self.picker_files = files
+        self.picker_sel = 0
+        self.picker_on = {f["index"] for f in files if f["selected"]}
+
+    def _picker_key(self, k: str) -> None:
+        n = len(self.picker_files)
+        if k in ("esc", "q", "f"):
+            self.picker = None
+        elif k in ("up", "k"):
+            self.picker_sel = (self.picker_sel - 1) % n
+        elif k in ("down", "j"):
+            self.picker_sel = (self.picker_sel + 1) % n
+        elif k == " ":
+            self.picker_on.symmetric_difference_update({self.picker_files[self.picker_sel]["index"]})
+        elif k == "a":
+            all_on = {f["index"] for f in self.picker_files}
+            self.picker_on = set() if self.picker_on == all_on else all_on
+        elif k == "enter":
+            if not self.picker_on:
+                self.status = "select at least one file"
+                return
+            ok = self.eng.select_files(self.picker.root, sorted(self.picker_on)) if self.eng else False
+            self.status = (f"downloading {len(self.picker_on)}/{n} files" if ok
+                           else "couldn't set file selection")
+            self.picker = None
+
     def drain_search(self) -> None:
         if not self.search:
             return
@@ -798,6 +835,9 @@ class App:
             return
         if self.settings:
             self._settings_key(k)
+            return
+        if self.picker is not None:
+            self._picker_key(k)
             return
         if self.detail is not None:
             if k in ("esc", "enter", "q"):
@@ -938,6 +978,18 @@ class App:
                     self.status = f"revealed: {clean(d.name)[:40]}"
                 else:
                     self.status = "couldn't open location"
+            elif k == "r":
+                if d.status != "error":
+                    self.status = "r retries a failed download"
+                elif self.eng and self.eng.retry(d.root):
+                    self.status = f"retrying: {clean(d.name)[:42]}"
+                else:
+                    self.status = "couldn't retry — no source uri known"
+            elif k == "f":
+                if d.status in ("active", "waiting", "paused"):
+                    self._open_picker(d)
+                else:
+                    self.status = "file selection only for in-progress downloads"
 
 
 # -- rendering ---------------------------------------------------------------
@@ -1258,6 +1310,29 @@ def _settings_panel(app: App, width: int, height: int) -> list[str]:
     return _wrap_panel("Settings", inner, width, height, True)
 
 
+def _picker_panel(app: App, width: int, height: int) -> list[str]:
+    inner_w = width - 4
+    files = app.picker_files
+    total_on = sum(f["length"] for f in files if f["index"] in app.picker_on)
+    inner = [cell(f"{len(app.picker_on)}/{len(files)} files · {fmt_bytes(total_on)}",
+                  inner_w, dim=True)]
+    list_h = max(1, height - 2 - len(inner))
+    start = _window(app.picker_sel, len(files), list_h)
+    for idx in range(start, min(start + list_h, len(files))):
+        f = files[idx]
+        here = idx == app.picker_sel
+        on = f["index"] in app.picker_on
+        name = os.path.basename(f["path"]) or f["path"] or "?"
+        inner.append(
+            cell(T.PTR if here else "", 2, color=T.ACCENT)
+            + cell("[x]" if on else "[ ]", 4, color=T.GOOD if on else T.RULE)
+            + cell(clean(name), inner_w - 16, color=T.ACCENT if here else None,
+                   bold=here, dim=not here and not on)
+            + cell(fmt_bytes(f["length"]), 10, "right", dim=True))
+    return _wrap_panel("Files", inner, width, height, True,
+                       f"({clean(app.picker.name)[:24]})" if app.picker else None)
+
+
 def _help_panel(width: int, height: int) -> list[str]:
     inner_w = width - 4
     groups = [
@@ -1269,6 +1344,7 @@ def _help_panel(width: int, height: int) -> list[str]:
         ("Navigate", [("↑ ↓  j k", "move selection / scroll wheel"),
                       ("tab", "switch search / downloads")]),
         ("Downloads", [("p", "pause / resume"), ("x", "cancel (ask: delete or keep files)"),
+                       ("r", "retry a failed download"), ("f", "choose files (season packs)"),
                        ("o", "reveal in Finder"), ("s", "resume partial downloads on disk")]),
         ("General", [("g", "settings (sources, download dir)"), ("?", "this help"),
                      ("q", "quit (confirm)"), ("ctrl-c", "quit now")]),
@@ -1292,6 +1368,9 @@ def _footer(app: App, width: int) -> str:
     elif app.settings:
         hints = ([("type", "value"), ("enter", "save"), ("esc", "cancel")] if app.edit_field
                  else [("↑↓", "move"), ("enter/space", "toggle/edit"), ("g/esc", "close")])
+    elif app.picker is not None:
+        hints = [("↑↓", "move"), ("space", "toggle"), ("a", "all/none"),
+                 ("enter", "apply"), ("esc", "cancel")]
     elif app.detail is not None:
         hints = [("d", "download"), ("o", "page"), ("y", "copy magnet"), ("p", "poster"), ("esc", "back"), ("q", "back")]
     elif app.view == "search" and app.editing:
@@ -1300,8 +1379,9 @@ def _footer(app: App, width: int) -> str:
         hints = [("↑↓", "move"), ("enter", "details"), ("d", "grab"), ("o", "page"), ("y", "copy"),
                  ("S", "sort"), ("←→", "category"), ("v", "paste"), ("g", "settings"), ("q", "quit")]
     else:
-        hints = [("↑↓", "move"), ("p", "pause/resume"), ("x", "cancel"), ("o", "reveal"),
-                 ("s", "resume"), ("g", "settings"), ("tab", "search"), ("q", "quit")]
+        hints = [("↑↓", "move"), ("p", "pause/resume"), ("x", "cancel"), ("r", "retry"),
+                 ("f", "files"), ("o", "reveal"), ("s", "resume"), ("g", "settings"),
+                 ("tab", "search"), ("q", "quit")]
     out, used = "", 0
     if app.status:
         st = dtrunc(clean(app.status), max(10, width // 2))
@@ -1437,6 +1517,9 @@ def render(app: App, cols: int, rows: int) -> list[str]:
         rail = [cell("", RAIL_W)] * body_h
     elif app.settings:
         content = _settings_panel(app, content_w, body_h)
+        rail = [cell("", RAIL_W)] * body_h
+    elif app.picker is not None:
+        content = _picker_panel(app, content_w, body_h)
         rail = [cell("", RAIL_W)] * body_h
     else:
         rail = _rail(app, body_h)
@@ -1618,6 +1701,62 @@ def selftest() -> None:
     apps.dsel = 0
     apps.on_key("o")
     assert "metadata" in apps.status, apps.status
+    # r retries only errored downloads, routed to the engine
+    rcalls = []
+
+    class _RetryEng:
+        def retry(self, r): rcalls.append(r); return "newgid"
+        def files(self, r): return []
+
+    appr = App(eng=_RetryEng())
+    appr.view = "downloads"
+    appr.downloads = [Download("g", "F", "active", 100, 10, 5, 1, None, root="r1")]
+    appr.on_key("r")
+    assert rcalls == [] and "retries a failed" in appr.status, appr.status
+    appr.downloads[0].status = "error"
+    appr.on_key("r")
+    assert rcalls == ["r1"] and appr.status.startswith("retrying"), (rcalls, appr.status)
+    # f opens the file picker (2+ files); space toggles, a flips all, enter applies
+    sel_calls = []
+
+    class _PickEng:
+        def files(self, r):
+            return [{"index": 1, "path": "/d/S01E01.mkv", "length": 700, "selected": True},
+                    {"index": 2, "path": "/d/S01E02.mkv", "length": 700, "selected": True}]
+        def select_files(self, r, idx): sel_calls.append((r, idx)); return True
+
+    appf = App(eng=_PickEng())
+    appf.view = "downloads"
+    appf.downloads = [Download("g", "Pack", "active", 100, 10, 5, 1, None, root="rp")]
+    appf.on_key("f")
+    assert appf.picker is not None and appf.picker_on == {1, 2}, appf.picker_on
+    appf.on_key(" ")  # toggle file 1 off
+    assert appf.picker_on == {2}, appf.picker_on
+    appf.on_key("a")  # all
+    assert appf.picker_on == {1, 2}
+    appf.on_key("a")  # none
+    appf.on_key("enter")  # empty selection refused
+    assert appf.picker is not None and "at least one" in appf.status
+    appf.on_key(" ")
+    appf.on_key("enter")
+    assert sel_calls == [("rp", [1])] and appf.picker is None, sel_calls
+    # single-file download: picker refuses to open
+    class _OneEng:
+        def files(self, r): return [{"index": 1, "path": "/d/f.iso", "length": 1, "selected": True}]
+    app1 = App(eng=_OneEng())
+    app1.view = "downloads"
+    app1.downloads = [Download("g", "F", "active", 1, 0, 0, 0, None, root="r")]
+    app1.on_key("f")
+    assert app1.picker is None and "nothing to pick" in app1.status, app1.status
+    # picker renders width-safe
+    appf.on_key("f")
+    appf2_frames = render(appf, 100, 30)
+    jp = "\n".join(strip_ansi(x) for x in appf2_frames)
+    assert "Files" in jp and "S01E01.mkv" in jp, jp
+    for ln in appf2_frames:
+        assert dwidth(strip_ansi(ln)) <= 100, "picker overflow"
+    appf.on_key("esc")
+    assert appf.picker is None
     # completion notification: once on active->complete, never for pre-complete/staying
     gn = globals()
     orig_notify, orig_append, notes = gn["notify"], gn["append_dl_history"], []

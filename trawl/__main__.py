@@ -9,11 +9,12 @@ from __future__ import annotations
 
 import signal
 import sys
+import threading
 import time
 
 from . import __version__
 from .aria2 import Aria2, Aria2Error
-from .sources import parse_magnet, parse_source
+from .sources import parse_magnet, parse_source, refresh_trackers
 from .tui import App, Terminal, paste_clipboard, render
 
 HELP = ("trawl — terminal torrent finder over aria2.\n"
@@ -43,6 +44,7 @@ def main(argv: list[str] | None = None) -> int:
     except Aria2Error as e:
         print(f"aria2 failed to start: {e}\nIs aria2 installed? (brew install aria2)")
         return 1
+    threading.Thread(target=refresh_trackers, daemon=True).start()
 
     app = App(eng)
     if app.download_dir:
