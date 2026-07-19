@@ -64,10 +64,12 @@ Trawl is a from-scratch Python TUI inspired by
   `~/.aria2/aria2.conf`. Magnet metadata → real download handoff handled; direct
   http(s) links download too.
 - **Downloads pane** — live progress (animated bar), speed, ETA, peers;
-  pause / resume / cancel; reveal in Finder; a persistent *Recently downloaded* list.
+  pause / resume / cancel / retry; pick individual files from multi-file
+  torrents; reveal in Finder; a persistent *Recently downloaded* list.
 - **Inspect before grabbing** — a details view, open the torrent's page in your
   browser, or copy its magnet.
-- **Resume** — `s` scans the download folder for partial `*.aria2` files and resumes them.
+- **Resume** — unfinished downloads resume automatically on the next launch;
+  `s` additionally scans the download folder for stray partial `*.aria2` files.
 - **Quality of life** — persistent search history, completion notifications,
   clipboard magnet auto-detect, mouse-wheel scrolling, a settings overlay
   (toggle sources, set the download dir), and confirm-on-quit.
@@ -126,6 +128,8 @@ empty box to browse the latest, or paste a magnet or direct http(s) link to grab
 | --- | --- |
 | `↑ ↓` | move / scroll |
 | `p` | pause / resume · `x` cancel (asks: delete files or keep) |
+| `r` | retry a failed download |
+| `f` | choose which files to download (season packs) |
 | `o` | reveal the file in Finder |
 | `s` resume · `g` settings · `q` | quit |
 
