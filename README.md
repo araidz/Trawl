@@ -142,7 +142,7 @@ empty box to browse the latest, or paste a magnet or direct http(s) link to grab
 | TV | EZTV · SolidTorrents · The Pirate Bay · 1337x |
 | Anime | Nyaa · SubsPlease · AnimeTosho |
 | Books | The Pirate Bay · Nyaa (literature) · Library Genesis · Anna's Archive |
-| All | Knaben (meta-aggregator) · TorrentGalaxy |
+| All | Knaben (meta-aggregator) · TorrentGalaxy · Torrents-CSV |
 
 Toggle any source on or off in the settings overlay (`g`). If a source is down,
 the search carries on without it.

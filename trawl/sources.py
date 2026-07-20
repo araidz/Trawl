@@ -361,6 +361,23 @@ def _solid(query: str) -> list[Result]:
     return out
 
 
+def _torrentscsv(query: str) -> list[Result]:
+    q = query.strip()
+    if not q:  # DHT aggregator: search only, no browse feed
+        return []
+    data = fetch_json(f"https://torrents-csv.com/service/search?q={urllib.parse.quote(q)}&size=100")
+    out = []
+    for it in data.get("torrents") or []:
+        h = (it.get("infohash") or "").lower()
+        if not re.fullmatch(r"[a-f0-9]{40}", h):
+            continue
+        name = it.get("name") or "Unknown"
+        out.append(Result(h, name, _int(it.get("size_bytes")), _int(it.get("seeders")),
+                          _int(it.get("leechers")), "torrents-csv", build_magnet(h, name),
+                          _int(it.get("created_unix")) or None))
+    return out
+
+
 _SP_RES = ["1080", "720", "480"]
 
 
@@ -754,6 +771,7 @@ SOURCES: list[Source] = [
     Source("annas", "Anna's", "Books", _annas, browse=False),
     Source("knaben", "Knaben", "Other", _knaben, browse=False),
     Source("torrentgalaxy", "TGx", "Other", _tgx, browse=False),
+    Source("torrents-csv", "TorrCSV", "Other", _torrentscsv, browse=False),
 ]
 
 
@@ -819,7 +837,8 @@ def selftest() -> None:
     ])
     assert len(merged) == 1 and merged[0].seeders == 50, "dedupe keeps higher seeders"
     # browse flag: only search-only sources are excluded from empty-query Latest
-    assert {s.id for s in SOURCES if not s.browse} == {"libgen", "annas", "knaben", "torrentgalaxy"}, \
+    assert {s.id for s in SOURCES if not s.browse} == \
+        {"libgen", "annas", "knaben", "torrentgalaxy", "torrents-csv"}, \
         [s.id for s in SOURCES if not s.browse]
     # tracker-list parse: keeps only announce urls, junk lines dropped
     tl = _parse_trackers("udp://a:1/announce\n\n# comment\nhttps://b/announce\nnot a url\n")
@@ -894,6 +913,17 @@ def selftest() -> None:
     assert an[0].magnet == "https://libgen.li/get.php?md5=aabbccddeeff00112233445566778899", an[0].magnet
     assert an[0].page == "https://annas-archive.org/md5/aabbccddeeff00112233445566778899", an[0].page
     assert _annas("") == [], "annas search-only"
+    _g["fetch"] = lambda *a, **k: json.dumps({"torrents": [
+        {"infohash": "dd8255ecdc7ca55fb0bbf81323d87062db1f6d1c", "name": "The Matrix 1999",
+         "size_bytes": 1_500_000_000, "seeders": 1234, "leechers": 56, "created_unix": 1700000000},
+        {"infohash": "tooshort", "name": "bad row", "size_bytes": 0, "seeders": 0, "leechers": 0},
+    ]})
+    tc = _torrentscsv("matrix")
+    assert len(tc) == 1 and tc[0].source == "torrents-csv" and tc[0].name == "The Matrix 1999", tc
+    assert tc[0].info_hash == "dd8255ecdc7ca55fb0bbf81323d87062db1f6d1c", tc[0].info_hash
+    assert tc[0].seeders == 1234 and tc[0].leechers == 56 and tc[0].size == 1_500_000_000, tc
+    assert tc[0].added == 1700000000 and tc[0].magnet.startswith("magnet:?"), tc
+    assert _torrentscsv("") == [], "torrents-csv search-only"
     _g["fetch"] = _of
     print("pure logic ok")
 
