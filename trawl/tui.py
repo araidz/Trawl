@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import glob
 import json
+import math
 import os
 import queue
 import re
@@ -22,6 +23,8 @@ import threading
 import time
 import tty
 import unicodedata
+from collections.abc import Iterable, Sequence
+from functools import cache, lru_cache
 
 from . import theme as T
 from .aria2 import STATE_DIR, Aria2Error, Download, control_infohash
@@ -104,6 +107,7 @@ RESET = "\x1b[0m"
 _ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 
 
+@lru_cache(maxsize=2048)
 def _fg(hexc: str) -> str:
     n = int(hexc[1:], 16)
     return f"\x1b[38;2;{(n >> 16) & 255};{(n >> 8) & 255};{n & 255}m"
@@ -292,23 +296,14 @@ def notify(title: str, message: str) -> None:
 # -- progress bar ------------------------------------------------------------
 
 
-def render_bar(progress: float, width: int, tick: float, animate: bool,
-               base: str = T.ACCENT) -> str:
-    if width <= 0:
-        return ""
-    filled = round(max(0.0, min(1.0, progress)) * width)
-    empty = width - filled
+@lru_cache(maxsize=64)
+def _bar_cells(width: int, base: str) -> tuple[str, ...]:
     denom = max(1, width - 1)
-    period = T.sheen_period(width)
-    center = T.sheen_center(tick, period)
-    cells = []
-    for i in range(filled):
-        c = T.progress_ramp(i / denom, T.DEEP, base, T.BRIGHT)
-        if animate:
-            inten = T.sheen_intensity(i, center)
-            if inten > 0:
-                c = T.lerp_hex(c, T.SHEEN_PEAK, inten)
-        cells.append(c)
+    return tuple(T.progress_ramp(i / denom, T.DEEP, base, T.BRIGHT)
+                 for i in range(width))
+
+
+def _styled_bar(cells: tuple[str, ...] | list[str], empty: int) -> str:
     out = []
     j = 0
     while j < len(cells):  # group consecutive same-color runs to cut escapes
@@ -320,6 +315,29 @@ def render_bar(progress: float, width: int, tick: float, animate: bool,
     if empty:
         out.append(style(T.TRACK * empty, T.RULE))
     return "".join(out)
+
+
+@lru_cache(maxsize=128)
+def _static_bar(width: int, filled: int, base: str) -> str:
+    return _styled_bar(_bar_cells(width, base)[:filled], width - filled)
+
+
+def render_bar(progress: float, width: int, tick: float, animate: bool,
+               base: str = T.ACCENT) -> str:
+    if width <= 0:
+        return ""
+    filled = round(max(0.0, min(1.0, progress)) * width)
+    if not animate:
+        return _static_bar(width, filled, base)
+    cells = list(_bar_cells(width, base)[:filled])
+    center = T.sheen_center(tick, T.sheen_period(width))
+    lo = max(0, math.floor(center - T.SHEEN_RADIUS) + 1)
+    hi = min(filled, math.ceil(center + T.SHEEN_RADIUS))
+    for i in range(lo, hi):
+        inten = T.sheen_intensity(i, center)
+        if inten > 0:
+            cells[i] = T.lerp_hex(cells[i], T.SHEEN_PEAK, inten)
+    return _styled_bar(cells, width - filled)
 
 
 # -- key parsing -------------------------------------------------------------
@@ -381,13 +399,19 @@ class Terminal:
     def __init__(self):
         self.fd = sys.stdin.fileno()
         self.saved = None
+        self._lines: tuple[str, ...] | None = None
+        self._size: tuple[int, int] | None = None
 
     def enter(self) -> None:
+        self._reset_frame()
         self.saved = termios.tcgetattr(self.fd)
         tty.setraw(self.fd)
         # alt-screen + clear + SGR mouse reporting; trawl owns the whole tab
         sys.stdout.write("\x1b[?1049h\x1b[3J\x1b[2J\x1b[H\x1b[?25l\x1b[?1000h\x1b[?1006h")
         sys.stdout.flush()
+
+    def _reset_frame(self) -> None:
+        self._lines = self._size = None
 
     def leave(self) -> None:
         sys.stdout.write("\x1b[?1000l\x1b[?1006l\x1b[?25h\x1b[?1049l")
@@ -409,15 +433,25 @@ class Terminal:
             return []
         return parse_keys(data)
 
-    def write(self, lines: list[str]) -> None:
-        buf = ["\x1b[H"]
-        for i, ln in enumerate(lines):
-            buf.append(ln + "\x1b[K")
-            if i < len(lines) - 1:
-                buf.append("\r\n")
-        buf.append("\x1b[J")
+    def write(self, lines: list[str], size: tuple[int, int]) -> bool:
+        current = tuple(lines)
+        if current == self._lines and size == self._size:
+            return False
+        full = self._lines is None or size != self._size or len(current) != len(self._lines)
+        if full:
+            buf = ["\x1b[H\x1b[2J"]
+            for i, ln in enumerate(current):
+                buf.append(ln + "\x1b[K")
+                if i < len(current) - 1:
+                    buf.append("\r\n")
+            buf.append("\x1b[J")
+        else:
+            buf = [f"\x1b[{i + 1};1H{ln}\x1b[K"
+                   for i, (old, ln) in enumerate(zip(self._lines, current)) if old != ln]
         sys.stdout.write("".join(buf))
         sys.stdout.flush()
+        self._lines, self._size = current, size
+        return True
 
 
 # -- app state ---------------------------------------------------------------
@@ -433,7 +467,9 @@ class App:
         self.history = load_history()  # past queries, oldest -> newest
         self.hist_idx = len(self.history)  # cursor; == len means "live draft"
         self.draft = ""  # query in progress before browsing history
-        self.results: list[Result] = []
+        self._results_revision = 0
+        self._results: tuple[Result, ...] = ()
+        self.results = []
         self.errors: dict[str, str] = {}
         self.search: Search | None = None
         self.search_done = 0
@@ -455,6 +491,7 @@ class App:
         self.picker_files: list[dict] = []  # engine file dicts for the picker
         self.picker_sel = 0
         self.picker_on: set[int] = set()  # selected 1-based file indices
+        self.picker_bytes = 0
         self.detail: Result | None = None  # search result shown in the details view
         cfg = load_config()
         self.disabled_sources: set[str] = set(cfg.get("disabled_sources", []))
@@ -469,12 +506,28 @@ class App:
         self.tmdb_key = cfg.get("tmdb_key") or os.environ.get("TMDB_API_KEY")
         self.omdb_key = cfg.get("omdb_key") or os.environ.get("OMDB_API_KEY")
         self.meta: dict[str, object] = {}  # "provider:kind:name" -> "loading" | Meta | None
+        self._visible_revision = -1
+        self._visible_cat: str | None = None
+        self._visible_cache: tuple[Result, ...] = ()
 
     # -- derived
-    def visible_results(self) -> list[Result]:
+    @property
+    def results(self) -> tuple[Result, ...]:
+        return self._results
+
+    @results.setter
+    def results(self, value: Iterable[Result]) -> None:
+        self._results = tuple(value)
+        self._results_revision += 1
+
+    def visible_results(self) -> tuple[Result, ...]:
+        if self._results_revision == self._visible_revision and self.cat == self._visible_cat:
+            return self._visible_cache
         if self.cat != "all":
             g = CAT_GROUP[self.cat]
-            return [r for r in self.results if (r.group or GROUP_OF.get(r.source)) == g]
+            out = tuple(r for r in self.results if (r.group or GROUP_OF.get(r.source)) == g)
+            self._visible_revision, self._visible_cat, self._visible_cache = self._results_revision, self.cat, out
+            return out
         # All: round-robin across categories so one prolific group (e.g. anime)
         # can't monopolize the top. Buckets keep first-seen order (= current sort),
         # so the group holding the overall-top result still leads.
@@ -482,9 +535,11 @@ class App:
         for r in self.results:
             buckets.setdefault(r.group or GROUP_OF.get(r.source) or "Other", []).append(r)
         cols = list(buckets.values())
-        out: list[Result] = []
+        ordered: list[Result] = []
         for i in range(max((len(c) for c in cols), default=0)):
-            out += [c[i] for c in cols if i < len(c)]
+            ordered += [c[i] for c in cols if i < len(c)]
+        out = tuple(ordered)
+        self._visible_revision, self._visible_cat, self._visible_cache = self._results_revision, self.cat, out
         return out
 
     def _cur(self) -> Result | None:
@@ -528,8 +583,13 @@ class App:
         except Exception:
             self.meta[ckey] = None
 
-    def animating(self) -> bool:
-        return any(d.status in ("active", "metadata") for d in self.downloads)
+    def animating(self, rows: int) -> bool:
+        if self.view != "downloads" or self.help or self.settings or self.picker is not None:
+            return False
+        covered = set(_overlay_rows(rows)) if (self.confirm_quit or self.torrent_prompt
+                                               or self.cancel_prompt) else set()
+        return any(self.downloads[idx].status in ("active", "metadata") and bar_row not in covered
+                   for idx, bar_row in _visible_download_rows(self, rows))
 
     def enabled_sources(self) -> list:
         return [s for s in SOURCES if s.id not in self.disabled_sources]
@@ -713,6 +773,8 @@ class App:
         self.picker_files = files
         self.picker_sel = 0
         self.picker_on = {f["index"] for f in files if f["selected"]}
+        self.picker_bytes = sum(int(f.get("length") or 0) for f in files
+                                if f["index"] in self.picker_on)
 
     def _picker_key(self, k: str) -> None:
         n = len(self.picker_files)
@@ -723,10 +785,21 @@ class App:
         elif k in ("down", "j"):
             self.picker_sel = (self.picker_sel + 1) % n
         elif k == " ":
-            self.picker_on.symmetric_difference_update({self.picker_files[self.picker_sel]["index"]})
+            f = self.picker_files[self.picker_sel]
+            idx, length = f["index"], int(f.get("length") or 0)
+            if idx in self.picker_on:
+                self.picker_on.remove(idx)
+                self.picker_bytes -= length
+            else:
+                self.picker_on.add(idx)
+                self.picker_bytes += length
         elif k == "a":
             all_on = {f["index"] for f in self.picker_files}
-            self.picker_on = set() if self.picker_on == all_on else all_on
+            if self.picker_on == all_on:
+                self.picker_on, self.picker_bytes = set(), 0
+            else:
+                self.picker_on = all_on
+                self.picker_bytes = sum(int(f.get("length") or 0) for f in self.picker_files)
         elif k == "enter":
             if not self.picker_on:
                 self.status = "select at least one file"
@@ -740,6 +813,7 @@ class App:
         if not self.search:
             return
         changed = False
+        incoming: list[Result] = []
         while True:
             try:
                 u = self.search.updates.get_nowait()
@@ -750,12 +824,12 @@ class App:
             if u.results is None:
                 self.errors[u.source] = u.error
             else:
-                self.results.extend(u.results)
+                incoming.extend(u.results)
         if changed:
-            self.results = self._apply_sort(dedupe(self.results))
+            self.results = self._apply_sort(dedupe([*self.results, *incoming]))
             self.sel = min(self.sel, max(0, len(self.visible_results()) - 1))
 
-    def _apply_sort(self, results: list[Result]) -> list[Result]:
+    def _apply_sort(self, results: Sequence[Result]) -> list[Result]:
         if self.sort == "size":
             key = lambda r: (r.size, r.seeders)
         elif self.sort == "newest":
@@ -1086,7 +1160,8 @@ def _wrap_panel(title: str, inner: list[str], width: int, height: int,
     return [_panel_top(title, width, count, bw)] + [_side(r, inner_w, bw) for r in rows] + [_panel_bottom(width, bw)]
 
 
-def _logo_lines() -> list[str]:
+@cache
+def _logo_lines() -> tuple[str, ...]:
     out = []
     rows = len(T.LOGO_LINES)
     for row, line in enumerate(T.LOGO_LINES):
@@ -1102,7 +1177,7 @@ def _logo_lines() -> list[str]:
             else:
                 seg += style(ch, T.logo_color(((i / last) + ty) / 2), bold=True)
         out.append(seg)
-    return out
+    return tuple(out)
 
 
 def _rail(app: App, h: int) -> list[str]:
@@ -1163,7 +1238,7 @@ def _search_panel(app: App, width: int) -> list[str]:
     return _wrap_panel("Search", [_search_line(app, width - 4)], width, 3, editing)
 
 
-def _status_line(app: App, results: list[Result], inner_w: int) -> str:
+def _status_line(app: App, results: Sequence[Result], inner_w: int) -> str:
     if app.search and app.search_done < app.search_total:
         return cell(f"searching… {app.search_done}/{app.search_total} sources", inner_w, dim=True)
     errs = len(app.errors)
@@ -1218,25 +1293,58 @@ def _results_panel(app: App, width: int, height: int) -> list[str]:
     return _wrap_panel(title, inner, width, height, app.view == "search" and not app.editing, count)
 
 
+_DOWNLOADS_PREFIX = 4  # search panel + spacer before the downloads panel
+_DOWNLOAD_ITEM_H = 3
+_DOWNLOAD_BAR_ROW = 2  # panel-relative: border, status, then bar
+_RECENT_MIN_H = 2      # heading plus at least one history row
+
+
+def _recent_downloads(app: App) -> list[dict]:
+    here_names = {d.name for d in app.downloads}
+    return [r for r in reversed(app.dl_history) if r.get("name") not in here_names]
+
+
+def _download_viewport(app: App, height: int) -> tuple[int, int]:
+    body_h = height - 2
+    recent = bool(_recent_downloads(app))
+    max_items = max(0, (body_h - (_RECENT_MIN_H if recent else 0)) // _DOWNLOAD_ITEM_H)
+    if not app.downloads or not max_items:
+        return 0, 0
+    count = min(len(app.downloads), max(1, max_items))
+    start = _window(app.dsel, len(app.downloads), count)
+    return start, min(start + count, len(app.downloads))
+
+
+def _download_rows(app: App, height: int) -> list[tuple[int, int]]:
+    """Visible download indices and their bar rows relative to the panel."""
+    start, end = _download_viewport(app, height)
+    return [(idx, _DOWNLOAD_BAR_ROW + n * _DOWNLOAD_ITEM_H)
+            for n, idx in enumerate(range(start, end))]
+
+
+def _visible_download_rows(app: App, rows: int) -> list[tuple[int, int]]:
+    rows = max(12, rows)
+    panel_h = _main_heights(rows)[1]
+    body_top = len(T.LOGO_LINES) + 1
+    return [(idx, body_top + _DOWNLOADS_PREFIX + panel_row)
+            for idx, panel_row in _download_rows(app, panel_h)]
+
+
 def _downloads_panel(app: App, width: int, height: int) -> list[str]:
     inner_w = width - 4
     body_h = height - 2
     live = app.downloads
-    here_names = {d.name for d in live}
     # Recently = past-session completions not currently in the live list (no dupes)
-    recent = [r for r in reversed(app.dl_history) if r.get("name") not in here_names]
+    recent = _recent_downloads(app)
     inner: list[str] = []
     if not live and not recent:
         inner.append(cell("No downloads yet. Find something and press d to grab it.", inner_w, dim=True))
         inner.append(cell("Press s to resume partial downloads on disk.", inner_w, dim=True))
         return _wrap_panel("Downloads", inner, width, height, app.view == "downloads")
     app.dsel = min(app.dsel, max(0, len(live) - 1))
-    reserve = 2 if recent else 0
-    max_items = max(0, (body_h - reserve) // 3)
-    if live and max_items:
-        list_h = min(len(live), max(1, max_items))
-        start = _window(app.dsel, len(live), list_h)
-        for idx in range(start, min(start + list_h, len(live))):
+    rows = _download_rows(app, height)
+    if rows:
+        for idx, _ in rows:
             d = live[idx]
             here = idx == app.dsel
             pct = int(d.progress * 100)
@@ -1313,8 +1421,7 @@ def _settings_panel(app: App, width: int, height: int) -> list[str]:
 def _picker_panel(app: App, width: int, height: int) -> list[str]:
     inner_w = width - 4
     files = app.picker_files
-    total_on = sum(f["length"] for f in files if f["index"] in app.picker_on)
-    inner = [cell(f"{len(app.picker_on)}/{len(files)} files · {fmt_bytes(total_on)}",
+    inner = [cell(f"{len(app.picker_on)}/{len(files)} files · {fmt_bytes(app.picker_bytes)}",
                   inner_w, dim=True)]
     list_h = max(1, height - 2 - len(inner))
     start = _window(app.picker_sel, len(files), list_h)
@@ -1328,7 +1435,7 @@ def _picker_panel(app: App, width: int, height: int) -> list[str]:
             + cell("[x]" if on else "[ ]", 4, color=T.GOOD if on else T.RULE)
             + cell(clean(name), inner_w - 16, color=T.ACCENT if here else None,
                    bold=here, dim=not here and not on)
-            + cell(fmt_bytes(f["length"]), 10, "right", dim=True))
+            + cell(fmt_bytes(f.get("length")), 10, "right", dim=True))
     return _wrap_panel("Files", inner, width, height, True,
                        f"({clean(app.picker.name)[:24]})" if app.picker else None)
 
@@ -1483,11 +1590,23 @@ def _overlay(lines: list[str], app: App, cols: int, rows: int) -> list[str]:
            else None)
     if not box:
         return lines
-    mid = max(0, rows // 2 - 1)
+    mid = _overlay_rows(rows).start
     for j, b in enumerate(box):
         if mid + j < len(lines):
             lines[mid + j] = b
     return lines
+
+
+def _overlay_rows(rows: int) -> range:
+    rows = max(12, rows)
+    mid = max(0, rows // 2 - 1)
+    return range(mid, min(rows, mid + 3))
+
+
+def _main_heights(rows: int) -> tuple[int, int]:
+    rows = max(12, rows)
+    body_h = rows - len(T.LOGO_LINES) - 3
+    return body_h, body_h - 4
 
 
 def render(app: App, cols: int, rows: int) -> list[str]:
@@ -1507,9 +1626,7 @@ def render(app: App, cols: int, rows: int) -> list[str]:
     else:
         lines.append(" " * MARGIN + style("─" * rule_w, T.RULE))
 
-    header_h = len(T.LOGO_LINES) + 1
-    footer_h = 2
-    body_h = rows - header_h - footer_h
+    body_h, panel_h = _main_heights(rows)
     content_w = cols - MARGIN - RAIL_W - GAP - 1
 
     if app.help:
@@ -1523,9 +1640,7 @@ def render(app: App, cols: int, rows: int) -> list[str]:
         rail = [cell("", RAIL_W)] * body_h
     else:
         rail = _rail(app, body_h)
-        search_h = 3
         content = _search_panel(app, content_w) + [""]
-        panel_h = body_h - search_h - 1
         if app.view == "search" and app.detail is not None:
             content += _detail_panel(app, app.detail, content_w, panel_h)
         elif app.view == "search":
@@ -1551,7 +1666,72 @@ def selftest() -> None:
     assert dwidth("abc") == 3 and dwidth("日本") == 4, "east-asian width"
     assert dwidth(strip_ansi(cell("hi", 10))) == 10, "cell pads to width"
     assert dtrunc("hello world", 5) == "hell…", dtrunc("hello world", 5)
-    assert strip_ansi(render_bar(0.5, 10, 0, False)).count("█") == 5, "bar half full"
+    def reference_bar(progress, width, tick, animate, base=T.ACCENT):
+        if width <= 0:
+            return ""
+        filled = round(max(0.0, min(1.0, progress)) * width)
+        denom = max(1, width - 1)
+        cells = [T.progress_ramp(i / denom, T.DEEP, base, T.BRIGHT)
+                 for i in range(filled)]
+        if animate:
+            center = T.sheen_center(tick, T.sheen_period(width))
+            lo = max(0, math.floor(center - T.SHEEN_RADIUS) + 1)
+            hi = min(filled, math.ceil(center + T.SHEEN_RADIUS))
+            for i in range(lo, hi):
+                intensity = T.sheen_intensity(i, center)
+                if intensity > 0:
+                    cells[i] = T.lerp_hex(cells[i], T.SHEEN_PEAK, intensity)
+        return _styled_bar(cells, width - filled)
+
+    for width in (0, 1, 2, 10, 17):
+        for progress in (-0.2, 0, .33, .5, 1, 1.2):
+            for tick in (0, 3.25, 999):
+                for base in (T.ACCENT, T.BAD):
+                    for animate in (False, True):
+                        got = render_bar(progress, width, tick, animate, base)
+                        assert got == reference_bar(progress, width, tick, animate, base), \
+                            (width, progress, tick, base, animate, got.encode())
+    static = render_bar(0.5, 10, 0, False)
+    assert strip_ansi(static).count("█") == 5, "bar half full"
+    before = _static_bar.cache_info().hits
+    assert render_bar(0.5, 10, 999, False) == static
+    assert _static_bar.cache_info().hits == before + 1, "static bar cache"
+    _bar_cells.cache_clear(); _static_bar.cache_clear()
+    for width in range(1, 201):
+        render_bar(.37, width, width, True)
+        render_bar(.37, width, 0, False)
+    assert _bar_cells.cache_info().maxsize == 64 and _bar_cells.cache_info().currsize <= 64
+    assert _static_bar.cache_info().maxsize == 128 and _static_bar.cache_info().currsize <= 128
+
+    # terminal frame suppression/diffing without a TTY
+    class _Out:
+        def __init__(self): self.data, self.flushes = "", 0
+        def write(self, s): self.data += s
+        def flush(self): self.flushes += 1
+
+    old_stdout, fake = sys.stdout, _Out()
+    sys.stdout = fake  # type: ignore[assignment]
+    try:
+        term = Terminal()
+        assert term.write(["one", "two-long"], (80, 24)) is True and fake.flushes == 1
+        fake.data = ""
+        assert term.write(["one", "two-long"], (80, 24)) is False
+        assert fake.data == "" and fake.flushes == 1, "unchanged frame must not flush"
+        assert term.write(["one", "two"], (80, 24)) is True
+        assert fake.flushes == 2 and "\x1b[2;1Htwo\x1b[K" in fake.data, fake.data
+        fake.data = ""
+        assert term.write(["one"], (80, 24)) is True
+        assert fake.flushes == 3 and "\x1b[2J" in fake.data, "line shrink fully clears"
+        fake.data = ""
+        assert term.write([], (80, 24)) is True
+        assert fake.flushes == 4 and "\x1b[2J" in fake.data, "zero-line frame clears"
+        fake.data = ""
+        assert term.write([], (100, 24)) is True
+        assert fake.flushes == 5 and "\x1b[2J" in fake.data, "size change fully clears"
+        term._reset_frame()
+        assert term._lines is None and term._size is None, "enter frame invalidation"
+    finally:
+        sys.stdout = old_stdout
 
     # key parsing
     assert parse_keys(b"\x1b[A") == ["up"]
@@ -1604,7 +1784,7 @@ def selftest() -> None:
     app.on_key("right")
     assert app.cat == "games", app.cat
     app.on_key("c")  # clear -> back to splash landing
-    assert app.search is None and app.results == [] and not app.editing, "c clears to splash"
+    assert app.search is None and app.results == () and not app.editing, "c clears to splash"
     app.on_key("tab")
     assert app.view == "downloads"
     # quit confirmation: q arms it, esc cancels, q+enter quits; ^c is immediate
@@ -1720,26 +1900,37 @@ def selftest() -> None:
     sel_calls = []
 
     class _PickEng:
+        def __init__(self):
+            self.current = [{"index": 1, "path": "/d/S01E01.mkv", "length": 700, "selected": True},
+                            {"index": 2, "path": "/d/S01E02.mkv", "selected": True}]
         def files(self, r):
-            return [{"index": 1, "path": "/d/S01E01.mkv", "length": 700, "selected": True},
-                    {"index": 2, "path": "/d/S01E02.mkv", "length": 700, "selected": True}]
+            return self.current
         def select_files(self, r, idx): sel_calls.append((r, idx)); return True
 
-    appf = App(eng=_PickEng())
+    pick_eng = _PickEng()
+    appf = App(eng=pick_eng)
     appf.view = "downloads"
     appf.downloads = [Download("g", "Pack", "active", 100, 10, 5, 1, None, root="rp")]
     appf.on_key("f")
     assert appf.picker is not None and appf.picker_on == {1, 2}, appf.picker_on
+    assert appf.picker_bytes == 700, appf.picker_bytes
     appf.on_key(" ")  # toggle file 1 off
-    assert appf.picker_on == {2}, appf.picker_on
+    assert appf.picker_on == {2} and appf.picker_bytes == 0, (appf.picker_on, appf.picker_bytes)
     appf.on_key("a")  # all
-    assert appf.picker_on == {1, 2}
+    assert appf.picker_on == {1, 2} and appf.picker_bytes == 700
     appf.on_key("a")  # none
+    assert appf.picker_bytes == 0
     appf.on_key("enter")  # empty selection refused
     assert appf.picker is not None and "at least one" in appf.status
     appf.on_key(" ")
     appf.on_key("enter")
     assert sel_calls == [("rp", [1])] and appf.picker is None, sel_calls
+    pick_eng.current = [{"index": 1, "path": "/d/S02E01.mkv", "length": 900, "selected": False},
+                        {"index": 2, "path": "/d/S02E02.mkv", "length": 1100, "selected": True}]
+    appf.on_key("f")
+    assert [f["path"] for f in appf.picker_files] == ["/d/S02E01.mkv", "/d/S02E02.mkv"]
+    assert appf.picker_on == {2} and appf.picker_bytes == 1100, "reopen refreshes selection bytes"
+    appf.on_key("esc")
     # single-file download: picker refuses to open
     class _OneEng:
         def files(self, r): return [{"index": 1, "path": "/d/f.iso", "length": 1, "selected": True}]
@@ -1752,7 +1943,7 @@ def selftest() -> None:
     appf.on_key("f")
     appf2_frames = render(appf, 100, 30)
     jp = "\n".join(strip_ansi(x) for x in appf2_frames)
-    assert "Files" in jp and "S01E01.mkv" in jp, jp
+    assert "Files" in jp and "S02E01.mkv" in jp, jp
     for ln in appf2_frames:
         assert dwidth(strip_ansi(ln)) <= 100, "picker overflow"
     appf.on_key("esc")
@@ -1830,6 +2021,43 @@ def selftest() -> None:
     ]
     assert [r.name for r in appi.visible_results()] == ["anime1", "tv1", "anime2", "anime3"], \
         [r.name for r in appi.visible_results()]
+    cached = appi.visible_results()
+    assert appi.visible_results() is cached, "visible results identity cache"
+    appi.results = appi.results[:]
+    assert appi.visible_results() is not cached, "results replacement invalidates"
+    cached = appi.visible_results()
+    appi.cat = "anime"
+    assert appi.visible_results() is not cached, "category invalidates"
+    try:
+        appi.visible_results().append(appi.results[0])  # type: ignore[attr-defined]
+        assert False, "cached output must be immutable"
+    except AttributeError:
+        pass
+    try:
+        appi.results.append(appi.results[0])  # type: ignore[attr-defined]
+        assert False, "stored results must be immutable"
+    except AttributeError:
+        pass
+    # Queue updates replace the source once per batch; clear and sort do likewise.
+    class _QueuedSearch:
+        def __init__(self): self.updates = queue.Queue()
+    appc = App(eng=None)
+    appc.search = _QueuedSearch()  # type: ignore[assignment]
+    first = Result("q1" + "x" * 38, "first", 1, 1, 0, "yts", "m")
+    second = Result("q2" + "x" * 38, "second", 2, 9, 0, "yts", "m")
+    appc.results = [first]
+    before_results, before_revision = appc.results, appc._results_revision
+    update = type("Update", (), {"source": "yts", "results": [second], "error": ""})()
+    appc.search.updates.put(update)
+    appc.drain_search()
+    assert appc.results is not before_results and appc._results_revision == before_revision + 1
+    assert {r.name for r in appc.visible_results()} == {"first", "second"}, "append-like update"
+    cached = appc.visible_results()
+    appc._cycle_sort()
+    assert appc.visible_results() is not cached and appc.results[0] is second, "sort replacement"
+    cached = appc.visible_results()
+    appc.results = []
+    assert appc.visible_results() == () and appc.visible_results() is not cached, "clear replacement"
     # clipboard grab (v): a magnet on the clipboard gets grabbed
     gp = globals()
     orig_paste = gp["paste_clipboard"]
@@ -1928,6 +2156,63 @@ def selftest() -> None:
         Download("g5", "Bad.Movie.mkv", "error", 100, 5, 0, 0, None, error="no peers", root="r5"),
     ]
     app2.down_speed, app2.num_active = 5_000_000, 2  # exercise the header readout
+    # animation runs only for an animated row in the exact visible download slice
+    app2.view = "downloads"
+    assert app2.animating(30)
+    app2.help = True
+    assert not app2.animating(30), "help covers downloads"
+    app2.help = False
+    app2.view = "search"
+    assert not app2.animating(30), "hidden downloads"
+    app2.view = "downloads"
+    app2.downloads = [Download(str(i), str(i), "complete", 1, 1, 0, 0, None, root=str(i))
+                      for i in range(12)]
+    app2.downloads[-1].status = "active"
+    app2.dsel = 0
+    assert not app2.animating(24), "offscreen active download"
+    app2.dsel = len(app2.downloads) - 1
+    assert app2.animating(24), "selected active download is visible"
+    app2.confirm_quit = True
+    assert app2.animating(24), "partial prompt leaves the active bar visible"
+    app2.confirm_quit = False
+    app2.dsel = 0
+    app2.downloads[-1].status = "complete"
+    app2.downloads[1].status = "active"  # second bar is on the centered overlay row
+    for prompt in ("confirm_quit", "torrent_prompt", "cancel_prompt"):
+        setattr(app2, prompt, True)
+        assert not app2.animating(24), f"only active bar hidden by {prompt}"
+        setattr(app2, prompt, False if prompt == "confirm_quit" else None)
+    app2.downloads[0].status = "active"  # first bar remains above the overlay
+    app2.confirm_quit = True
+    assert app2.animating(24), "active row outside overlay still animates"
+    app2.confirm_quit = False
+    for covering in ("help", "settings", "picker"):
+        setattr(app2, covering, True)
+        assert not app2.animating(24), f"{covering} fully covers downloads"
+        setattr(app2, covering, False if covering != "picker" else None)
+    assert not app2.animating(1), "minimum terminal has no visible bar"
+    app2.downloads = [
+        Download("g1", "Active.Movie.mkv", "active", 100, 42, 2_500_000, 12, 90.0, root="r1"),
+        Download("g2", "Done.Movie.mkv", "complete", 100, 100, 0, 0, None, root="r2"),
+        Download("g3", "meta", "metadata", 0, 0, 0, 0, None, root="r3"),
+        Download("g4", "Paused.Movie.mkv", "paused", 100, 60, 0, 4, None, root="r4"),
+        Download("g5", "Bad.Movie.mkv", "error", 100, 5, 0, 0, None, error="no peers", root="r5"),
+    ]
+    app2.dsel = 0
+    # Shared viewport rows are the rows the panel actually renders, including
+    # history reservation and the clamped minimum terminal size.
+    app2.dl_history = []
+    positions = _visible_download_rows(app2, 24)
+    assert len(positions) == 4, positions
+    frame24 = render(app2, 100, 24)
+    for idx, bar_row in positions:
+        assert clean(app2.downloads[idx].name) in strip_ansi(frame24[bar_row - 1])
+        assert "█" in strip_ansi(frame24[bar_row]) or "░" in strip_ansi(frame24[bar_row])
+    app2.dl_history = [{"name": "OldSession.iso", "size": 1, "ts": 1}]
+    reserved = _visible_download_rows(app2, 24)
+    assert len(reserved) == 3 and len(reserved) < len(positions), reserved
+    assert _visible_download_rows(app2, 1) == [] and _download_viewport(app2, 1) == (0, 0)
+    app2.dl_history = []
     for cols, rows in [(100, 30), (80, 24), (140, 50)]:
         for view, help_ in [("search", False), ("downloads", False), ("search", True)]:
             app2.view, app2.help = view, help_
@@ -1939,7 +2224,7 @@ def selftest() -> None:
     # spot-check content present
     app2.help, app2.view, app2.query = False, "search", "matrix"
     f = "\n".join(strip_ansi(x) for x in render(app2, 100, 30))
-    assert "results" in f and "quit" in f and "Result 0" in f, "search chrome"
+    assert "results" in f and "quit" in f and "Result 0" in f, f
     app2.view = "downloads"
     f = "\n".join(strip_ansi(x) for x in render(app2, 100, 30))
     assert "Active.Movie.mkv" in f and "fetching metadata" in f, "downloads view"

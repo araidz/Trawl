@@ -1,8 +1,8 @@
 """trawl entry point + run loop.
 
-Single-threaded: poll stdin with a frame-interval timeout, dispatch keys, drain
-the search queue, poll aria2 every 500ms, full-redraw. aria2 does the
-downloading in its own process; daemon search threads die with us on quit.
+Single-threaded: poll stdin, dispatch keys, drain the search queue, and check
+aria2 no more often than every 500ms (about 600ms when idle). Each frame is
+rebuilt; Terminal emits only changed rows, or nothing when unchanged.
 """
 
 from __future__ import annotations
@@ -64,7 +64,8 @@ def main(argv: list[str] | None = None) -> int:
     last_poll = 0.0
     try:
         while app.running:
-            for k in term.read_keys(0.04 if app.animating() else 0.2):
+            cols, rows = term.size()
+            for k in term.read_keys(0.04 if app.animating(rows) else 0.2):
                 app.on_key(k)
             if not app.running:
                 break
@@ -80,7 +81,7 @@ def main(argv: list[str] | None = None) -> int:
                     pass
                 last_poll = now
             cols, rows = term.size()
-            term.write(render(app, cols, rows))
+            term.write(render(app, cols, rows), (cols, rows))
     except KeyboardInterrupt:
         pass
     finally:

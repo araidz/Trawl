@@ -290,7 +290,7 @@ class Aria2:
         out: list[Download] = []
         for root in list(self.roots):
             try:
-                st = self._call("aria2.tellStatus", [self._resolve(root)])
+                st, _ = self._resolved_status(root)
             except Aria2Error:
                 continue
             d = to_download(st)
@@ -329,15 +329,22 @@ class Aria2:
     # -- internals -----------------------------------------------------------
 
     def _resolve(self, root: str) -> str:
+        return self._resolved_status(root, ["status", "followedBy"])[1]
+
+    def _resolved_status(self, root: str, fields: list[str] | None = None) -> tuple[dict, str]:
         gid = self._resolved.get(root, root)
         for _ in range(8):  # ponytail: cap the walk; a magnet is one hop
-            st = self._call("aria2.tellStatus", [gid, ["status", "followedBy"]])
+            params = [gid, fields] if fields else [gid]
+            st = self._call("aria2.tellStatus", params)
             nxt = _follow(st)
             if nxt is None:
                 break
             gid = nxt
+        else:
+            params = [gid, fields] if fields else [gid]
+            st = self._call("aria2.tellStatus", params)
         self._resolved[root] = gid
-        return gid
+        return st, gid
 
     def _call(self, method: str, params: list | None = None):
         payload = {
@@ -389,6 +396,72 @@ def selftest() -> None:
     assert live.progress == 0.5 and live.eta == 5.0 and live.peers == 7, live
     assert _follow({"status": "complete", "followedBy": ["z"]}) == "z"
     assert _follow({"status": "active", "followedBy": ["z"]}) is None
+    # poll reuses the status fetched while resolving: one steady call, root+child on handoff
+    mock = Aria2(conf=None)
+    mock.roots = ["root"]
+    mock._resolved = {"root": "root"}
+    calls = []
+    steady = {"gid": "root", "status": "active", "totalLength": "1",
+              "completedLength": "0", "files": []}
+    mock._call = lambda method, params=None: calls.append((method, params)) or steady  # type: ignore[method-assign]
+    rows = mock.poll()
+    assert len(calls) == 1 and calls[0][0] == "aria2.tellStatus", calls
+    assert rows[0].gid == "root" and rows[0].root == "root"
+    calls.clear()
+    statuses = {
+        "root": {"gid": "root", "status": "complete", "followedBy": ["child"], "files": []},
+        "child": {"gid": "child", "status": "active", "totalLength": "10",
+                  "completedLength": "2", "files": [{"path": "/x/movie"}]},
+    }
+    mock._call = lambda method, params=None: calls.append((method, params)) or statuses[params[0]]  # type: ignore[method-assign,index]
+    rows = mock.poll()
+    assert [c[1][0] for c in calls] == ["root", "child"], calls
+    assert rows[0].gid == "child" and rows[0].root == "root" and mock._resolved["root"] == "child", rows[0]
+    # A vanished/erroring metadata child is skipped, while file APIs follow a
+    # successful metadata handoff before asking for the child file list.
+    missing = Aria2(conf=None)
+    missing.roots = ["root"]
+    missing._resolved = {"root": "root"}
+    def missing_call(method, params=None):
+        if params[0] == "root":
+            return {"gid": "root", "status": "complete", "followedBy": ["gone"]}
+        raise Aria2Error("missing child")
+    missing._call = missing_call  # type: ignore[method-assign]
+    assert missing.poll() == [], "missing metadata child should not escape poll"
+    assert missing._resolved["root"] == "root", "failed child must preserve last valid gid"
+
+    broken_root = Aria2(conf=None)
+    broken_root.roots = ["root"]
+    broken_root._resolved = {"root": "root"}
+    broken_root._call = lambda *a, **k: (_ for _ in ()).throw(Aria2Error("gone"))  # type: ignore[method-assign]
+    assert broken_root.poll() == [] and broken_root._resolved["root"] == "root"
+
+    failed = Aria2(conf=None)
+    failed.roots = ["root"]
+    failed._resolved = {"root": "root"}
+    failed._call = lambda method, params=None: {  # type: ignore[method-assign]
+        "gid": "child", "status": "error", "errorMessage": "disk full", "files": []
+    } if params[0] == "child" else {
+        "gid": "root", "status": "complete", "followedBy": ["child"]
+    }
+    failed_row = failed.poll()[0]
+    assert failed_row.gid == "child" and failed_row.root == "root"
+    assert failed_row.status == "error" and failed_row.error == "disk full"
+
+    handed = Aria2(conf=None)
+    handed._resolved = {"root": "root"}
+    hand_calls = []
+    child_files = [{"index": "1", "path": "/x/movie.mkv", "length": "12", "selected": "true"}]
+    def hand_call(method, params=None):
+        hand_calls.append(params)
+        if params[0] == "root":
+            return {"gid": "root", "status": "complete", "followedBy": ["child"]}
+        return {"gid": "child", "status": "active", "files": child_files}
+    handed._call = hand_call  # type: ignore[method-assign]
+    assert handed.files("root") == [{"index": 1, "path": "/x/movie.mkv", "length": 12,
+                                      "selected": True}]
+    assert handed._resolved["root"] == "child" and hand_calls[-1][0] == "child", hand_calls
+    assert handed.file_paths("root") == ["/x/movie.mkv"] and hand_calls[-1][0] == "child"
     # *.aria2 control-file infohash parse (synthetic, documented big-endian format)
     import tempfile as _tf
     ih = "dd8255ecdc7ca55fb0bbf81323d87062db1f6d1c"

@@ -17,7 +17,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import FrozenInstanceError, dataclass
 from datetime import datetime
 from email.utils import parsedate_to_datetime
 from typing import Callable
@@ -75,7 +75,7 @@ class SourceError(Exception):
     pass
 
 
-@dataclass
+@dataclass(frozen=True)
 class Result:
     info_hash: str
     name: str
@@ -836,6 +836,11 @@ def selftest() -> None:
         Result(h40, "hi", 1, 50, 0, "b", "m"),
     ])
     assert len(merged) == 1 and merged[0].seeders == 50, "dedupe keeps higher seeders"
+    try:
+        merged[0].seeders = 0
+        assert False, "results must be immutable"
+    except FrozenInstanceError:
+        pass
     # browse flag: only search-only sources are excluded from empty-query Latest
     assert {s.id for s in SOURCES if not s.browse} == \
         {"libgen", "annas", "knaben", "torrentgalaxy", "torrents-csv"}, \
