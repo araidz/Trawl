@@ -23,15 +23,19 @@ import threading
 import time
 import tty
 import unicodedata
+import urllib.parse
+import uuid
 from collections.abc import Iterable, Sequence
 from functools import cache, lru_cache
 
 from . import theme as T
 from .aria2 import STATE_DIR, Aria2Error, Download, control_infohash
-from .sources import (SOURCES, Result, Search, build_magnet, dedupe, parse_source)
+from .sources import (SOURCES, LocalQuery, Result, ResultVariant, Search, TorznabFeed,
+                      build_magnet, dedupe, make_torznab_source, matches_query,
+                      parse_query, parse_source, redact, redact_url, result_identity, torznab_label,
+                      validate_torznab_url)
 from .meta import Meta, kind_for, lookup
 
-GROUP_OF = {s.id: s.group for s in SOURCES}
 CATS = [("all", "All"), ("games", "Games"), ("movies", "Movies"),
         ("tv", "TV"), ("anime", "Anime"), ("books", "Books")]
 CAT_GROUP = {"games": "Games", "movies": "Movies", "tv": "TV", "anime": "Anime",
@@ -493,7 +497,31 @@ class App:
         self.picker_on: set[int] = set()  # selected 1-based file indices
         self.picker_bytes = 0
         self.detail: Result | None = None  # search result shown in the details view
+        self.variant_idx = 0
         cfg = load_config()
+        self.config = cfg if isinstance(cfg, dict) else {}
+        cfg = self.config
+        self.torznab_feeds: list[dict[str, str]] = []
+        seen = {s.id for s in SOURCES}
+        records = self.config.get("torznab_feeds", [])
+        if isinstance(records, list):
+            for rec in records:
+                if not isinstance(rec, dict):
+                    continue
+                sid, url, key = rec.get("id"), rec.get("url"), rec.get("api_key", "")
+                if not all(isinstance(x, str) for x in (sid, url, key)) or not sid or sid in seen:
+                    continue
+                try:
+                    validate_torznab_url(url)
+                except Exception:
+                    continue
+                seen.add(sid)
+                self.torznab_feeds.append({"id": sid, "url": url, "api_key": key})
+        self.sources = []
+        self.source_labels: dict[str, str] = {}
+        self.source_groups: dict[str, str] = {}
+        self.source_secrets: dict[str, tuple[str, ...]] = {}
+        self._rebuild_sources()
         self.disabled_sources: set[str] = set(cfg.get("disabled_sources", []))
         self.download_dir: str | None = cfg.get("download_dir")
         self.dl_history: list[dict] = load_dl_history()  # completed downloads, oldest->newest
@@ -501,6 +529,8 @@ class App:
         self.set_sel = 0  # 0 dir, 1 provider, 2 key, 3.. sources
         self.edit_field: str | None = None  # settings text-edit: "dir" | "key"
         self.edit_buf = ""
+        self.remove_feed: str | None = None
+        self.local_query = LocalQuery("")
         self.start = time.monotonic()
         self.meta_provider = cfg.get("meta_provider", "tmdb")  # tmdb | omdb
         self.tmdb_key = cfg.get("tmdb_key") or os.environ.get("TMDB_API_KEY")
@@ -525,7 +555,7 @@ class App:
             return self._visible_cache
         if self.cat != "all":
             g = CAT_GROUP[self.cat]
-            out = tuple(r for r in self.results if (r.group or GROUP_OF.get(r.source)) == g)
+            out = tuple(r for r in self.results if self.result_group(r) == g)
             self._visible_revision, self._visible_cat, self._visible_cache = self._results_revision, self.cat, out
             return out
         # All: round-robin across categories so one prolific group (e.g. anime)
@@ -533,7 +563,7 @@ class App:
         # so the group holding the overall-top result still leads.
         buckets: dict[str, list[Result]] = {}
         for r in self.results:
-            buckets.setdefault(r.group or GROUP_OF.get(r.source) or "Other", []).append(r)
+            buckets.setdefault(self.result_group(r) or "Other", []).append(r)
         cols = list(buckets.values())
         ordered: list[Result] = []
         for i in range(max((len(c) for c in cols), default=0)):
@@ -548,7 +578,50 @@ class App:
         return rs[self.sel] if 0 <= self.sel < len(rs) else None
 
     def _meta_kind(self, r: Result) -> str | None:
-        return kind_for(r.group or GROUP_OF.get(r.source))
+        return kind_for(self.result_group(r))
+
+    def _rebuild_sources(self) -> None:
+        configured = []
+        for rec in self.torznab_feeds:
+            try:
+                configured.append(make_torznab_source(TorznabFeed(**rec)))
+            except Exception:
+                pass
+        self.sources = [*SOURCES, *configured]
+        for source in self.sources:
+            self.source_labels[source.id] = source.label
+            self.source_groups[source.id] = source.group
+            self.source_secrets[source.id] = tuple(dict.fromkeys(
+                (*self.source_secrets.get(source.id, ()), *source.secrets)))
+
+    def source_label(self, source_id: str) -> str:
+        return self.source_labels.get(source_id, source_id)
+
+    def source_secrets_for(self, source_id: str) -> tuple[str, ...]:
+        return self.source_secrets.get(source_id, ())
+
+    def _all_secrets(self) -> tuple[str, ...]:
+        return tuple(dict.fromkeys(secret for secrets in self.source_secrets.values()
+                                   for secret in secrets if secret))
+
+    def result_group(self, result: Result) -> str | None:
+        return result.group or self.source_groups.get(result.source)
+
+    def source_tag(self, source_id: str) -> tuple[str, str]:
+        if source_id in {s.id for s in SOURCES}:
+            return T.source_style(source_id)
+        return dtrunc(self.source_label(source_id), 5), T.ALT
+
+    def _variants(self, result: Result | None = None) -> tuple[ResultVariant, ...]:
+        result = result or self.detail
+        if not result:
+            return ()
+        return result.variants or (ResultVariant(result.source, result.magnet, result.page,
+                                                  result.seeders, result.leechers),)
+
+    def _variant(self) -> ResultVariant | None:
+        variants = self._variants()
+        return variants[self.variant_idx % len(variants)] if variants else None
 
     def _provider_key(self) -> str | None:
         return self.omdb_key if self.meta_provider == "omdb" else self.tmdb_key
@@ -592,7 +665,7 @@ class App:
                    for idx, bar_row in _visible_download_rows(self, rows))
 
     def enabled_sources(self) -> list:
-        return [s for s in SOURCES if s.id not in self.disabled_sources]
+        return [s for s in self.sources if s.id not in self.disabled_sources]
 
     @property
     def tick(self) -> float:
@@ -608,17 +681,20 @@ class App:
             self.cursor = 0
             self.editing = False
             return
+        self.local_query = parse_query(q)
         srcs = self.enabled_sources()
-        if not q:  # Latest: only sources that browse without a query
+        if not self.local_query.remote.strip():  # Latest/operator-only: browse-capable built-ins
             srcs = [s for s in srcs if s.browse]
-        self.search = Search(q, srcs)
-        self.search_total = len(srcs)
+        self.search = Search(self.local_query.remote, srcs)
+        self.search_total = getattr(self.search, "total", len(srcs))
         self.results, self.errors, self.search_done, self.sel = [], {}, 0, 0
         self.editing = False
         self.detail = None
         if q:
             self._add_history(q)
         self.status = f'searching "{clean(q)}"' if q else "loading latest"
+        if self.local_query.malformed:
+            self.status = f"searching; ignored {len(self.local_query.malformed)} malformed filter(s)"
 
     def _add_history(self, q: str) -> None:
         if q in self.history:
@@ -646,17 +722,19 @@ class App:
         self.cursor = 0
         self.editing = False
         self.detail = None
+        self.variant_idx = 0
         self.status = ""
 
     def grab(self, magnet: str, name: str) -> None:
+        secrets = self._all_secrets()
         if not self.eng:
-            self.status = f"(no engine) {clean(name)[:48]}"
+            self.status = redact(f"(no engine) {clean(name)[:48]}", secrets)
             return
         try:
             self.eng.add(magnet)
-            self.status = f"grabbing: {clean(name)[:48]}"
+            self.status = redact(f"grabbing: {clean(name)[:48]}", secrets)
         except Aria2Error as e:
-            self.status = f"error: {e}"
+            self.status = redact(f"error: {e}", secrets)
 
     def _grab_source(self, pm) -> None:
         """Grab a parsed input; a .torrent link first asks file-vs-contents."""
@@ -668,16 +746,17 @@ class App:
     def grab_torrent(self, url: str, name: str, contents: bool) -> None:
         """A .torrent link: follow-torrent=mem grabs its contents; =false saves
         just the .torrent file. aria2 handles both natively."""
+        secrets = self._all_secrets()
         if not self.eng:
-            self.status = f"(no engine) {clean(name)[:48]}"
+            self.status = redact(f"(no engine) {clean(name)[:48]}", secrets)
             return
         try:
             self.eng.add(url, {"follow-torrent": "mem" if contents else "false"})
-            self.status = (f"grabbing torrent: {clean(name)[:40]}" if contents
-                           else f"downloading .torrent file: {clean(name)[:40]}")
+            self.status = redact(f"grabbing torrent: {clean(name)[:40]}" if contents
+                                 else f"downloading .torrent file: {clean(name)[:40]}", secrets)
             self.view = "downloads"
         except Aria2Error as e:
-            self.status = f"error: {e}"
+            self.status = redact(f"error: {e}", secrets)
 
     def _cancel(self, d: Download, delete_files: bool) -> None:
         """Remove a download from aria2; optionally delete its files off disk."""
@@ -714,43 +793,92 @@ class App:
         return n
 
     def _save_settings(self) -> None:
-        save_config({"disabled_sources": sorted(self.disabled_sources),
-                     "download_dir": self.download_dir, "meta_provider": self.meta_provider,
-                     "tmdb_key": self.tmdb_key, "omdb_key": self.omdb_key})
+        self.config.update({"disabled_sources": sorted(self.disabled_sources),
+                            "download_dir": self.download_dir, "meta_provider": self.meta_provider,
+                            "tmdb_key": self.tmdb_key, "omdb_key": self.omdb_key,
+                            "torznab_feeds": [dict(feed) for feed in self.torznab_feeds]})
+        save_config(self.config)
+
+    def setting_items(self) -> list[tuple[str, object]]:
+        return ([('dir', None), ('provider', None), ('meta-key', None)]
+                + [('source', s) for s in SOURCES]
+                + [('feed', feed) for feed in self.torznab_feeds]
+                + [('add-feed', None)])
+
+    def _start_feed_edit(self, feed: dict[str, str] | None = None) -> None:
+        self.edit_field = "feed-url"
+        self.edit_buf = feed["url"] if feed else ""
+        self.remove_feed = None
+
+    def _selected_setting(self) -> tuple[str, object]:
+        items = self.setting_items()
+        self.set_sel = min(self.set_sel, len(items) - 1)
+        return items[self.set_sel]
 
     def _settings_key(self, k: str) -> None:
-        rows = 3 + len(SOURCES)  # 0 dir, 1 provider, 2 key, 3.. sources
+        rows = len(self.setting_items())
         if self.edit_field:
             if k == "enter":
                 self._commit_edit()
             elif k == "esc":
                 self.edit_field = None
+                self.status = ""
             elif k == "backspace":
                 self.edit_buf = self.edit_buf[:-1]
             elif len(k) == 1 and k >= " ":
                 self.edit_buf += k
             return
         if k in ("g", "esc", "q"):
-            self.settings = False
-        elif k in ("up", "k"):
+            if self.remove_feed:
+                self.remove_feed = None
+                self.status = ""
+            else:
+                self.settings = False
+        elif k == "up" or (k == "k" and self._selected_setting()[0] != "feed"):
             self.set_sel = (self.set_sel - 1) % rows
         elif k in ("down", "j"):
             self.set_sel = (self.set_sel + 1) % rows
-        elif k in ("enter", " "):
-            if self.set_sel == 0:
+        else:
+            kind, value = self._selected_setting()
+            if k == "a" or (k == "enter" and kind == "add-feed"):
+                self._start_feed_edit()
+            elif k in ("enter", "e") and kind == "feed":
+                if self.remove_feed == value["id"]:
+                    self._remove_selected_feed(value)
+                else:
+                    self._start_feed_edit(value)
+            elif k == "k" and kind == "feed":
+                self.edit_field, self.edit_buf = "feed-key", value["api_key"]
+                self.remove_feed = None
+            elif k == "x" and kind == "feed":
+                if self.remove_feed == value["id"]:
+                    self._remove_selected_feed(value)
+                else:
+                    self.remove_feed = value["id"]
+                    self.status = f"press x or Enter to remove {torznab_label(value['url'])}"
+            elif k in ("enter", " ") and kind == "dir":
                 self.edit_field = "dir"
                 self.edit_buf = self.download_dir or (self.eng.download_dir() if self.eng else "") or ""
-            elif self.set_sel == 1:
+            elif k in ("enter", " ") and kind == "provider":
                 self.meta_provider = "omdb" if self.meta_provider == "tmdb" else "tmdb"
                 self.meta.clear()  # cached results are provider-specific
                 self._save_settings()
-            elif self.set_sel == 2:
+            elif k in ("enter", " ") and kind == "meta-key":
                 self.edit_field = "key"
                 self.edit_buf = self._provider_key() or ""
-            else:
-                sid = SOURCES[self.set_sel - 3].id
+            elif k in ("enter", " ") and kind in ("source", "feed"):
+                sid = value.id if kind == "source" else value["id"]
                 self.disabled_sources.symmetric_difference_update({sid})
                 self._save_settings()
+
+    def _remove_selected_feed(self, feed: dict[str, str]) -> None:
+        self.torznab_feeds.remove(feed)
+        self.disabled_sources.discard(feed["id"])
+        self.remove_feed = None
+        self._rebuild_sources()
+        self._save_settings()
+        self.set_sel = min(self.set_sel, len(self.setting_items()) - 1)
+        self.status = "feed removed"
 
     def _commit_edit(self) -> None:
         if self.edit_field == "dir":
@@ -760,7 +888,26 @@ class App:
         elif self.edit_field == "key":
             self._set_provider_key(self.edit_buf.strip() or None)
             self.meta.clear()  # re-fetch with the new key
+        elif self.edit_field in ("feed-url", "feed-key"):
+            kind, value = self._selected_setting()
+            if self.edit_field == "feed-key" and kind == "feed":
+                value["api_key"] = self.edit_buf
+            else:
+                raw = self.edit_buf.strip()
+                try:
+                    validate_torznab_url(raw)
+                except Exception:
+                    self.status = "invalid Torznab URL"
+                    return
+                if kind == "feed":
+                    value["url"] = raw
+                else:
+                    sid = "torznab-" + uuid.uuid4().hex[:12]
+                    self.torznab_feeds.append({"id": sid, "url": raw, "api_key": ""})
+                    self.set_sel = len(self.setting_items()) - 2
+            self._rebuild_sources()
         self.edit_field = None
+        self.status = ""
         self._save_settings()
 
     def _open_picker(self, d: Download) -> None:
@@ -813,6 +960,10 @@ class App:
         if not self.search:
             return
         changed = False
+        selected = self._cur()
+        selected_id = ((result_identity(selected) or (selected.name, selected.magnet))
+                       if selected else None)
+        source_map = getattr(self.search, "sources", None) or {s.id: s for s in self.sources}
         incoming: list[Result] = []
         while True:
             try:
@@ -824,10 +975,26 @@ class App:
             if u.results is None:
                 self.errors[u.source] = u.error
             else:
-                incoming.extend(u.results)
+                self.errors.pop(u.source, None)
+                incoming.extend(r for r in u.results
+                                if matches_query(r, self.local_query,
+                                                 source_map))
         if changed:
             self.results = self._apply_sort(dedupe([*self.results, *incoming]))
-            self.sel = min(self.sel, max(0, len(self.visible_results()) - 1))
+            visible = self.visible_results()
+            restored = next((i for i, r in enumerate(visible)
+                             if (result_identity(r) or (r.name, r.magnet)) == selected_id), None)
+            self.sel = (restored if restored is not None
+                        else min(self.sel, max(0, len(visible) - 1)))
+
+    def retry_failed_sources(self) -> None:
+        if not self.search or not self.errors:
+            self.status = "no failed sources to retry"
+            return
+        scheduled = self.search.retry(tuple(self.errors))
+        self.search_total = self.search.total
+        self.status = (f"retrying {len(scheduled)} failed source(s)" if scheduled
+                       else "failed sources already retrying")
 
     def _apply_sort(self, results: Sequence[Result]) -> list[Result]:
         if self.sort == "size":
@@ -916,17 +1083,23 @@ class App:
         if self.detail is not None:
             if k in ("esc", "enter", "q"):
                 self.detail = None
+                self.variant_idx = 0
+            elif k in ("left", "right"):
+                variants = self._variants()
+                if len(variants) > 1:
+                    self.variant_idx = (self.variant_idx + (-1 if k == "left" else 1)) % len(variants)
             elif k == "d":
-                self.grab(self.detail.magnet, self.detail.name)
+                self.grab(self._variant().uri, self.detail.name)
                 self.detail = None
+                self.variant_idx = 0
             elif k == "o":
-                page = self.detail.page
+                page = self._variant().page
                 self.status = ("opened in browser" if page and open_url(page)
                                else "no page for this source" if not page
                                else "couldn't open browser")
             elif k == "y":
                 self.status = ("magnet copied to clipboard"
-                               if copy_clipboard(self.detail.magnet) else "copy failed")
+                               if copy_clipboard(self._variant().uri) else "copy failed")
             elif k == "p":
                 m = self._detail_meta()
                 poster = m.poster if isinstance(m, Meta) else ""
@@ -986,6 +1159,7 @@ class App:
         elif k == "tab":
             self.view = "downloads" if self.view == "search" else "search"
             self.detail = None
+            self.variant_idx = 0
         elif k == "s":
             n = self.scan_resume()
             self.status = (f"resumed {n} download{'' if n == 1 else 's'}" if n
@@ -1013,12 +1187,15 @@ class App:
                 self.clear()
             elif k == "S":
                 self._cycle_sort()
+            elif k == "r":
+                self.retry_failed_sources()
             elif k == "d":
                 if (r := self._cur()):
                     self.grab(r.magnet, r.name)
             elif k == "enter":
                 if (r := self._cur()):
                     self.detail = r
+                    self.variant_idx = 0
                     self._ensure_meta(r)
             elif k == "y":
                 if (r := self._cur()):
@@ -1096,19 +1273,23 @@ def _detail_panel(app: App, r: Result, width: int, height: int) -> list[str]:
     def field(label: str, value: str, color: str | None = None) -> str:
         return "  " + cell(label, 7, dim=True) + cell(value, inner_w - 9, color=color)
 
-    tag, _ = T.source_style(r.source)
-    health = (f"{r.seeders} seeders · {r.leechers} leechers"
-              if (r.seeders or r.leechers) else "unknown")
-    inner.append(field("Source", tag))
+    variants = app._variants(r)
+    variant = variants[app.variant_idx % len(variants)]
+    health = (f"{variant.seeders} seeders · {variant.leechers} leechers"
+              if (variant.seeders or variant.leechers) else "unknown")
+    if len(variants) > 1:
+        inner.append(field("Variant", f"{app.variant_idx + 1}/{len(variants)}"))
+    inner.append(field("Source", app.source_label(variant.source)))
     inner.append(field("Size", fmt_bytes(r.size)))
-    inner.append(field("Health", health, T.GOOD if r.seeders else None))
+    inner.append(field("Health", health, T.GOOD if variant.seeders else None))
     if r.added:
         inner.append(field("Added", fmt_rel(r.added)))
     if r.num_files:
         inner.append(field("Files", str(r.num_files)))
     inner.append(field("Hash", r.info_hash))
-    if r.page:
-        inner.append(field("Page", r.page))
+    if variant.page:
+        inner.append(field("Page", redact_url(variant.page,
+                                               app.source_secrets_for(variant.source))))
     kind = app._meta_kind(r)
     if kind and app._provider_key():
         m = app._detail_meta()
@@ -1271,7 +1452,7 @@ def _results_panel(app: App, width: int, height: int) -> list[str]:
         for idx in range(start, min(start + list_h, len(results))):
             r = results[idx]
             here = idx == app.sel
-            tag, tcolor = T.source_style(r.source)
+            tag, tcolor = app.source_tag(r.source)
             sl = f"{r.seeders}:{r.leechers}" if (r.seeders or r.leechers) else "-"
             if here:  # selected row: the whole line lights up in accent
                 inner.append(
@@ -1350,7 +1531,7 @@ def _downloads_panel(app: App, width: int, height: int) -> list[str]:
             pct = int(d.progress * 100)
             if d.status == "error":
                 icon, ic, base = T.ERR, T.BAD, T.BAD
-                stats = dtrunc(d.error or "failed", 28)
+                stats = dtrunc(redact(d.error or "failed", app._all_secrets()), 28)
             elif d.status == "complete":
                 icon, ic, base = T.DONE, T.GOOD, T.GOOD
                 stats = "done"
@@ -1387,34 +1568,42 @@ def _downloads_panel(app: App, width: int, height: int) -> list[str]:
 
 def _settings_panel(app: App, width: int, height: int) -> list[str]:
     inner_w = width - 4
-    editing = app.edit_field
-
-    def row(idx: int, val: str, active: bool) -> str:
-        return (cell(T.PTR if app.set_sel == idx else "", 2, color=T.ACCENT)
-                + cell(val, inner_w - 2, color=T.TEXT if active else None, dim=not active))
-
-    dir_ed = editing == "dir"
-    dir_val = (app.edit_buf + "▌") if dir_ed else (app.download_dir or "(from aria2.conf)")
-    key = app._provider_key()
-    key_ed = editing == "key"
-    key_val = (app.edit_buf + "▌") if key_ed else ("•" * min(len(key), 12) if key else "(not set)")
-    inner = [
-        cell("Download dir", inner_w, color=T.ALT, bold=True),
-        row(0, dir_val, bool(app.download_dir or dir_ed)),
-        cell("", inner_w),
-        cell("Metadata  (enter / space)", inner_w, color=T.ALT, bold=True),
-        row(1, f"provider: {app.meta_provider.upper()}", True),
-        row(2, f"{app.meta_provider.upper()} key: {key_val}", bool(key or key_ed)),
-        cell("", inner_w),
-        cell("Sources  (enter / space toggles)", inner_w, color=T.ALT, bold=True),
-    ]
-    for i, s in enumerate(SOURCES):
-        sel = app.set_sel == i + 3
-        on = s.id not in app.disabled_sources
-        inner.append(cell(T.PTR if sel else "", 2, color=T.ACCENT)
-                     + cell("[x]" if on else "[ ]", 4, color=T.GOOD if on else T.RULE)
-                     + cell(f"{s.label}  ·  {s.group}", inner_w - 6,
-                            color=T.ACCENT if sel else None, bold=sel, dim=not sel and not on))
+    items = app.setting_items()
+    body_h = max(1, height - 2)
+    start = _window(app.set_sel, len(items), body_h)
+    inner = []
+    for idx in range(start, min(start + body_h, len(items))):
+        kind, value = items[idx]
+        selected = idx == app.set_sel
+        prefix = cell(T.PTR if selected else "", 2, color=T.ACCENT)
+        if kind == "dir":
+            shown = app.edit_buf + "▌" if app.edit_field == "dir" else app.download_dir or "(from aria2.conf)"
+            text, on = f"Download dir: {shown}", bool(app.download_dir or app.edit_field == "dir")
+        elif kind == "provider":
+            text, on = f"Metadata provider: {app.meta_provider.upper()}", True
+        elif kind == "meta-key":
+            key = app.edit_buf if app.edit_field == "key" else app._provider_key() or ""
+            shown = "•" * min(len(key), 12) + ("▌" if app.edit_field == "key" else "")
+            text, on = f"{app.meta_provider.upper()} key: {shown or '(not set)'}", bool(key)
+        elif kind == "source":
+            on = value.id not in app.disabled_sources
+            text = f"Sources · [{'x' if on else ' '}] {value.label}  ·  {value.group}"
+        elif kind == "feed":
+            on = value["id"] not in app.disabled_sources
+            if selected and app.edit_field == "feed-url":
+                shown = redact_url(app.edit_buf, app._all_secrets()) + "▌"
+            elif selected and app.edit_field == "feed-key":
+                shown = "key: " + "•" * min(len(app.edit_buf), 12) + "▌"
+            else:
+                shown = torznab_label(value["url"])
+            armed = "  [remove?]" if app.remove_feed == value["id"] else ""
+            text = f"[{'x' if on else ' '}] {shown}{armed}"
+        else:
+            shown = (redact_url(app.edit_buf, app._all_secrets()) + "▌"
+                     if selected and app.edit_field == "feed-url" else "")
+            text, on = (shown or "+ Add Torznab feed"), True
+        inner.append(prefix + cell(text, inner_w - 2, color=T.ACCENT if selected else None,
+                                   bold=selected, dim=not selected and not on))
     return _wrap_panel("Settings", inner, width, height, True)
 
 
@@ -1444,10 +1633,18 @@ def _help_panel(width: int, height: int) -> list[str]:
     inner_w = width - 4
     groups = [
         ("Search", [("type", "search (paste a magnet or link to grab)"), ("enter", "details"),
-                    ("d", "download"), ("o", "open page in browser"), ("y", "copy magnet"),
-                    ("/  i", "edit query"), ("↑ ↓", "recall past searches"),
-                    ("S", "cycle sort (seeders/size/newest)"), ("c", "clear results"),
-                    ("← →", "filter category"), ("v", "grab magnet/link from clipboard")]),
+                     ("d", "download"), ("o", "open page in browser"), ("y", "copy magnet"),
+                     ("/  i", "edit query"), ("↑ ↓", "recall past searches"),
+                     ("r", "retry failed sources"),
+                     ("filters", "seeders: size: age: files: source: group:"),
+                     ("examples", 'matrix -cam size:>1GiB group:movies'),
+                     ("S", "cycle sort (seeders/size/newest)"), ("c", "clear results"),
+                     ("← →", "filter category"), ("v", "grab magnet/link from clipboard")]),
+        ("Details", [("← →", "cycle duplicate source variants"),
+                     ("d / y / o", "use selected variant")]),
+        ("Settings", [("a", "add Torznab feed"), ("enter / e", "edit endpoint"),
+                      ("k", "edit separate key"), ("space", "toggle source"),
+                      ("x x", "arm / confirm feed removal")]),
         ("Navigate", [("↑ ↓  j k", "move selection / scroll wheel"),
                       ("tab", "switch search / downloads")]),
         ("Downloads", [("p", "pause / resume"), ("x", "cancel (ask: delete or keep files)"),
@@ -1474,24 +1671,25 @@ def _footer(app: App, width: int) -> str:
         hints = [("any key", "close")]
     elif app.settings:
         hints = ([("type", "value"), ("enter", "save"), ("esc", "cancel")] if app.edit_field
-                 else [("↑↓", "move"), ("enter/space", "toggle/edit"), ("g/esc", "close")])
+                 else [("↑↓", "move"), ("a", "add"), ("e", "endpoint"), ("k", "key"),
+                       ("space", "toggle"), ("x", "remove"), ("g/esc", "close")])
     elif app.picker is not None:
         hints = [("↑↓", "move"), ("space", "toggle"), ("a", "all/none"),
                  ("enter", "apply"), ("esc", "cancel")]
     elif app.detail is not None:
-        hints = [("d", "download"), ("o", "page"), ("y", "copy magnet"), ("p", "poster"), ("esc", "back"), ("q", "back")]
+        hints = [("←→", "variant"), ("d", "download"), ("o", "page"), ("y", "copy"), ("p", "poster"), ("esc/q", "back")]
     elif app.view == "search" and app.editing:
         hints = [("enter", "search"), ("↑↓", "history"), ("esc", "nav"), ("tab", "downloads"), ("^c", "quit")]
     elif app.view == "search":
         hints = [("↑↓", "move"), ("enter", "details"), ("d", "grab"), ("o", "page"), ("y", "copy"),
-                 ("S", "sort"), ("←→", "category"), ("v", "paste"), ("g", "settings"), ("q", "quit")]
+                 ("r", "retry"), ("S", "sort"), ("←→", "category"), ("v", "paste"), ("g", "settings"), ("q", "quit")]
     else:
         hints = [("↑↓", "move"), ("p", "pause/resume"), ("x", "cancel"), ("r", "retry"),
                  ("f", "files"), ("o", "reveal"), ("s", "resume"), ("g", "settings"),
                  ("tab", "search"), ("q", "quit")]
     out, used = "", 0
     if app.status:
-        st = dtrunc(clean(app.status), max(10, width // 2))
+        st = dtrunc(redact(clean(app.status), app._all_secrets()), max(10, width // 2))
         out = style(st, T.ALT) + "   "
         used = dwidth(st) + 3
     sep = "  " + T.DOT + "  "
@@ -1547,7 +1745,7 @@ def _splash(app: App, cols: int, rows: int) -> list[str]:
         plain += dwidth(k) + 1 + dwidth(v)
     block += ["", _center("".join(parts), plain, cols)]
     if app.status:
-        st = dtrunc(clean(app.status), cols - 4)
+        st = dtrunc(redact(clean(app.status), app._all_secrets()), cols - 4)
         block += ["", _center(style(st, T.ALT), dwidth(st), cols)]
     top = max(0, (rows - len(block)) // 2)
     return ([""] * top + block + [""] * rows)[:rows]
@@ -1609,11 +1807,33 @@ def _main_heights(rows: int) -> tuple[int, int]:
     return body_h, body_h - 4
 
 
+def _redact_frame(lines: list[str], app: App) -> list[str]:
+    candidates = {form for secret in app._all_secrets() for form in
+                  (secret, urllib.parse.quote(secret, safe=""), urllib.parse.quote_plus(secret))
+                  if form}
+    if not candidates:
+        return lines
+    secrets = re.compile("|".join(map(re.escape, sorted(candidates, key=len, reverse=True))), re.I)
+
+    def redact_plain(text: str) -> str:
+        return secrets.sub(lambda m: "*" * (dwidth(m.group()) or 3), text)
+
+    def redact_line(line: str) -> str:
+        out, end = [], 0
+        for ansi in _ANSI.finditer(line):
+            out.extend((redact_plain(line[end:ansi.start()]), ansi.group()))
+            end = ansi.end()
+        out.append(redact_plain(line[end:]))
+        return "".join(out)
+
+    return [redact_line(line) for line in lines]
+
+
 def render(app: App, cols: int, rows: int) -> list[str]:
     cols = max(40, cols)
     rows = max(12, rows)
     if app.view == "search" and app.search is None and not app.help and not app.settings:
-        return _overlay(_splash(app, cols, rows), app, cols, rows)
+        return _redact_frame(_overlay(_splash(app, cols, rows), app, cols, rows), app)
     lines: list[str] = []
     for L in _logo_lines():
         lines.append(" " * MARGIN + L)
@@ -1655,7 +1875,7 @@ def render(app: App, cols: int, rows: int) -> list[str]:
     lines.append("")
     lines.append(" " * MARGIN + _footer(app, cols - MARGIN))
     lines = (lines + [""] * rows)[:rows]
-    return _overlay(lines, app, cols, rows)
+    return _redact_frame(_overlay(lines, app, cols, rows), app)
 
 
 # -- self-check --------------------------------------------------------------
@@ -2139,6 +2359,244 @@ def selftest() -> None:
     appg.on_key("g")
     assert not appg.settings, "g closes settings"
     gc["load_config"], gc["save_config"] = o_load_cfg, o_save_cfg
+
+    # v0.3 integration: config migration, dynamic feeds/settings, local filtering,
+    # retries, variants, and secret-safe full frames. Everything here is offline.
+    gv = globals()
+    originals = {k: gv[k] for k in ("load_config", "load_history", "load_dl_history",
+                                     "save_config", "save_history", "open_url",
+                                     "copy_clipboard")}
+    saved_v3: dict = {}
+    sentinel = "SECRETSENTINEL"
+    feed = {"id": "torznab-test", "url": f"https://indexer.invalid/api?foo={sentinel}&apikey=url-key",
+            "api_key": sentinel}
+    bad_records = [None, {}, {"id": SOURCES[0].id, "url": "https://duplicate.invalid/api"},
+                   {"id": "duplicate", "url": "https://one.invalid/api"},
+                   {"id": "duplicate", "url": "https://two.invalid/api"},
+                   {"id": "invalid", "url": "file:///tmp/feed"}, feed]
+    gv["load_history"] = lambda: []
+    gv["load_dl_history"] = lambda: []
+    gv["save_history"] = lambda h: None
+    gv["save_config"] = lambda c: (saved_v3.clear(), saved_v3.update(c))
+    builtins_before = tuple(SOURCES)
+    try:
+        gv["load_config"] = lambda: {"unknown": {"keep": True}, "torznab_feeds": bad_records}
+        av = App()
+        assert [f["id"] for f in av.torznab_feeds] == ["duplicate", feed["id"]], \
+            "invalid feed records were not ignored"
+        av._save_settings()
+        assert saved_v3["unknown"] == {"keep": True} and saved_v3["torznab_feeds"] == av.torznab_feeds, \
+            "config persistence did not preserve exact feed and unknown values"
+        assert tuple(SOURCES) == builtins_before, "dynamic feeds mutated global sources"
+        retained_label = av.source_label(feed["id"])
+        assert retained_label != feed["id"] and av.result_group(
+            Result("", "x", 0, 0, 0, feed["id"], "m")) == "Other", "dynamic source maps"
+        assert av.source_secrets_for(feed["id"]) == (sentinel, "url-key"), "source secret extraction"
+        av.disabled_sources.add(feed["id"])
+        assert feed["id"] not in {s.id for s in av.enabled_sources()}, "enabled dynamic sources"
+        av.results = [Result("f" * 40, "kept", 1, 1, 0, feed["id"], "magnet:?xt=kept")]
+        dynamic = av.torznab_feeds[-1]
+        av._remove_selected_feed(dynamic)
+        assert av.results[0].name == "kept" and av.source_label(feed["id"]) == retained_label, \
+            "feed removal changed results or discarded retained labels"
+        assert av.source_secrets_for(feed["id"]) == (sentinel, "url-key"), "removed secret map not retained"
+
+        gv["load_config"] = lambda: {}
+        old = App()
+        assert old.torznab_feeds == [], "old config without feeds"
+
+        # One shared setting_items list controls navigation and rendering, including scrolling.
+        aset = App()
+        aset.settings = True
+        aset.set_sel = len(aset.setting_items()) - 1
+        assert "+ Add Torznab feed" in "\n".join(strip_ansi(x) for x in _settings_panel(aset, 70, 6)), \
+            "settings selection/render list drift"
+        aset.on_key("enter")
+        assert aset.edit_field == "feed-url", "add-feed enter did not edit URL"
+        aset.edit_buf = f"https://new.invalid/api?apikey={sentinel}"
+        assert sentinel not in "\n".join(_settings_panel(aset, 70, 6)), "add-feed URL edit leaked secret"
+        aset.edit_buf = "bad"
+        aset.on_key("enter")
+        assert aset.edit_field == "feed-url" and not aset.torznab_feeds, "invalid URL mutated feeds"
+        aset.on_key("esc")
+        aset.on_key("a")
+        aset.edit_buf = "https://new.invalid/api"
+        aset.on_key("enter")
+        assert len(aset.torznab_feeds) == 1, "feed add"
+        old_endpoint_secret, old_key_secret = "OLD-ENDPOINT-SECRET", "OLD-SEPARATE-KEY"
+        aset.on_key("e"); aset.edit_buf = f"https://new.invalid/api?apikey={old_endpoint_secret}"; aset.on_key("enter")
+        aset.on_key("k"); aset.edit_buf = old_key_secret; aset.on_key("enter")
+        aset.on_key("k"); aset.edit_buf = "separate"; aset.on_key("enter")
+        assert aset.torznab_feeds[0]["api_key"] == "separate", "feed key edit"
+        aset.on_key("e"); aset.edit_buf = "https://edited.invalid/api"; aset.on_key("enter")
+        assert aset.torznab_feeds[0]["url"] == "https://edited.invalid/api", "feed URL edit"
+        edited_feed = aset.torznab_feeds[0]
+        assert {old_endpoint_secret, old_key_secret} <= set(aset.source_secrets_for(edited_feed["id"])), \
+            "feed edit discarded historical secrets"
+        aset.on_key(" ")
+        assert edited_feed["id"] in aset.disabled_sources, "Space did not toggle configured feed"
+        aset.on_key(" ")
+        assert edited_feed["id"] not in aset.disabled_sources, "Space did not restore configured feed"
+        aset.set_sel = 3
+        sid = SOURCES[0].id
+        aset.on_key("enter")
+        assert sid in aset.disabled_sources, "Enter did not toggle built-in source"
+        aset.on_key(" ")
+        assert sid not in aset.disabled_sources, "Space did not toggle built-in source"
+        aset.set_sel = next(i for i, item in enumerate(aset.setting_items()) if item[0] == "feed")
+        aset.on_key("x"); aset.on_key("esc")
+        assert aset.torznab_feeds and aset.remove_feed is None, "escape did not cancel removal"
+        aset.on_key("x"); aset.on_key("x")
+        assert not aset.torznab_feeds and aset.set_sel < len(aset.setting_items()), "remove/clamp failed"
+
+        # Submit sends remote text only while retaining the raw history entry.
+        captures = []
+        real_search = gv["Search"]
+        class _SubmitSearch:
+            def __init__(self, query, sources):
+                captures.append((query, sources)); self.total = len(sources)
+        gv["Search"] = _SubmitSearch
+        gv["load_config"] = lambda: {"torznab_feeds": [feed]}
+        aq = App(); aq.query = '"exact phrase" -cam seeders:>2 mystery:value'; aq.submit()
+        assert captures[-1][0] == "exact phrase mystery:value" and aq.history[-1] == aq.query, \
+            "remote query/history split"
+        aq.query = "-cam seeders:>2"; aq.submit()
+        assert all(s.browse for s in captures[-1][1]) and feed["id"] not in {s.id for s in captures[-1][1]}, \
+            "operator-only query included search-only feed"
+        gv["Search"] = real_search
+
+        # Filter before dedupe with the active search's source map; preserve selection across sorting.
+        active_source = type("ActiveSource", (), {"id": "removed", "label": "Old", "group": "Movies"})()
+        class _ActiveSearch:
+            def __init__(self):
+                self.updates, self.sources = queue.Queue(), {"removed": active_source}
+        af = App(); af.search = _ActiveSearch()  # type: ignore[assignment]
+        af.local_query = parse_query("good group:movies")
+        selected = Result("1" * 40, "good selected", 1, 1, 0, "removed", "magnet:?xt=urn:btih:" + "1" * 40)
+        af.results = [selected]; af.sel = 0
+        shared_hash = "2" * 40
+        bad = Result(shared_hash, "bad", 1, 99, 0, "removed", "magnet:?xt=urn:btih:" + shared_hash)
+        good = Result(shared_hash, "good new", 1, 50, 0, "removed", "magnet:?xt=urn:btih:" + shared_hash)
+        af.search.updates.put(type("U", (), {"source": "removed", "results": [bad, good], "error": ""})())
+        af.drain_search()
+        assert [r.name for r in af.results] == ["good new", "good selected"], "active-map filter before dedupe"
+        assert af._cur().name == "good selected", "selection identity was not restored after sorting"
+
+        # Retry accounting keeps errors visible while in flight, then clears only a success.
+        class _RetrySearch:
+            def __init__(self):
+                self.updates, self.sources, self.in_flight = queue.Queue(), {}, set()
+                self.total = 2
+            def retry(self, ids):
+                scheduled = tuple(i for i in ids if i not in self.in_flight)
+                self.in_flight.update(scheduled); self.total += len(scheduled)
+                return scheduled
+        ar = App(); ar.search = _RetrySearch(); ar.search_total = 2  # type: ignore[assignment]
+        ar.search.updates.put(type("U", (), {"source": "bad", "results": None, "error": "down"})())
+        ar.search.updates.put(type("U", (), {"source": "good", "results": [], "error": ""})())
+        ar.drain_search()
+        assert ar.search_done == ar.search_total == 2 and ar.errors == {"bad": "down"}, \
+            "initial completion accounting"
+        ar.retry_failed_sources()
+        assert ar.search_done == 2 and ar.search_total == 3 and ar.errors == {"bad": "down"}, \
+            "in-flight retry accounting"
+        ar.retry_failed_sources()
+        assert ar.status == "failed sources already retrying" and ar.search_total == 3, \
+            "repeat retry scheduled in-flight source"
+        ar.search.in_flight.clear()
+        ar.search.updates.put(type("U", (), {"source": "bad", "results": None, "error": "down again"})())
+        ar.drain_search()
+        assert ar.search_done == ar.search_total == 3 and ar.errors == {"bad": "down again"}, \
+            "failed retry completion accounting"
+        ar.retry_failed_sources()
+        assert ar.search_done == 3 and ar.search_total == 4 and ar.errors == {"bad": "down again"}, \
+            "second in-flight retry accounting"
+        ar.retry_failed_sources()
+        assert ar.status == "failed sources already retrying" and ar.search_total == 4, \
+            "second repeat retry scheduled in-flight source"
+        ar.search.in_flight.clear()
+        ar.search.updates.put(type("U", (), {"source": "bad", "results": [], "error": ""})())
+        ar.drain_search()
+        assert ar.search_done == ar.search_total == 4 and not ar.errors, "successful retry completion accounting"
+
+        # Variant state and actions are isolated to details; canonical list remains unchanged.
+        variants = (ResultVariant("one", "magnet:?xt=one", "https://one.invalid", 1, 0),
+                    ResultVariant("two", "magnet:?xt=two", "https://two.invalid", 2, 0))
+        vr = Result("4" * 40, "variant", 1, 2, 0, "one", "magnet:?xt=canonical", variants=variants)
+        va = App(); va.search = Search.__new__(Search); va.results = [vr]; va.editing = False
+        used = []
+        gv["open_url"] = lambda u: used.append(("open", u)) or True
+        gv["copy_clipboard"] = lambda u: used.append(("copy", u)) or True
+        va.variant_idx = 1
+        va.on_key("enter")
+        assert va.variant_idx == 0, "opening details did not reset variant selection"
+        va.on_key("right"); va.on_key("y"); va.on_key("o")
+        assert used == [("copy", "magnet:?xt=two"), ("open", "https://two.invalid")], "variant y/o"
+        va.grab = lambda u, n: used.append(("grab", u))  # type: ignore[method-assign]
+        va.on_key("d")
+        assert used[-1] == ("grab", "magnet:?xt=two") and va.results[0].magnet == "magnet:?xt=canonical", \
+            "variant download changed canonical result"
+        va.detail = Result("6" * 40, "single", 1, 1, 0, "one", "magnet:?xt=single")
+        assert "Variant" not in "\n".join(strip_ansi(x) for x in _detail_panel(va, va.detail, 80, 15)), \
+            "single result displayed a variant counter"
+
+        # Historical endpoint and separate-key secrets still redact old in-flight results.
+        aset.settings = False
+        old_page = (f"https://new.invalid/item?apikey={old_endpoint_secret}"
+                    f"&token={old_key_secret}")
+        aset.detail = Result("7" * 40, "old result", 1, 1, 0, edited_feed["id"], "m",
+                             variants=(ResultVariant(edited_feed["id"], "m", old_page, 1, 0),))
+        aset.status = f"old request failed: {old_endpoint_secret} {old_key_secret}"
+        historical_frame = "\n".join(render(aset, 100, 30))
+        assert old_endpoint_secret not in historical_frame and old_key_secret not in historical_frame, \
+            "historical feed secret appeared in rendered output"
+
+        # Every sensitive UI mode and an aria2 URI error must hide configured secrets.
+        gv["load_config"] = lambda: {"torznab_feeds": [feed], "tmdb_key": sentinel}
+        secret_app = App()
+        frames = []
+        secret_app.settings = True
+        feed_row = next(i for i, item in enumerate(secret_app.setting_items()) if item[0] == "feed")
+        secret_app.set_sel, secret_app.edit_field, secret_app.edit_buf = feed_row, "feed-url", feed["url"]
+        frames += render(secret_app, 100, 30)
+        secret_app.edit_field, secret_app.edit_buf = "feed-key", sentinel
+        frames += render(secret_app, 100, 30)
+        secret_app.set_sel, secret_app.edit_field, secret_app.edit_buf = 2, "key", sentinel
+        frames += render(secret_app, 100, 30)
+        page = f"https://indexer.invalid/item?api_key={sentinel}&safe={sentinel}"
+        secret_app.settings = False
+        secret_app.detail = Result("5" * 40, "safe", 1, 1, 0, feed["id"], "m", page=page)
+        frames += render(secret_app, 100, 30)
+        class _ErrorEng:
+            def add(self, uri, options=None): raise Aria2Error(f"failed {page}")
+        secret_app.eng = _ErrorEng(); secret_app.grab(page, "safe")
+        frames += render(secret_app, 100, 30)
+        assert sentinel not in secret_app.status and sentinel not in "\n".join(frames), \
+            "configured secret appeared in a frame or status"
+
+        # Final-frame masking ignores ANSI spans and preserves display width.
+        encoded_secret = "Long Secret+/Sentinel"
+        mask_app = App()
+        mask_app.source_secrets["mask-test"] = ("m", "0", "38", "a", encoded_secret)
+        forms = (encoded_secret, urllib.parse.quote(encoded_secret, safe=""),
+                 urllib.parse.quote_plus(encoded_secret))
+        plain = "keep | " + " | ".join(forms)
+        styled = style(plain, T.ACCENT)
+        masked = _redact_frame(["keep", styled], mask_app)
+        assert masked[0] == "keep", "unmatched output changed during final-frame masking"
+        assert _ANSI.findall(masked[1]) == _ANSI.findall(styled), "ANSI sequence changed during masking"
+        assert dwidth(strip_ansi(masked[1])) == dwidth(strip_ansi(styled)), \
+            "final-frame masking changed display width"
+        assert all(form.lower() not in strip_ansi(masked[1]).lower() for form in forms), \
+            "encoded secret form appeared after final-frame masking"
+        mask_frame = render(mask_app, 60, 20)
+        assert all(dwidth(strip_ansi(line)) <= 60 for line in mask_frame), \
+            "masked render exceeded requested width"
+    finally:
+        for k, v in originals.items():
+            gv[k] = v
+        if "real_search" in locals():
+            gv["Search"] = real_search
     print("interaction ok")
 
     # render: search nav, downloads, help — sized lines, no overflow, no crash

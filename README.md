@@ -58,8 +58,9 @@ Trawl is a from-scratch Python TUI inspired by
 
 ## Features
 
-- **Multi-source search** — 18 sources (incl. the Knaben meta-aggregator) queried
-  concurrently, results streamed in and merged, sorted by seeders (toggle to size / newest).
+- **Multi-source search** — built-in sources plus user-configured Torznab feeds are
+  queried concurrently; results stream in, merge, and sort by seeders (toggle to
+  size / newest). Failed sources can be retried without losing good results.
 - **aria2 engine** — spawns a private `aria2c` over JSON-RPC; honors your
   `~/.aria2/aria2.conf`. Magnet metadata → real download handoff handled; direct
   http(s) links download too.
@@ -67,7 +68,8 @@ Trawl is a from-scratch Python TUI inspired by
   pause / resume / cancel / retry; pick individual files from multi-file
   torrents; reveal in Finder; a persistent *Recently downloaded* list.
 - **Inspect before grabbing** — a details view, open the torrent's page in your
-  browser, or copy its magnet.
+  browser, or copy its selected URI/link. Duplicate results retain source variants; use
+  `←` / `→` in details to cycle them.
 - **Resume** — unfinished downloads resume automatically on the next launch;
   `s` additionally scans the download folder for stray partial `*.aria2` files.
 - **Quality of life** — persistent search history, completion notifications,
@@ -116,8 +118,9 @@ empty box to browse the latest, or paste a magnet or direct http(s) link to grab
 | `Enter` | result details |
 | `d` | download selected |
 | `o` | open the torrent's page in your browser |
-| `y` copy magnet · `v` | grab a magnet or link from the clipboard |
+| `y` copy selected URI/link · `v` | grab a magnet or link from the clipboard |
 | `S` | cycle sort (seeders / size / newest) |
+| `r` | retry failed sources, preserving successful results |
 | `← →` filter category · `c` | clear results |
 | `s` | resume partial downloads found on disk |
 | `g` settings · `?` keys · `q` | quit |
@@ -137,7 +140,7 @@ empty box to browse the latest, or paste a magnet or direct http(s) link to grab
 
 | Category | Sources |
 | --- | --- |
-| Games | FitGirl · DODI |
+| Games | FitGirl |
 | Movies | YTS · The Pirate Bay · 1337x |
 | TV | EZTV · SolidTorrents · The Pirate Bay · 1337x |
 | Anime | Nyaa · SubsPlease · AnimeTosho |
@@ -146,6 +149,22 @@ empty box to browse the latest, or paste a magnet or direct http(s) link to grab
 
 Toggle any source on or off in the settings overlay (`g`). If a source is down,
 the search carries on without it.
+
+### Torznab feeds
+
+In settings (`g`), press `a` and paste a Torznab endpoint URL. You may also
+enter a separate API key with `k`; a separate key overrides an `apikey` already
+present in the endpoint URL. User feeds are search-only: Trawl does not request
+capabilities and currently provides neither browse-latest nor pagination for
+them. Feed availability and contents depend on the endpoint.
+
+### Local query operators
+
+Trawl sends only the remaining search text to sources, then applies these
+filters locally: `seeders:`, `size:`, `source:`, `group:`, `age:`, and `files:`.
+Use `-term` to exclude a word and quotes for an exact phrase, for example
+`"special edition" -cam seeders:>10 size:<4GiB group:movies`. Unknown operators
+are treated as literal search text.
 
 ## How it works
 
@@ -158,6 +177,10 @@ uses a private session file so it never touches your own aria2 state.
 State lives in `~/Library/Application Support/Trawl/`:
 `history.txt` (searches), `downloads.jsonl` (completed), `config.json` (settings),
 `aria2-session.txt` (private session).
+
+Torznab endpoint keys are masked in the UI and errors, as are metadata keys.
+They are stored as plaintext in `config.json`, so protect that file like any
+other local credential store.
 
 ## Privacy
 
