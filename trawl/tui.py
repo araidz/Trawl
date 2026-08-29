@@ -32,14 +32,15 @@ from . import theme as T
 from .aria2 import STATE_DIR, Aria2Error, Download, control_infohash
 from .sources import (SOURCES, LocalQuery, Result, ResultVariant, Search, TorznabFeed,
                       build_magnet, dedupe, make_torznab_source, matches_query,
-                      parse_query, parse_source, redact, redact_url, result_identity, torznab_label,
-                      validate_torznab_url)
+                      parse_magnet, parse_query, parse_source, redact, redact_url,
+                      result_identity, torznab_label, validate_torznab_url)
 from .meta import Meta, kind_for, lookup
 
 CATS = [("all", "All"), ("games", "Games"), ("movies", "Movies"),
         ("tv", "TV"), ("anime", "Anime"), ("books", "Books")]
 CAT_GROUP = {"games": "Games", "movies": "Movies", "tv": "TV", "anime": "Anime",
              "books": "Books"}
+CAT_GLYPH = {"all": "✦", "games": "◆", "movies": "★", "tv": "▶", "anime": "❀", "books": "▤"}
 
 HIST_MAX = 100
 HIST_FILE = STATE_DIR / "history.txt"
@@ -89,7 +90,8 @@ def append_dl_history(rec: dict) -> None:
 
 def load_config() -> dict:
     try:
-        return json.loads(CONFIG_FILE.read_text())
+        cfg = json.loads(CONFIG_FILE.read_text())
+        return cfg if isinstance(cfg, dict) else {}
     except (OSError, ValueError):
         return {}
 
@@ -101,7 +103,7 @@ def save_config(cfg: dict) -> None:
     except OSError:
         pass
 
-RAIL_W = 16  # fits "Downloads (NN)"
+RAIL_W = 18  # glyph + label + count
 MARGIN = 2
 GAP = 2
 
@@ -227,6 +229,11 @@ def fmt_rel(unix: int | None) -> str:
 def clean(s: str) -> str:
     s = "".join(c if c.isprintable() or c == " " else " " for c in s)
     return re.sub(r"\s+", " ", s).strip()
+
+
+def _safe_basename(name: str) -> str:
+    s = re.sub(r'[\x00-\x1f\x7f/\\:*?"<>|]', "_", clean(name)).strip().strip(".")
+    return (s[:120] or "torrent")
 
 
 def copy_clipboard(text: str) -> bool:
@@ -486,6 +493,7 @@ class App:
         self.down_speed = 0  # aria2 global download speed (bytes/s)
         self.num_active = 0
         self.help = False
+        self.help_scroll = 0
         self.status = ""
         self.running = True
         self.confirm_quit = False
@@ -498,9 +506,7 @@ class App:
         self.picker_bytes = 0
         self.detail: Result | None = None  # search result shown in the details view
         self.variant_idx = 0
-        cfg = load_config()
-        self.config = cfg if isinstance(cfg, dict) else {}
-        cfg = self.config
+        cfg = self.config = load_config()
         self.torznab_feeds: list[dict[str, str]] = []
         seen = {s.id for s in SOURCES}
         records = self.config.get("torznab_feeds", [])
@@ -521,23 +527,31 @@ class App:
         self.source_labels: dict[str, str] = {}
         self.source_groups: dict[str, str] = {}
         self.source_secrets: dict[str, tuple[str, ...]] = {}
+        self.source_reports_health: dict[str, bool] = {}
         self._rebuild_sources()
         self.disabled_sources: set[str] = set(cfg.get("disabled_sources", []))
         self.download_dir: str | None = cfg.get("download_dir")
         self.dl_history: list[dict] = load_dl_history()  # completed downloads, oldest->newest
         self.settings = False  # settings overlay open
-        self.set_sel = 0  # 0 dir, 1 provider, 2 key, 3.. sources
+        self.set_sel = 0  # settings selection (never a 'section' row)
         self.edit_field: str | None = None  # settings text-edit: "dir" | "key"
         self.edit_buf = ""
         self.remove_feed: str | None = None
+        self.hide_dead = bool(cfg.get("hide_dead", False))
+        self.folder_prompt: tuple[str, str] | None = None  # (uri, name) for D download
+        self.folder_buf = ""
+        self.last_dir: str | None = None  # last Shift+D destination, reused as prompt default
+        self._exports: dict[str, tuple[str, str, str, float]] = {}  # gid -> (ih, name, dir, started)
         self.local_query = LocalQuery("")
         self.start = time.monotonic()
         self.meta_provider = cfg.get("meta_provider", "tmdb")  # tmdb | omdb
+        self.theme = T.set_theme(cfg.get("theme", "violet"))
         self.tmdb_key = cfg.get("tmdb_key") or os.environ.get("TMDB_API_KEY")
         self.omdb_key = cfg.get("omdb_key") or os.environ.get("OMDB_API_KEY")
         self.meta: dict[str, object] = {}  # "provider:kind:name" -> "loading" | Meta | None
         self._visible_revision = -1
         self._visible_cat: str | None = None
+        self._visible_hide_dead = False
         self._visible_cache: tuple[Result, ...] = ()
 
     # -- derived
@@ -551,25 +565,33 @@ class App:
         self._results_revision += 1
 
     def visible_results(self) -> tuple[Result, ...]:
-        if self._results_revision == self._visible_revision and self.cat == self._visible_cat:
+        if (self._results_revision == self._visible_revision and self.cat == self._visible_cat
+                and self.hide_dead == self._visible_hide_dead):
             return self._visible_cache
+        base = tuple(r for r in self.results
+                     if not (self.hide_dead and r.seeders == 0
+                             and self.source_reports_health.get(r.source, True)))
         if self.cat != "all":
             g = CAT_GROUP[self.cat]
-            out = tuple(r for r in self.results if self.result_group(r) == g)
-            self._visible_revision, self._visible_cat, self._visible_cache = self._results_revision, self.cat, out
+            out = tuple(r for r in base if self.result_group(r) == g)
+            self._visible_revision, self._visible_cat = self._results_revision, self.cat
+            self._visible_hide_dead = self.hide_dead
+            self._visible_cache = out
             return out
         # All: round-robin across categories so one prolific group (e.g. anime)
         # can't monopolize the top. Buckets keep first-seen order (= current sort),
         # so the group holding the overall-top result still leads.
         buckets: dict[str, list[Result]] = {}
-        for r in self.results:
+        for r in base:
             buckets.setdefault(self.result_group(r) or "Other", []).append(r)
         cols = list(buckets.values())
         ordered: list[Result] = []
         for i in range(max((len(c) for c in cols), default=0)):
             ordered += [c[i] for c in cols if i < len(c)]
         out = tuple(ordered)
-        self._visible_revision, self._visible_cat, self._visible_cache = self._results_revision, self.cat, out
+        self._visible_revision, self._visible_cat = self._results_revision, self.cat
+        self._visible_hide_dead = self.hide_dead
+        self._visible_cache = out
         return out
 
     def _cur(self) -> Result | None:
@@ -591,6 +613,7 @@ class App:
         for source in self.sources:
             self.source_labels[source.id] = source.label
             self.source_groups[source.id] = source.group
+            self.source_reports_health[source.id] = source.reports_health
             self.source_secrets[source.id] = tuple(dict.fromkeys(
                 (*self.source_secrets.get(source.id, ()), *source.secrets)))
 
@@ -725,14 +748,60 @@ class App:
         self.variant_idx = 0
         self.status = ""
 
-    def grab(self, magnet: str, name: str) -> None:
+    def grab(self, magnet: str, name: str, dir_: str | None = None) -> None:
         secrets = self._all_secrets()
         if not self.eng:
             self.status = redact(f"(no engine) {clean(name)[:48]}", secrets)
             return
         try:
-            self.eng.add(magnet)
+            self.eng.add(magnet, {"dir": dir_} if dir_ else None)
             self.status = redact(f"grabbing: {clean(name)[:48]}", secrets)
+        except Aria2Error as e:
+            self.status = redact(f"error: {e}", secrets)
+
+    def _start_folder_prompt(self, uri: str, name: str) -> None:
+        self.folder_prompt = (uri, name)
+        self.folder_buf = self.last_dir or self.download_dir or ""
+
+    def _commit_folder_prompt(self) -> None:
+        uri, name = self.folder_prompt or ("", "")
+        self.folder_prompt = None
+        path = os.path.expanduser(self.folder_buf.strip())
+        if not path:
+            self.status = "folder download cancelled (no path)"
+            return
+        try:
+            os.makedirs(path, exist_ok=True)
+        except OSError as e:
+            self.status = f"couldn't create folder: {e.strerror or e}"
+            return
+        self.last_dir = path
+        self.grab(uri, name, dir_=path)
+        if self.view == "search":
+            self.view = "downloads"
+
+    def export_torrent(self, uri: str, name: str) -> None:
+        """Fetch metadata only and save <name>.torrent into the download dir."""
+        secrets = self._all_secrets()
+        if not uri.startswith("magnet:"):
+            self.status = redact(f"not a magnet: {clean(name)[:36]}", secrets)
+            return
+        if not self.eng:
+            self.status = redact(f"(no engine) {clean(name)[:48]}", secrets)
+            return
+        try:
+            pm = parse_magnet(uri)
+            ih = pm.info_hash if pm else ""
+            if not ih:
+                m = re.search(r"btih:([0-9a-fA-F]{40}|[0-9A-Za-z]{32})", uri)
+                ih = m.group(1) if m else "?"
+            dir_path = self.eng.download_dir() or os.path.expanduser("~")
+            gid = self.eng.save_metadata(uri, dir_path)
+            if not gid:
+                self.status = "couldn't start .torrent fetch"
+                return
+            self._exports[gid] = (ih, name, dir_path, time.monotonic())
+            self.status = redact(f"fetching .torrent for {clean(name)[:36]}…", secrets)
         except Aria2Error as e:
             self.status = redact(f"error: {e}", secrets)
 
@@ -795,13 +864,21 @@ class App:
     def _save_settings(self) -> None:
         self.config.update({"disabled_sources": sorted(self.disabled_sources),
                             "download_dir": self.download_dir, "meta_provider": self.meta_provider,
+                            "theme": self.theme, "hide_dead": self.hide_dead,
                             "tmdb_key": self.tmdb_key, "omdb_key": self.omdb_key,
                             "torznab_feeds": [dict(feed) for feed in self.torznab_feeds]})
         save_config(self.config)
 
+    def _set_theme(self, name: str) -> None:
+        self.theme = T.set_theme(name)
+        _logo_lines.cache_clear()  # the gradient logo is baked at first render
+
     def setting_items(self) -> list[tuple[str, object]]:
-        return ([('dir', None), ('provider', None), ('meta-key', None)]
+        return ([('section', 'General'), ('dir', None), ('provider', None), ('meta-key', None),
+                 ('theme', None),
+                 ('section', 'Sources')]
                 + [('source', s) for s in SOURCES]
+                + [('section', 'Torznab feeds')]
                 + [('feed', feed) for feed in self.torznab_feeds]
                 + [('add-feed', None)])
 
@@ -810,13 +887,35 @@ class App:
         self.edit_buf = feed["url"] if feed else ""
         self.remove_feed = None
 
+    def _snap_setting(self, sel: int) -> int:
+        """Clamp sel to a selectable row, stepping past 'section' headers."""
+        items = self.setting_items()
+        n = len(items)
+        sel = min(max(0, sel), n - 1)
+        if items[sel][0] != "section":
+            return sel
+        for d in range(1, n):
+            for cand in (sel - d, sel + d):
+                if 0 <= cand < n and items[cand][0] != "section":
+                    return cand
+        return 0
+
+    def _move_setting(self, delta: int) -> None:
+        items = self.setting_items()
+        n = len(items)
+        sel = self.set_sel
+        for _ in range(n):
+            sel = (sel + delta) % n
+            if items[sel][0] != "section":
+                self.set_sel = sel
+                return
+
     def _selected_setting(self) -> tuple[str, object]:
         items = self.setting_items()
-        self.set_sel = min(self.set_sel, len(items) - 1)
+        self.set_sel = self._snap_setting(self.set_sel)
         return items[self.set_sel]
 
     def _settings_key(self, k: str) -> None:
-        rows = len(self.setting_items())
         if self.edit_field:
             if k == "enter":
                 self._commit_edit()
@@ -835,9 +934,9 @@ class App:
             else:
                 self.settings = False
         elif k == "up" or (k == "k" and self._selected_setting()[0] != "feed"):
-            self.set_sel = (self.set_sel - 1) % rows
+            self._move_setting(-1)
         elif k in ("down", "j"):
-            self.set_sel = (self.set_sel + 1) % rows
+            self._move_setting(1)
         else:
             kind, value = self._selected_setting()
             if k == "a" or (k == "enter" and kind == "add-feed"):
@@ -866,6 +965,9 @@ class App:
             elif k in ("enter", " ") and kind == "meta-key":
                 self.edit_field = "key"
                 self.edit_buf = self._provider_key() or ""
+            elif k in ("enter", " ") and kind == "theme":
+                self._set_theme("light" if self.theme == "violet" else "violet")
+                self._save_settings()
             elif k in ("enter", " ") and kind in ("source", "feed"):
                 sid = value.id if kind == "source" else value["id"]
                 self.disabled_sources.symmetric_difference_update({sid})
@@ -877,7 +979,7 @@ class App:
         self.remove_feed = None
         self._rebuild_sources()
         self._save_settings()
-        self.set_sel = min(self.set_sel, len(self.setting_items()) - 1)
+        self.set_sel = self._snap_setting(self.set_sel)
         self.status = "feed removed"
 
     def _commit_edit(self) -> None:
@@ -1015,16 +1117,60 @@ class App:
     def update_downloads(self, downloads: list[Download]) -> None:
         """Replace the download list, notifying on any active->complete transition
         seen this session (not for downloads that were already complete when first
-        polled, so launching with finished items stays quiet)."""
+        polled, so launching with finished items stays quiet). .torrent exports
+        are resolved here too: once the metadata fetch completes, the <hash>.torrent
+        aria2 wrote is renamed to the item's name and the fetch row is dropped."""
         prev = {d.root: d.status for d in self.downloads}
         for d in downloads:
+            if d.root in self._exports:
+                continue  # a metadata fetch, not a real download
             was = prev.get(d.root)
             if d.status == "complete" and was is not None and was != "complete":
                 notify("trawl — download complete", d.name)
                 rec = {"name": d.name, "size": d.total, "ts": int(time.time()), "path": d.path}
                 self.dl_history.append(rec)
                 append_dl_history(rec)
-        self.downloads = downloads
+        exports = dict(self._exports)
+        kept = []
+        now = time.monotonic()
+        for d in downloads:
+            if d.root in exports:
+                ih, name, dir_path, started = exports[d.root]
+                st = self.eng.status(d.root) if self.eng else ""
+                if st == "complete":
+                    self._finish_export(d.root, ih, name, dir_path)
+                elif st == "error" or now - started > 60:
+                    self._exports.pop(d.root, None)
+                    try:
+                        self.eng.remove(d.root)
+                    except Aria2Error:
+                        pass
+                    self.status = ("couldn't fetch .torrent metadata"
+                                   if st == "error" else
+                                   "couldn't fetch .torrent metadata (timed out)")
+                continue
+            kept.append(d)
+        self.downloads = kept
+
+    def _finish_export(self, gid: str, ih: str, name: str, dir_path: str) -> None:
+        self._exports.pop(gid, None)
+        src = os.path.join(dir_path, f"{ih}.torrent")
+        target = os.path.join(dir_path, _safe_basename(name) + ".torrent")
+        saved = src
+        try:
+            deadline = time.monotonic() + 3  # file write can lag the status flip
+            while not os.path.exists(src) and time.monotonic() < deadline:
+                time.sleep(0.1)
+            if src != target and os.path.exists(src):
+                os.replace(src, target)
+                saved = target
+        except OSError:
+            saved = src
+        try:
+            self.eng.remove(gid)
+        except Aria2Error:
+            pass
+        self.status = redact(f"saved {os.path.basename(saved)}", self._all_secrets())
 
     def _move(self, d: int) -> None:
         if self.view == "downloads":
@@ -1041,7 +1187,19 @@ class App:
 
     def on_key(self, k: str) -> None:
         if self.help:
-            self.help = False
+            if k in ("up", "down", "j", "k", "pageup", "pagedown"):
+                if k in ("down", "j"):
+                    self.help_scroll += 1
+                elif k in ("up", "k"):
+                    self.help_scroll -= 1
+                elif k == "pagedown":
+                    self.help_scroll += 8
+                else:
+                    self.help_scroll -= 8
+                self.help_scroll = max(0, self.help_scroll)
+            else:
+                self.help = False
+                self.help_scroll = 0
             return
         if k == "ctrl-c":
             self.running = False
@@ -1074,6 +1232,16 @@ class App:
             elif k in ("esc", "q"):
                 self.cancel_prompt = None
             return
+        if self.folder_prompt is not None:
+            if k == "enter":
+                self._commit_folder_prompt()
+            elif k == "esc":
+                self.folder_prompt = None
+            elif k == "backspace":
+                self.folder_buf = self.folder_buf[:-1]
+            elif len(k) == 1 and k >= " ":
+                self.folder_buf += k
+            return
         if self.settings:
             self._settings_key(k)
             return
@@ -1092,6 +1260,10 @@ class App:
                 self.grab(self._variant().uri, self.detail.name)
                 self.detail = None
                 self.variant_idx = 0
+            elif k == "D":
+                self._start_folder_prompt(self._variant().uri, self.detail.name)
+            elif k == "e":
+                self.export_torrent(self._variant().uri, self.detail.name)
             elif k == "o":
                 page = self._variant().page
                 self.status = ("opened in browser" if page and open_url(page)
@@ -1155,7 +1327,7 @@ class App:
             self.help = True
         elif k == "g":
             self.settings = True
-            self.set_sel = 0
+            self.set_sel = self._snap_setting(0)
         elif k == "tab":
             self.view = "downloads" if self.view == "search" else "search"
             self.detail = None
@@ -1187,11 +1359,22 @@ class App:
                 self.clear()
             elif k == "S":
                 self._cycle_sort()
+            elif k == "z":
+                self.hide_dead = not self.hide_dead
+                self._save_settings()
+                self.status = ("hiding dead torrents" if self.hide_dead
+                               else "showing all torrents")
             elif k == "r":
                 self.retry_failed_sources()
             elif k == "d":
                 if (r := self._cur()):
                     self.grab(r.magnet, r.name)
+            elif k == "D":
+                if (r := self._cur()):
+                    self._start_folder_prompt(r.magnet, r.name)
+            elif k == "e":
+                if (r := self._cur()):
+                    self.export_torrent(r.magnet, r.name)
             elif k == "enter":
                 if (r := self._cur()):
                     self.detail = r
@@ -1275,13 +1458,33 @@ def _detail_panel(app: App, r: Result, width: int, height: int) -> list[str]:
 
     variants = app._variants(r)
     variant = variants[app.variant_idx % len(variants)]
-    health = (f"{variant.seeders} seeders · {variant.leechers} leechers"
-              if (variant.seeders or variant.leechers) else "unknown")
     if len(variants) > 1:
-        inner.append(field("Variant", f"{app.variant_idx + 1}/{len(variants)}"))
+        inner.append(cell("", inner_w))
+        inner.append(cell(f"Variants  ({len(variants)})  ← →", inner_w, color=T.ALT, bold=True))
+        vlw = max(0, inner_w - 2 - 1 - 9 - 5)
+        for i, v in enumerate(variants):
+            here = i == app.variant_idx % len(variants)
+            vtag, _ = app.source_tag(v.source)
+            inner.append(cell(T.PTR if here else " ", 2, color=T.ACCENT) + " "
+                         + cell(app.source_label(v.source), vlw,
+                                color=T.ACCENT if here else T.TEXT, bold=here)
+                         + cell(seed_leech(v, app.source_reports_health.get(v.source, True)),
+                                9, "right", color=seed_color(v.seeders), bold=here)
+                         + cell(vtag, 5, "right", color=T.ACCENT if here else T.ALT, bold=here))
+        inner.append(cell("", inner_w))
     inner.append(field("Source", app.source_label(variant.source)))
     inner.append(field("Size", fmt_bytes(r.size)))
-    inner.append(field("Health", health, T.GOOD if variant.seeders else None))
+    if variant.seeders or variant.leechers:
+        ratio = min(1.0, (variant.seeders or 0) / 1000)
+        filled = round(ratio * 10)
+        bar = style(T.BLOCK * filled, seed_color(variant.seeders) or T.RULE) \
+            + style(T.TRACK * (10 - filled), T.RULE)
+        text = (f"{variant.seeders} s · {variant.leechers} l" if (variant.seeders or variant.leechers)
+                else "unknown")
+        inner.append("  " + cell("Health", 7, dim=True) + bar + " "
+                     + cell(text, inner_w - 20, dim=True))
+    else:
+        inner.append(field("Health", "unknown"))
     if r.added:
         inner.append(field("Added", fmt_rel(r.added)))
     if r.num_files:
@@ -1361,20 +1564,37 @@ def _logo_lines() -> tuple[str, ...]:
     return tuple(out)
 
 
+def _cat_counts(app: App) -> dict[str, int]:
+    counts = {key: 0 for key, _ in CATS}
+    counts["all"] = len(app.results)
+    for r in app.results:
+        g = app.result_group(r)
+        for key, group in CAT_GROUP.items():
+            if g == group:
+                counts[key] += 1
+                break
+    return counts
+
+
 def _rail(app: App, h: int) -> list[str]:
+    counts = _cat_counts(app)
     lines = [cell("", RAIL_W)]
     for key, label in CATS:
         sel = app.view == "search" and app.cat == key
         mark = style(T.BAR, T.ACCENT, bold=True) if sel else " "
-        lines.append(mark + " " + cell(label, RAIL_W - 2, color=T.ACCENT if sel else None,
-                                       bold=sel, dim=not sel))
+        n = counts.get(key, 0)
+        lines.append(mark + " " + style(CAT_GLYPH[key], T.ALT) + " "
+                     + cell(label, 9, color=T.ACCENT if sel else T.TEXT, bold=sel)
+                     + cell(str(n) if n else "", 5, "right", color=T.ACCENT if sel else None,
+                            bold=sel, dim=not sel))
     lines.append(cell("", RAIL_W))
     dsel = app.view == "downloads"
     n = len(app.downloads)
     mark = style(T.BAR, T.ACCENT, bold=True) if dsel else " "
-    label = "Downloads" + (f" ({n})" if n else "")
-    lines.append(mark + " " + cell(label, RAIL_W - 2, color=T.ACCENT if dsel else None,
-                                   bold=dsel, dim=not dsel))
+    lines.append(mark + " " + style(T.DOWN, T.ALT) + " "
+                 + cell("Downloads", 9, color=T.ACCENT if dsel else T.TEXT, bold=dsel)
+                 + cell(f"({n})" if n else "", 5, "right", color=T.ACCENT if dsel else None,
+                        bold=dsel, dim=not dsel))
     return (lines + [cell("", RAIL_W)] * h)[:h]
 
 
@@ -1435,6 +1655,30 @@ def _status_line(app: App, results: Sequence[Result], inner_w: int) -> str:
     return cell(head + note, inner_w, dim=True)
 
 
+def seed_color(n: int) -> str | None:
+    """Health tier for a seeder count: hot (GOOD), warm (ALT), cold (WARN), none."""
+    if n <= 0:
+        return None
+    if n < 100:
+        return T.WARN
+    if n < 1000:
+        return T.ALT
+    return T.GOOD
+
+
+def seed_leech(r: Result, reports_health: bool = True) -> str:
+    s, l = r.seeders, r.leechers
+    if not reports_health and not s and not l:
+        return "—"  # source reports no swarm counts; unknown, not dead
+    if s and l:
+        return f"{s}:{l}"
+    if s:
+        return str(s)
+    if l:
+        return f"0:{l}"
+    return "-"
+
+
 def _results_panel(app: App, width: int, height: int) -> list[str]:
     inner_w = width - 4
     results = app.visible_results()
@@ -1444,7 +1688,7 @@ def _results_panel(app: App, width: int, height: int) -> list[str]:
     if results:
         header = (cell("", 2) + " " + cell("Name", name_w, dim=True, bold=True) + " "
                   + cell("Size", 9, "right", dim=True, bold=True) + " "
-                  + cell("S:L", 9, "right", dim=True, bold=True) + " "
+                  + cell("Seed", 9, "right", dim=True, bold=True) + " "
                   + cell("Src", 5, "right", dim=True, bold=True))
         inner.append(header)
         list_h = max(1, height - 2 - len(inner))
@@ -1453,7 +1697,7 @@ def _results_panel(app: App, width: int, height: int) -> list[str]:
             r = results[idx]
             here = idx == app.sel
             tag, tcolor = app.source_tag(r.source)
-            sl = f"{r.seeders}:{r.leechers}" if (r.seeders or r.leechers) else "-"
+            sl = seed_leech(r, app.source_reports_health.get(r.source, True))
             if here:  # selected row: the whole line lights up in accent
                 inner.append(
                     cell(T.PTR, 2, color=T.ACCENT) + " "
@@ -1464,10 +1708,10 @@ def _results_panel(app: App, width: int, height: int) -> list[str]:
             else:
                 inner.append(
                     cell("", 2) + " "
-                    + cell(clean(r.name), name_w, dim=True) + " "
+                    + cell(clean(r.name), name_w, color=T.TEXT) + " "
                     + cell(fmt_bytes(r.size), 9, "right", dim=True) + " "
-                    + cell(sl, 9, "right", color=T.GOOD if r.seeders else None, dim=not r.seeders) + " "
-                    + cell(tag, 5, "right", color=tcolor, dim=True))
+                    + cell(sl, 9, "right", color=seed_color(r.seeders)) + " "
+                    + cell(tag, 5, "right", color=tcolor))
     base = "Latest" if (app.search is not None and not app.query.strip()) else "Results"
     title = f"{base} · {app.sort}" if results else base
     count = f"({len(results)})" if results else None
@@ -1547,10 +1791,11 @@ def _downloads_panel(app: App, width: int, height: int) -> list[str]:
             stat_w = min(dwidth(stats) + 1, inner_w - 6)
             inner.append(
                 cell(icon, 2, color=ic) + cell(clean(d.name) or "…", inner_w - 2 - stat_w,
-                                               color=T.ACCENT if here else None, bold=here, dim=not here)
+                                               color=T.ACCENT if here else T.TEXT, bold=here)
                 + cell(stats, stat_w, "right", dim=True))
-            inner.append("  " + render_bar(d.progress, inner_w - 2, app.tick,
-                                           d.status in ("active", "metadata"), base))
+            if d.status != "error":
+                inner.append("  " + render_bar(d.progress, inner_w - 2, app.tick,
+                                               d.status in ("active", "metadata"), base))
             inner.append(cell("", inner_w))
     if recent and len(inner) < body_h:
         inner.append(cell("Recently downloaded", inner_w, color=T.ALT, bold=True))
@@ -1560,34 +1805,64 @@ def _downloads_panel(app: App, width: int, height: int) -> list[str]:
             right = f"{fmt_bytes(rec.get('size', 0))}  {fmt_rel(rec.get('ts'))}"
             rw = min(dwidth(right) + 1, inner_w - 6)
             inner.append(cell(T.DONE, 2, color=T.GOOD)
-                         + cell(clean(rec.get("name", "?")), inner_w - 2 - rw, dim=True)
+                         + cell(clean(rec.get("name", "?")), inner_w - 2 - rw, color=T.TEXT)
                          + cell(right, rw, "right", dim=True))
+    active = sum(1 for d in live if d.status in ("active", "waiting", "metadata"))
+    title_count = f"({len(live)})" if live else None
+    if active and title_count:
+        title_count += f" · {active} active"
     return _wrap_panel("Downloads", inner, width, height, app.view == "downloads",
-                       f"({len(live)})" if live else None)
+                       title_count)
 
 
 def _settings_panel(app: App, width: int, height: int) -> list[str]:
     inner_w = width - 4
     items = app.setting_items()
     body_h = max(1, height - 2)
+    app.set_sel = app._snap_setting(app.set_sel)
     start = _window(app.set_sel, len(items), body_h)
     inner = []
     for idx in range(start, min(start + body_h, len(items))):
         kind, value = items[idx]
         selected = idx == app.set_sel
+        sel_c = T.ACCENT if selected else None
+        if kind == "section":
+            inner.append(cell(str(value).upper(), inner_w, color=T.ALT, bold=True, dim=True))
+            continue
         prefix = cell(T.PTR if selected else "", 2, color=T.ACCENT)
-        if kind == "dir":
-            shown = app.edit_buf + "▌" if app.edit_field == "dir" else app.download_dir or "(from aria2.conf)"
-            text, on = f"Download dir: {shown}", bool(app.download_dir or app.edit_field == "dir")
-        elif kind == "provider":
-            text, on = f"Metadata provider: {app.meta_provider.upper()}", True
-        elif kind == "meta-key":
-            key = app.edit_buf if app.edit_field == "key" else app._provider_key() or ""
-            shown = "•" * min(len(key), 12) + ("▌" if app.edit_field == "key" else "")
-            text, on = f"{app.meta_provider.upper()} key: {shown or '(not set)'}", bool(key)
+        if kind in ("dir", "provider", "meta-key", "theme"):
+            if kind == "dir":
+                label = "Download dir"
+                shown = app.edit_buf + "▌" if app.edit_field == "dir" else app.download_dir or "(from aria2.conf)"
+                on = bool(app.download_dir or app.edit_field == "dir")
+            elif kind == "provider":
+                label = "Metadata provider"
+                shown = app.meta_provider.upper()
+                on = True
+            elif kind == "theme":
+                label = "Theme"
+                shown = app.theme.title()
+                on = True
+            else:
+                label = f"{app.meta_provider.upper()} key"
+                key = app.edit_buf if app.edit_field == "key" else app._provider_key() or ""
+                shown = ("•" * min(len(key), 12) + ("▌" if app.edit_field == "key" else "")) or "(not set)"
+                on = bool(key)
+            inner.append(prefix + cell(label, 18, color=sel_c, bold=selected, dim=not selected and not on)
+                         + cell(shown, inner_w - 20, color=sel_c, bold=selected,
+                                dim=not selected and not on))
         elif kind == "source":
             on = value.id not in app.disabled_sources
-            text = f"Sources · [{'x' if on else ' '}] {value.label}  ·  {value.group}"
+            tag, tcolor = app.source_tag(value.id)
+            inner.append(prefix
+                         + cell("[✓]" if on else "[ ]", 4,
+                                color=T.GOOD if (on and not selected) else (sel_c or T.RULE), bold=selected)
+                         + cell(value.label, inner_w - 21, color=sel_c, bold=selected,
+                                dim=not selected and not on)
+                         + cell(value.group or "", 10, "right", color=sel_c, bold=selected,
+                                dim=not selected and not on)
+                         + cell(tag, 5, "right", color=sel_c if selected else tcolor, bold=selected,
+                                dim=not selected and not on))
         elif kind == "feed":
             on = value["id"] not in app.disabled_sources
             if selected and app.edit_field == "feed-url":
@@ -1597,14 +1872,21 @@ def _settings_panel(app: App, width: int, height: int) -> list[str]:
             else:
                 shown = torznab_label(value["url"])
             armed = "  [remove?]" if app.remove_feed == value["id"] else ""
-            text = f"[{'x' if on else ' '}] {shown}{armed}"
-        else:
+            keymark = " · key" if value.get("api_key") else ""
+            inner.append(prefix
+                         + cell("[✓]" if on else "[ ]", 4,
+                                color=T.GOOD if (on and not selected) else (sel_c or T.RULE), bold=selected)
+                         + cell(f"{shown}{keymark}{armed}", inner_w - 6, color=sel_c, bold=selected,
+                                dim=not selected and not on))
+        else:  # add-feed
             shown = (redact_url(app.edit_buf, app._all_secrets()) + "▌"
                      if selected and app.edit_field == "feed-url" else "")
-            text, on = (shown or "+ Add Torznab feed"), True
-        inner.append(prefix + cell(text, inner_w - 2, color=T.ACCENT if selected else None,
-                                   bold=selected, dim=not selected and not on))
-    return _wrap_panel("Settings", inner, width, height, True)
+            text = shown or "+ Add Torznab feed"
+            inner.append(prefix + cell(text, inner_w - 2, color=sel_c or T.ALT, bold=selected,
+                                       dim=not selected))
+    on_sources = sum(1 for s in SOURCES if s.id not in app.disabled_sources)
+    return _wrap_panel("Settings", inner, width, height, True,
+                       f"{on_sources}/{len(SOURCES)} sources on")
 
 
 def _picker_panel(app: App, width: int, height: int) -> list[str]:
@@ -1629,22 +1911,24 @@ def _picker_panel(app: App, width: int, height: int) -> list[str]:
                        f"({clean(app.picker.name)[:24]})" if app.picker else None)
 
 
-def _help_panel(width: int, height: int) -> list[str]:
+def _help_panel(app: App, width: int, height: int) -> list[str]:
     inner_w = width - 4
     groups = [
         ("Search", [("type", "search (paste a magnet or link to grab)"), ("enter", "details"),
-                     ("d", "download"), ("o", "open page in browser"), ("y", "copy magnet"),
+                     ("d", "download"), ("D", "download to a folder"), ("e", "save .torrent"),
+                     ("o", "open page in browser"), ("y", "copy magnet"),
                      ("/  i", "edit query"), ("↑ ↓", "recall past searches"),
-                     ("r", "retry failed sources"),
+                     ("r", "retry failed sources"), ("z", "hide dead torrents"),
                      ("filters", "seeders: size: age: files: source: group:"),
                      ("examples", 'matrix -cam size:>1GiB group:movies'),
                      ("S", "cycle sort (seeders/size/newest)"), ("c", "clear results"),
                      ("← →", "filter category"), ("v", "grab magnet/link from clipboard")]),
         ("Details", [("← →", "cycle duplicate source variants"),
-                     ("d / y / o", "use selected variant")]),
-        ("Settings", [("a", "add Torznab feed"), ("enter / e", "edit endpoint"),
-                      ("k", "edit separate key"), ("space", "toggle source"),
-                      ("x x", "arm / confirm feed removal")]),
+                     ("d / D / e", "download / to folder / save .torrent")]),
+        ("Settings", [("enter / space", "edit or toggle the selected row"),
+                       ("a", "add Torznab feed"),
+                       ("on a feed row", "e endpoint · k separate key · x remove"),
+                       ("g / esc", "close")]),
         ("Navigate", [("↑ ↓  j k", "move selection / scroll wheel"),
                       ("tab", "switch search / downloads")]),
         ("Downloads", [("p", "pause / resume"), ("x", "cancel (ask: delete or keep files)"),
@@ -1653,36 +1937,62 @@ def _help_panel(width: int, height: int) -> list[str]:
         ("General", [("g", "settings (sources, download dir)"), ("?", "this help"),
                      ("q", "quit (confirm)"), ("ctrl-c", "quit now")]),
     ]
-    inner = [cell("Keys", inner_w, color=T.ACCENT, bold=True), cell("", inner_w)]
+    rows = [cell("Keys", inner_w, color=T.ACCENT, bold=True), cell("", inner_w)]
     for title, items in groups:
-        inner.append(cell(title, inner_w, color=T.ALT, bold=True))
+        rows.append(cell(title, inner_w, color=T.ALT, bold=True))
         for keys, desc in items:
-            inner.append("  " + cell(keys, 12, color=T.BRIGHT) + " " + cell(desc, inner_w - 15, dim=True))
-        inner.append(cell("", inner_w))
-    return _wrap_panel("Help", inner, width, height, True)
+            rows.append("  " + cell(keys, 16, color=T.BRIGHT) + " " + cell(desc, inner_w - 20, dim=True))
+        rows.append(cell("", inner_w))
+    body_h = max(1, height - 2)
+    max_scroll = max(0, len(rows) - body_h)
+    app.help_scroll = min(app.help_scroll, max_scroll)
+    start = app.help_scroll
+    shown = rows[start:start + body_h]
+    count = f"{start + 1}-{start + len(shown)}/{len(rows)}" if max_scroll else None
+    return _wrap_panel("Help", shown, width, height, True, count)
 
 
 def _footer(app: App, width: int) -> str:
     if app.cancel_prompt is not None:
         hints = [("d", "delete files"), ("k", "keep files"), ("esc", "abort")]
+    elif app.folder_prompt is not None:
+        hints = [("type", "path"), ("enter", "download"), ("esc", "cancel")]
     elif app.torrent_prompt is not None:
         hints = [("t", "contents"), ("f", ".torrent file"), ("esc", "cancel")]
     elif app.help:
-        hints = [("any key", "close")]
+        hints = [("↑↓", "scroll"), ("any key", "close")]
     elif app.settings:
-        hints = ([("type", "value"), ("enter", "save"), ("esc", "cancel")] if app.edit_field
-                 else [("↑↓", "move"), ("a", "add"), ("e", "endpoint"), ("k", "key"),
-                       ("space", "toggle"), ("x", "remove"), ("g/esc", "close")])
+        if app.edit_field:
+            hints = [("type", "value"), ("enter", "save"), ("esc", "cancel")]
+        elif app.remove_feed is not None:
+            hints = [("x/enter", "confirm"), ("esc", "cancel")]
+        else:
+            items = app.setting_items()
+            kind = items[app._snap_setting(app.set_sel)][0]
+            if kind == "feed":
+                hints = [("↑↓", "move"), ("enter/e", "endpoint"), ("k", "key"),
+                         ("x", "remove"), ("space", "toggle"), ("a", "add"), ("g/esc", "close")]
+            elif kind == "add-feed":
+                hints = [("↑↓", "move"), ("enter", "add"), ("a", "add"), ("g/esc", "close")]
+            elif kind == "source":
+                hints = [("↑↓", "move"), ("space/enter", "toggle"), ("a", "add"), ("g/esc", "close")]
+            elif kind in ("dir", "meta-key"):
+                hints = [("↑↓", "move"), ("enter/space", "edit"), ("a", "add"), ("g/esc", "close")]
+            else:  # provider / theme
+                hints = [("↑↓", "move"), ("enter/space", "toggle"), ("a", "add"), ("g/esc", "close")]
     elif app.picker is not None:
         hints = [("↑↓", "move"), ("space", "toggle"), ("a", "all/none"),
                  ("enter", "apply"), ("esc", "cancel")]
     elif app.detail is not None:
-        hints = [("←→", "variant"), ("d", "download"), ("o", "page"), ("y", "copy"), ("p", "poster"), ("esc/q", "back")]
+        hints = [("←→", "variant"), ("d", "download"), ("D", "folder"), ("e", ".torrent"),
+                 ("o", "page"), ("y", "copy"), ("p", "poster"), ("esc/q", "back")]
     elif app.view == "search" and app.editing:
         hints = [("enter", "search"), ("↑↓", "history"), ("esc", "nav"), ("tab", "downloads"), ("^c", "quit")]
     elif app.view == "search":
-        hints = [("↑↓", "move"), ("enter", "details"), ("d", "grab"), ("o", "page"), ("y", "copy"),
-                 ("r", "retry"), ("S", "sort"), ("←→", "category"), ("v", "paste"), ("g", "settings"), ("q", "quit")]
+        hints = [("↑↓", "move"), ("enter", "details"), ("d", "grab"), ("D", "folder"), ("e", ".torrent"),
+                 ("o", "page"), ("y", "copy"),
+                 ("r", "retry"), ("z", "hide dead"), ("S", "sort"), ("←→", "category"),
+                 ("v", "paste"), ("g", "settings"), ("q", "quit")]
     else:
         hints = [("↑↓", "move"), ("p", "pause/resume"), ("x", "cancel"), ("r", "retry"),
                  ("f", "files"), ("o", "reveal"), ("s", "resume"), ("g", "settings"),
@@ -1729,6 +2039,7 @@ def _splash(app: App, cols: int, rows: int) -> list[str]:
               _center(style(CATS_LINE, dim=True), dwidth(CATS_LINE), cols), ""]
     box_w = min(64, cols - 8)
     editing = app.view == "search" and app.editing
+    block += [_center(style("─" * box_w, T.RULE), box_w, cols)]
     box = _wrap_panel("Search", [_search_line(app, box_w - 4)], box_w, 3, editing)
     bleft = max(0, (cols - box_w) // 2)
     block += [" " * bleft + b for b in box]
@@ -1781,10 +2092,35 @@ def _cancel_box(cols: int) -> list[str]:
                       [("d", "delete files"), ("k", "keep files"), ("esc", "abort")], T.WARN)
 
 
+def _folder_box(cols: int, app: App) -> list[str]:
+    _, name = app.folder_prompt or ("", "")
+    label = f"Download to folder — {clean(name)}"
+    box_w = min(max(dwidth(label) + 6, 30), cols - 2)
+    pre = " " * max(0, (cols - box_w) // 2)
+    inner_w = box_w - 4
+    shown = dtrunc(clean(app.folder_buf), inner_w)
+    caret = "\x1b[7m \x1b[0m" if dwidth(shown) >= inner_w else ""
+    path = style("path: ", dim=True) + style(shown, T.TEXT) + caret
+    hint = style("enter", T.ACCENT) + style(" download  ", dim=True) \
+        + style("esc", T.ACCENT) + style(" cancel", dim=True)
+    def _pad_styled(s: str) -> str:
+        return s + " " * max(0, inner_w - dwidth(strip_ansi(s)))
+    return [
+        pre + style("╭" + "─" * (box_w - 2) + "╮", T.ACCENT),
+        pre + style("│", T.ACCENT) + _pad_styled(style(dtrunc(label, inner_w), T.TEXT, bold=True)) + style("│", T.ACCENT),
+        pre + style("│", T.ACCENT) + cell("", inner_w) + style("│", T.ACCENT),
+        pre + style("│", T.ACCENT) + _pad_styled(path) + style("│", T.ACCENT),
+        pre + style("│", T.ACCENT) + cell("", inner_w) + style("│", T.ACCENT),
+        pre + style("│", T.ACCENT) + _pad_styled(hint) + style("│", T.ACCENT),
+        pre + style("╰" + "─" * (box_w - 2) + "╯", T.ACCENT),
+    ]
+
+
 def _overlay(lines: list[str], app: App, cols: int, rows: int) -> list[str]:
     box = (_confirm(cols) if app.confirm_quit
            else _torrent_box(cols) if app.torrent_prompt
            else _cancel_box(cols) if app.cancel_prompt
+           else _folder_box(cols, app) if app.folder_prompt is not None
            else None)
     if not box:
         return lines
@@ -1847,19 +2183,17 @@ def render(app: App, cols: int, rows: int) -> list[str]:
         lines.append(" " * MARGIN + style("─" * rule_w, T.RULE))
 
     body_h, panel_h = _main_heights(rows)
-    content_w = cols - MARGIN - RAIL_W - GAP - 1
+    use_rail = app.view in ("search", "downloads") and app.detail is None and not app.help \
+        and not app.settings and app.picker is None
+    content_w = cols - MARGIN - RAIL_W - GAP - 1 if use_rail else cols - MARGIN - 1
 
     if app.help:
-        content = _help_panel(content_w, body_h)
-        rail = [cell("", RAIL_W)] * body_h
+        content = _help_panel(app, content_w, body_h)
     elif app.settings:
         content = _settings_panel(app, content_w, body_h)
-        rail = [cell("", RAIL_W)] * body_h
     elif app.picker is not None:
         content = _picker_panel(app, content_w, body_h)
-        rail = [cell("", RAIL_W)] * body_h
     else:
-        rail = _rail(app, body_h)
         content = _search_panel(app, content_w) + [""]
         if app.view == "search" and app.detail is not None:
             content += _detail_panel(app, app.detail, content_w, panel_h)
@@ -1868,9 +2202,10 @@ def render(app: App, cols: int, rows: int) -> list[str]:
         else:
             content += _downloads_panel(app, content_w, panel_h)
     content = (content + [""] * body_h)[:body_h]
+    rail = _rail(app, body_h) if use_rail else []
 
     for i in range(body_h):
-        lines.append(" " * MARGIN + rail[i] + " " * GAP + content[i])
+        lines.append(" " * MARGIN + (rail[i] + " " * GAP if use_rail else "") + content[i])
 
     lines.append("")
     lines.append(" " * MARGIN + _footer(app, cols - MARGIN))
@@ -2087,6 +2422,100 @@ def selftest() -> None:
     appx.grab = lambda m, n: grabbed2.update(m=m)  # type: ignore
     appx.on_key("d")
     assert grabbed2.get("m") == "magnet:?xt=z" and appx.detail is None, "d grabs from details"
+
+    # D opens the folder prompt, enter commits a per-download dir; esc cancels.
+    import tempfile as _tf
+    _dirs = []
+    class _DirEng:
+        def add(self, uri, options=None): _dirs.append((uri, options))
+    appf = App(eng=_DirEng())
+    appf.search = Search.__new__(Search)
+    appf.editing = False
+    appf.results = [Result("b" * 40, "Folder Test", 1, 5, 1, "yts", "magnet:?xt=fold")]
+    appf.on_key("D")
+    assert appf.folder_prompt is not None, "D opens folder prompt"
+    appf.folder_buf = ""  # prompt defaults to the download dir; type a fresh path
+    _target = os.path.join(_tf.mkdtemp(), "nest", "dl")
+    for ch in _target:
+        appf.on_key(ch)
+    appf.on_key("enter")
+    assert appf.folder_prompt is None and appf.last_dir == _target, appf.last_dir
+    assert os.path.isdir(_target), "folder prompt created the target dir"
+    assert _dirs[-1] == ("magnet:?xt=fold", {"dir": _target}), _dirs
+    appf.view = "search"  # a successful folder grab jumps to downloads
+    appf.on_key("D")
+    assert appf.folder_buf == _target, "last_dir reused as prompt default"
+    appf.on_key("esc")
+    assert appf.folder_prompt is None, "esc cancels folder prompt"
+    appf.on_key("D")
+    appf.folder_buf = "/nonexistent-root-xyz/blocked"
+    appf.on_key("enter")
+    assert appf.folder_prompt is None and "couldn't create" in appf.status, appf.status
+    assert _dirs[-1] == ("magnet:?xt=fold", {"dir": _target}), "failed dir did not enqueue"
+
+    # e exports the .torrent via save_metadata (magnet only); once the fetch
+    # completes the <hash>.torrent is renamed to the item's name.
+    _expdir = _tf.mkdtemp()
+    _meta, _removed, _status = [], [], {}
+    class _MetaEng:
+        def download_dir(self): return _expdir
+        def save_metadata(self, uri, d): _meta.append((uri, d)); return "xgid"
+        def remove(self, r): _removed.append(r)
+        def status(self, r): return _status.get(r, "")
+    appe = App(eng=_MetaEng())
+    appe.search = Search.__new__(Search)
+    appe.editing = False
+    appe.results = [Result("b" * 40, "Meta Test", 1, 5, 1, "yts", f"magnet:?xt=urn:btih:{'b' * 40}"),
+                    Result("c" * 40, "Link Test", 1, 5, 1, "yts", "https://x.invalid/f.torrent")]
+    appe.on_key("e")
+    assert _meta == [(f"magnet:?xt=urn:btih:{'b' * 40}", _expdir)], _meta
+    assert appe.status.startswith("fetching .torrent"), appe.status
+    assert appe._exports["xgid"][:2] == ("b" * 40, "Meta Test"), appe._exports
+    # still fetching (raw status active): the row stays hidden and no error fires
+    _status["xgid"] = "active"
+    appe.update_downloads([type("_P", (), {"root": "xgid", "status": "metadata",
+                                           "name": "", "total": 0, "path": ""})()])
+    assert appe._exports and appe.downloads == [] and "couldn't fetch" not in appe.status, \
+        (appe._exports, appe.status)
+    # raw status flips complete -> rename <hash>.torrent to the item name
+    open(os.path.join(_expdir, "b" * 40 + ".torrent"), "w").close()  # what aria2 writes
+    _status["xgid"] = "complete"
+    appe.update_downloads([type("_Done", (), {"root": "xgid", "status": "metadata",
+                                              "name": "", "total": 0, "path": ""})()])
+    assert os.path.exists(os.path.join(_expdir, "Meta Test.torrent")), "renamed to item name"
+    assert not os.path.exists(os.path.join(_expdir, "b" * 40 + ".torrent")), "hash file replaced"
+    assert appe._exports == {} and appe.downloads == [] and _removed == ["xgid"], (appe._exports, _removed)
+    assert appe.status.startswith("saved Meta Test.torrent"), appe.status
+    # an errored fetch reports failure; a hung fetch times out
+    appe._exports["xerr"] = ("c" * 40, "E", _expdir, time.monotonic())
+    _status["xerr"] = "error"
+    appe.update_downloads([type("_F", (), {"root": "xerr", "status": "error",
+                                           "name": "", "total": 0, "path": ""})()])
+    assert "couldn't fetch .torrent metadata" == appe.status and _removed == ["xgid", "xerr"], \
+        (appe.status, _removed)
+    appe._exports["xhun"] = ("d" * 40, "H", _expdir, time.monotonic() - 61)
+    _status["xhun"] = "active"
+    appe.update_downloads([type("_T", (), {"root": "xhun", "status": "active",
+                                           "name": "", "total": 0, "path": ""})()])
+    assert appe.status.endswith("(timed out)") and "xhun" not in appe._exports, appe.status
+    appe.on_key("j"); appe.on_key("e")
+    assert len(_meta) == 1, "link source does not export"
+    assert "not a magnet" in appe.status, appe.status
+
+    # z toggles hide-dead: swarm-less sources always show, zero-seeder swarm sources hide
+    appz = App(eng=None)
+    appz.search = Search.__new__(Search)
+    appz.editing = False
+    appz.results = [Result("0" * 40, "Dead", 1, 0, 0, "yts", "magnet:?xt=0"),
+                    Result("1" * 40, "Unknown Health", 1, 0, 0, "fitgirl", "magnet:?xt=1")]
+    assert {r.info_hash for r in appz.visible_results()} == {"0" * 40, "1" * 40}
+    appz.on_key("z")
+    assert appz.hide_dead is True and {r.info_hash for r in appz.visible_results()} == {"1" * 40}, \
+        "hide-dead keeps swarm-less rows, drops dead swarm rows"
+    appz.on_key("z")
+    assert appz.hide_dead is False
+    assert seed_leech(appz.results[1], reports_health=False) == "—", "unknown health shows dash"
+    assert seed_leech(appz.results[0], reports_health=True) == "-", "dead swarm shows dash-minus"
 
     # s scans for resumables via the engine; metadata reveal gives a clear message
     class _ScanEng:
@@ -2324,15 +2753,25 @@ def selftest() -> None:
     assert appg.disabled_sources == set() and not appg.settings
     appg.on_key("g")
     assert appg.settings, "g opens settings"
-    # provider toggle (row 1) flips tmdb<->omdb and persists
+    # opening lands on the first selectable row (never a section header)
+    assert appg.setting_items()[appg.set_sel][0] == "dir", "g did not snap to first row"
+    # provider toggle flips tmdb<->omdb and persists
     assert appg.meta_provider == "tmdb"
-    appg.set_sel = 1
+    appg.set_sel = next(i for i, it in enumerate(appg.setting_items()) if it[0] == "provider")
     appg.on_key(" ")
     assert appg.meta_provider == "omdb" and saved_cfg["meta_provider"] == "omdb", saved_cfg
     appg.on_key(" ")
     assert appg.meta_provider == "tmdb", "provider toggles back"
-    # key entry (row 2) writes the active provider's key
-    appg.set_sel = 2
+    # theme toggle flips the global palette and persists
+    assert appg.theme == "violet"
+    appg.set_sel = next(i for i, it in enumerate(appg.setting_items()) if it[0] == "theme")
+    appg.on_key("enter")
+    assert appg.theme == "light" and saved_cfg["theme"] == "light" and T.ACCENT == "#6d4fc9", \
+        "theme toggle did not flip palette/persist"
+    appg.on_key(" ")
+    assert appg.theme == "violet" and T.ACCENT == "#a78bfa", "theme toggle back"
+    # key entry writes the active provider's key
+    appg.set_sel = next(i for i, it in enumerate(appg.setting_items()) if it[0] == "meta-key")
     appg.tmdb_key = None
     appg.on_key("enter")
     assert appg.edit_field == "key"
@@ -2340,16 +2779,23 @@ def selftest() -> None:
         appg.on_key(ch)
     appg.on_key("enter")
     assert appg.tmdb_key == "abc123" and saved_cfg["tmdb_key"] == "abc123", saved_cfg
-    # source toggle (row 3+)
-    appg.set_sel = 3
+    # source toggle
+    appg.set_sel = next(i for i, it in enumerate(appg.setting_items()) if it[0] == "source")
     sid = SOURCES[0].id
     appg.on_key(" ")
     assert sid in appg.disabled_sources and sid in saved_cfg["disabled_sources"], saved_cfg
     assert SOURCES[0] not in appg.enabled_sources()
     appg.on_key(" ")
     assert sid not in appg.disabled_sources, "toggle back on"
-    # download dir (row 0)
+    # navigation never lands on a section header
     appg.set_sel = 0
+    for _ in range(3 * len(appg.setting_items())):
+        appg.on_key("down")
+        assert appg.setting_items()[appg.set_sel][0] != "section", "down landed on a section"
+        appg.on_key("j")
+        assert appg.setting_items()[appg.set_sel][0] != "section", "j landed on a section"
+    # download dir
+    appg.set_sel = next(i for i, it in enumerate(appg.setting_items()) if it[0] == "dir")
     appg.on_key("enter")
     assert appg.edit_field == "dir"
     for ch in "/tmp/dl":
@@ -2437,7 +2883,7 @@ def selftest() -> None:
         assert edited_feed["id"] in aset.disabled_sources, "Space did not toggle configured feed"
         aset.on_key(" ")
         assert edited_feed["id"] not in aset.disabled_sources, "Space did not restore configured feed"
-        aset.set_sel = 3
+        aset.set_sel = next(i for i, it in enumerate(aset.setting_items()) if it[0] == "source")
         sid = SOURCES[0].id
         aset.on_key("enter")
         assert sid in aset.disabled_sources, "Enter did not toggle built-in source"
@@ -2561,7 +3007,8 @@ def selftest() -> None:
         frames += render(secret_app, 100, 30)
         secret_app.edit_field, secret_app.edit_buf = "feed-key", sentinel
         frames += render(secret_app, 100, 30)
-        secret_app.set_sel, secret_app.edit_field, secret_app.edit_buf = 2, "key", sentinel
+        key_row = next(i for i, item in enumerate(secret_app.setting_items()) if item[0] == "meta-key")
+        secret_app.set_sel, secret_app.edit_field, secret_app.edit_buf = key_row, "key", sentinel
         frames += render(secret_app, 100, 30)
         page = f"https://indexer.invalid/item?api_key={sentinel}&safe={sentinel}"
         secret_app.settings = False
@@ -2592,6 +3039,33 @@ def selftest() -> None:
         mask_frame = render(mask_app, 60, 20)
         assert all(dwidth(strip_ansi(line)) <= 60 for line in mask_frame), \
             "masked render exceeded requested width"
+
+        # Settings footer is context-sensitive — source rows never show feed-only actions.
+        faf = App(); faf.settings = True
+        faf.set_sel = next(i for i, it in enumerate(faf.setting_items()) if it[0] == "source")
+        src_ftr = strip_ansi(_footer(faf, 100))
+        assert "endpoint" not in src_ftr and "remove" not in src_ftr, \
+            f"source-row footer leaked feed keys: {src_ftr}"
+        faf.torznab_feeds = [feed]; faf._rebuild_sources()
+        faf.set_sel = next(i for i, item in enumerate(faf.setting_items()) if item[0] == "feed")
+        feed_ftr = strip_ansi(_footer(faf, 100))
+        assert "endpoint" in feed_ftr and "remove" in feed_ftr, \
+            f"feed-row footer missing feed keys: {feed_ftr}"
+
+        # Settings panel renders section headers, no repeated "Sources ·" prefix,
+        # and a header count; selected row stays on a selectable row.
+        sp = App(); sp.settings = True; sp.set_sel = len(sp.setting_items()) - 1
+        panel = "\n".join(strip_ansi(x) for x in _settings_panel(sp, 90, 60))
+        for head in ("GENERAL", "SOURCES", "TORZNAB FEEDS", "+ Add Torznab feed"):
+            assert head in panel, f"settings panel missing {head!r}"
+        assert "Theme" in panel and "Violet" in panel, "settings panel theme row missing"
+        assert panel.count("+ Add Torznab feed") == 1, "settings panel add-feed duplicated"
+        assert "Sources · " not in panel and "sources on" in panel, \
+            "settings panel kept the repeated prefix or lost its count"
+        assert sp.set_sel == len(sp.setting_items()) - 1, "panel render moved the selection"
+        sp.set_sel = next(i for i, it in enumerate(sp.setting_items()) if it[0] == "section")
+        _settings_panel(sp, 90, 60)
+        assert sp.setting_items()[sp.set_sel][0] != "section", "render left selection on a section"
     finally:
         for k, v in originals.items():
             gv[k] = v
@@ -2699,7 +3173,7 @@ def selftest() -> None:
     for ln in gf:
         assert dwidth(strip_ansi(ln)) <= 100, "settings overflow"
     joined = "\n".join(strip_ansi(x) for x in gf)
-    assert "Settings" in joined and "Sources" in joined and "FitGirl" in joined, "settings view"
+    assert "Settings" in joined and "SOURCES" in joined and "FitGirl" in joined, "settings view"
     app2.settings = False
     # details view renders, width-safe
     app2.view, app2.detail = "search", app2.results[0]
@@ -2708,6 +3182,27 @@ def selftest() -> None:
         assert dwidth(strip_ansi(ln)) <= 100, "details overflow"
     assert any("Details" in strip_ansi(x) for x in df) and any("Health" in strip_ansi(x) for x in df), "details view"
     app2.detail = None
+    # health bar uses block/track glyphs; seed column drops ":0" and tiers color
+    assert ":" in seed_leech(app2.results[0]) or seed_leech(app2.results[0]) != "0:0"
+    app2.view, app2.detail = "search", app2.results[0]
+    dh = "\n".join(strip_ansi(x) for x in render(app2, 100, 30))
+    assert "s · " in dh and (T.BLOCK in dh or T.TRACK in dh), "details health bar"
+    app2.detail = None
+    # rail: categories show glyph + per-category result counts on the results view
+    app2.view = "search"
+    rl = "\n".join(strip_ansi(x) for x in render(app2, 100, 30))
+    for glyph in CAT_GLYPH.values():
+        assert glyph in rl, f"rail glyph {glyph!r} missing"
+    assert f"  {len(app2.results)} " in rl, "rail 'all' count missing"
+    # help: scrollable, key column wide enough to avoid truncation
+    app2.help, app2.help_scroll = True, 0
+    hp = "\n".join(strip_ansi(x) for x in render(app2, 140, 60))  # tall enough for all groups
+    assert "enter / space" in hp and "on a feed row" in hp, "help keys truncated"
+    assert "Downloads" in hp and "ctrl-c" in hp, "help last groups not visible at tall size"
+    app2.on_key("down"); app2.on_key("down"); app2.on_key("down")
+    assert app2.help_scroll == 3, "help down did not scroll"
+    app2.on_key("x")
+    assert not app2.help, "help any-key close"
     # details shows info, provider-labeled, with a poster hint; cache is per-provider
     app2.meta_provider, app2.tmdb_key = "tmdb", "test-key"
     app2.meta[f"tmdb:movie:{app2.results[0].name}"] = Meta(

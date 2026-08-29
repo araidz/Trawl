@@ -128,6 +128,7 @@ class Source:
     fn: Callable[[str], list[Result]]
     browse: bool = True  # False = search-only (no empty-query latest feed)
     secrets: tuple[str, ...] = ()
+    reports_health: bool = True  # False = swarm counts never populated (RSS/library)
 
 
 @dataclass(frozen=True)
@@ -1059,7 +1060,7 @@ def _annas(query: str) -> list[Result]:
 # -- registry ----------------------------------------------------------------
 
 SOURCES: list[Source] = [
-    Source("fitgirl", "FitGirl", "Games", _fitgirl),
+    Source("fitgirl", "FitGirl", "Games", _fitgirl, reports_health=False),
     Source("yts", "YTS", "Movies", _yts),
     Source("tpb-movies", "TPB", "Movies", _tpb_movies),
     Source("x1337-movies", "1337x", "Movies", lambda q: _x1337(q, "Movies", "x1337-movies")),
@@ -1068,12 +1069,12 @@ SOURCES: list[Source] = [
     Source("tpb-tv", "TPB", "TV", _tpb_tv),
     Source("x1337-tv", "1337x", "TV", lambda q: _x1337(q, "TV", "x1337-tv")),
     Source("nyaa", "Nyaa", "Anime", _nyaa),
-    Source("subsplease", "SubsPlease", "Anime", _subsplease),
+    Source("subsplease", "SubsPlease", "Anime", _subsplease, reports_health=False),
     Source("animetosho", "AnimeTosho", "Anime", _animetosho),
     Source("tpb-books", "TPB", "Books", _tpb_books),
     Source("nyaa-books", "Nyaa", "Books", lambda q: _nyaa(q, "3_1", "nyaa-books")),
-    Source("libgen", "LibGen", "Books", _libgen, browse=False),
-    Source("annas", "Anna's", "Books", _annas, browse=False),
+    Source("libgen", "LibGen", "Books", _libgen, browse=False, reports_health=False),
+    Source("annas", "Anna's", "Books", _annas, browse=False, reports_health=False),
     Source("knaben", "Knaben", "Other", _knaben, browse=False),
     Source("torrentgalaxy", "TGx", "Other", _tgx, browse=False),
     Source("torrents-csv", "TorrCSV", "Other", _torrentscsv, browse=False),

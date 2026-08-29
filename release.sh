@@ -65,8 +65,6 @@ if [ -n "$remote_refs" ]; then
 fi
 
 if [ "$local_tag" = false ] && [ "$remote_tag" = false ]; then
-  [ "$(git cat-file -t refs/tags/v0.2.8)" = commit ] \
-    || { echo "v0.2.8 is not the expected lightweight tag" >&2; exit 1; }
   git tag "$tag"
   local_tag=true
 fi

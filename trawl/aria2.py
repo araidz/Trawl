@@ -209,6 +209,20 @@ class Aria2:
         self._uris[gid] = (magnet, options or {})
         return gid
 
+    def save_metadata(self, magnet: str, dir_path: str) -> str:
+        """Fetch a magnet's metadata only, writing <infohash>.torrent into
+        dir_path with no content download. Returns the root gid."""
+        opts = {"bt-metadata-only": "true", "bt-save-metadata": "true", "dir": dir_path}
+        return self.add(magnet, opts)
+
+    def status(self, root: str) -> str:
+        """Raw aria2 status of a tracked download ('' if it can't be queried)."""
+        try:
+            st = self._call("aria2.tellStatus", [self._resolve(root), ["status"]])
+            return st.get("status", "")
+        except Aria2Error:
+            return ""
+
     def remove(self, root: str) -> None:
         gid = self._resolved.get(root, root)
         for method in ("aria2.forceRemove", "aria2.removeDownloadResult"):

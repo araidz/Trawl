@@ -68,8 +68,14 @@ Trawl is a from-scratch Python TUI inspired by
   pause / resume / cancel / retry; pick individual files from multi-file
   torrents; reveal in Finder; a persistent *Recently downloaded* list.
 - **Inspect before grabbing** — a details view, open the torrent's page in your
-  browser, or copy its selected URI/link. Duplicate results retain source variants; use
-  `←` / `→` in details to cycle them.
+  browser, copy its selected URI/link, or save its `.torrent` file (`e`, metadata
+  only). Duplicate results retain source variants; use `←` / `→` in details to
+  cycle them.
+- **Folder download** — `D` grabs to a one-off folder (created on the fly,
+  remembered for next time) without changing the default download dir.
+- **Dead-torrent filter** — `z` hides zero-seeder results from sources that
+  report swarm counts; library/RSS sources with no swarm data (FitGirl,
+  SubsPlease, LibGen, Anna's) always show their health as `—`.
 - **Resume** — unfinished downloads resume automatically on the next launch;
   `s` additionally scans the download folder for stray partial `*.aria2` files.
 - **Quality of life** — persistent search history, completion notifications,
@@ -117,6 +123,9 @@ empty box to browse the latest, or paste a magnet or direct http(s) link to grab
 | `↑ ↓` | recall past searches / scroll results |
 | `Enter` | result details |
 | `d` | download selected |
+| `D` | download selected to a chosen folder (remembered for next time) |
+| `e` | save the selected torrent's `.torrent` file (metadata only, no download) |
+| `z` | hide/show dead torrents (zero-seeder rows from health-reporting sources) |
 | `o` | open the torrent's page in your browser |
 | `y` copy selected URI/link · `v` | grab a magnet or link from the clipboard |
 | `S` | cycle sort (seeders / size / newest) |
