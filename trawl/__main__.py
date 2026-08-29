@@ -19,6 +19,7 @@ from .tui import App, Terminal, paste_clipboard, render
 
 HELP = ("trawl — terminal torrent finder over aria2.\n"
         "  trawl               start (press s to resume partial downloads on disk)\n"
+        "  trawl <query>       start and search for a query\n"
         "  trawl <magnet|url>  start and grab a magnet or direct link")
 
 
@@ -32,8 +33,10 @@ def main(argv: list[str] | None = None) -> int:
         if a in ("-V", "--version"):
             print(f"trawl {__version__}")
             return 0
-        if parse_source(a):
+        if not initial and parse_source(a):
             initial = a
+        elif not initial:
+            initial = a  # a plain search query
     if not (sys.stdin.isatty() and sys.stdout.isatty()):
         print("trawl needs an interactive terminal.")
         return 1
@@ -55,6 +58,9 @@ def main(argv: list[str] | None = None) -> int:
             app._grab_source(pm)
             if not app.torrent_prompt:  # a .torrent link waits on the file/contents prompt
                 app.view, app.editing = "downloads", False
+        else:  # a plain query: seed and run the search
+            app.query = initial
+            app.submit()
     elif parse_magnet(paste_clipboard()):
         app.status = "magnet detected in clipboard — press v to grab it"
 

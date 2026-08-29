@@ -354,6 +354,9 @@ def render_bar(progress: float, width: int, tick: float, animate: bool,
 # -- key parsing -------------------------------------------------------------
 
 _ARROWS = {b"A": "up", b"B": "down", b"C": "right", b"D": "left"}
+_TILDE = {b"[5~": "pageup", b"[6~": "pagedown", b"[1~": "home", b"[4~": "end",
+          b"[7~": "home", b"[8~": "end"}
+_CTRL = {0x01: "ctrl-a", 0x05: "ctrl-e", 0x15: "ctrl-u", 0x17: "ctrl-w"}
 
 
 def parse_keys(data: bytes) -> list[str]:
@@ -374,8 +377,20 @@ def parse_keys(data: bytes) -> list[str]:
                     elif btn == 65:  # wheel down
                         keys.append("down")
                 i = j + 1
+            elif data[i:i + 6] == b"\x1b[200~":  # bracketed paste: wrap to close
+                j = data.find(b"\x1b[201~", i + 6)
+                if j < 0:
+                    j = n
+                keys.extend(c for c in data[i + 6:j].decode("utf-8", "ignore") if c >= " ")
+                i = n if j == n else j + 6
             elif i + 2 < n and data[i + 1] in (ord("["), ord("O")) and bytes([data[i + 2]]) in _ARROWS:
                 keys.append(_ARROWS[bytes([data[i + 2]])])
+                i += 3
+            elif data[i + 1:i + 4] in _TILDE:
+                keys.append(_TILDE[data[i + 1:i + 4]])
+                i += 4
+            elif data[i + 1:i + 3] in (b"[H", b"OH", b"[F", b"OF"):
+                keys.append("home" if data[i + 1:i + 3] in (b"[H", b"OH") else "end")
                 i += 3
             else:
                 keys.append("esc")
@@ -391,6 +406,9 @@ def parse_keys(data: bytes) -> list[str]:
             i += 1
         elif b == 0x03:
             keys.append("ctrl-c")
+            i += 1
+        elif b in _CTRL:
+            keys.append(_CTRL[b])
             i += 1
         elif b < 0x20:
             i += 1
@@ -417,15 +435,15 @@ class Terminal:
         self._reset_frame()
         self.saved = termios.tcgetattr(self.fd)
         tty.setraw(self.fd)
-        # alt-screen + clear + SGR mouse reporting; trawl owns the whole tab
-        sys.stdout.write("\x1b[?1049h\x1b[3J\x1b[2J\x1b[H\x1b[?25l\x1b[?1000h\x1b[?1006h")
+        # alt-screen + clear + SGR mouse + bracketed paste; trawl owns the whole tab
+        sys.stdout.write("\x1b[?1049h\x1b[3J\x1b[2J\x1b[H\x1b[?25l\x1b[?1000h\x1b[?1006h\x1b[?2004h")
         sys.stdout.flush()
 
     def _reset_frame(self) -> None:
         self._lines = self._size = None
 
     def leave(self) -> None:
-        sys.stdout.write("\x1b[?1000l\x1b[?1006l\x1b[?25h\x1b[?1049l")
+        sys.stdout.write("\x1b[?1000l\x1b[?1006l\x1b[?2004l\x1b[?25h\x1b[?1049l")
         sys.stdout.flush()
         if self.saved:
             termios.tcsetattr(self.fd, termios.TCSADRAIN, self.saved)
@@ -924,6 +942,8 @@ class App:
                 self.status = ""
             elif k == "backspace":
                 self.edit_buf = self.edit_buf[:-1]
+            elif k == "ctrl-u":
+                self.edit_buf = ""
             elif len(k) == 1 and k >= " ":
                 self.edit_buf += k
             return
@@ -933,10 +953,16 @@ class App:
                 self.status = ""
             else:
                 self.settings = False
-        elif k == "up" or (k == "k" and self._selected_setting()[0] != "feed"):
-            self._move_setting(-1)
-        elif k in ("down", "j"):
-            self._move_setting(1)
+        elif k in ("up", "pageup") or (k == "k" and self._selected_setting()[0] != "feed"):
+            for _ in range(8 if k == "pageup" else 1):
+                self._move_setting(-1)
+        elif k in ("down", "j", "pagedown"):
+            for _ in range(8 if k == "pagedown" else 1):
+                self._move_setting(1)
+        elif k in ("home", "end"):
+            items = self.setting_items()
+            self.set_sel = 0 if k == "home" else len(items) - 1
+            self._snap_setting(self.set_sel)
         else:
             kind, value = self._selected_setting()
             if k == "a" or (k == "enter" and kind == "add-feed"):
@@ -1029,10 +1055,12 @@ class App:
         n = len(self.picker_files)
         if k in ("esc", "q", "f"):
             self.picker = None
-        elif k in ("up", "k"):
-            self.picker_sel = (self.picker_sel - 1) % n
-        elif k in ("down", "j"):
-            self.picker_sel = (self.picker_sel + 1) % n
+        elif k in ("up", "k", "pageup"):
+            self.picker_sel = (self.picker_sel - (8 if k == "pageup" else 1)) % n
+        elif k in ("down", "j", "pagedown"):
+            self.picker_sel = (self.picker_sel + (8 if k == "pagedown" else 1)) % n
+        elif k in ("home", "end"):
+            self.picker_sel = 0 if k == "home" else n - 1
         elif k == " ":
             f = self.picker_files[self.picker_sel]
             idx, length = f["index"], int(f.get("length") or 0)
@@ -1239,6 +1267,8 @@ class App:
                 self.folder_prompt = None
             elif k == "backspace":
                 self.folder_buf = self.folder_buf[:-1]
+            elif k == "ctrl-u":
+                self.folder_buf = ""
             elif len(k) == 1 and k >= " ":
                 self.folder_buf += k
             return
@@ -1288,10 +1318,19 @@ class App:
                     self.query = self.query[:self.cursor - 1] + self.query[self.cursor:]
                     self.cursor -= 1
                 self.hist_idx = len(self.history)
-            elif k == "left":
-                self.cursor = max(0, self.cursor - 1)
-            elif k == "right":
-                self.cursor = min(len(self.query), self.cursor + 1)
+            elif k in ("left", "home", "ctrl-a"):
+                self.cursor = 0 if k in ("home", "ctrl-a") else max(0, self.cursor - 1)
+            elif k in ("right", "end", "ctrl-e"):
+                self.cursor = len(self.query) if k in ("end", "ctrl-e") else min(len(self.query), self.cursor + 1)
+            elif k == "ctrl-u":  # kill to start
+                self.query = self.query[self.cursor:]
+                self.cursor = 0
+            elif k == "ctrl-w":  # kill word behind the caret
+                head = self.query[:self.cursor].rstrip(" ")
+                cut = head.rfind(" ")
+                keep = cut + 1 if cut >= 0 else 0
+                self.query = self.query[:keep] + self.query[self.cursor:]
+                self.cursor = keep
             elif k == "tab":
                 self.view, self.editing = "downloads", False
             elif k == "up":
@@ -1348,6 +1387,17 @@ class App:
             self._move(-1)
         elif k in ("down", "j"):
             self._move(1)
+        elif k == "pageup":
+            self._move(-8)
+        elif k == "pagedown":
+            self._move(8)
+        elif k in ("home", "end"):
+            last = (len(self.downloads) - 1 if self.view == "downloads"
+                    else len(self.visible_results()) - 1)
+            if self.view == "downloads":
+                self.dsel = 0 if k == "home" else max(0, last)
+            else:
+                self.sel = 0 if k == "home" else max(0, last)
         elif self.view == "search":
             if k == "left":
                 self._cycle_cat(-1)
@@ -2296,6 +2346,13 @@ def selftest() -> None:
     assert parse_keys(b"\x1b[<65;10;5M") == ["down"], "wheel down"
     assert parse_keys(b"\x1b[<0;1;1M") == [], "click ignored, sequence consumed"
     assert parse_keys(b"a\x1b[<64;1;1Mb") == ["a", "up", "b"], "mouse mid-stream"
+    assert parse_keys(b"\x1b[5~\x1b[6~") == ["pageup", "pagedown"], "page keys"
+    assert parse_keys(b"\x1b[H\x1b[F\x1b[1~\x1b[4~\x1b[7~\x1b[8~") == \
+        ["home", "end", "home", "end", "home", "end"], "home/end variants"
+    assert parse_keys(b"\x01\x05\x15\x17") == ["ctrl-a", "ctrl-e", "ctrl-u", "ctrl-w"]
+    assert parse_keys("café".encode() + b"\x1b[200~paste me\x1b[201~") == \
+        ["c", "a", "f", "é", "p", "a", "s", "t", "e", " ", "m", "e"], "bracketed paste"
+    assert parse_keys(b"\x1b[200~a\x03b\x1b[201~") == ["a", "b"], "paste drops control chars"
     print("primitives ok")
 
     # interaction: edit -> type -> submit -> nav -> tab -> downloads
@@ -2323,6 +2380,31 @@ def selftest() -> None:
     assert app.cursor == 0, app.cursor  # clamps at start
     app.on_key("right")
     assert app.cursor == 1, app.cursor
+    # editor movement keys: home/end, ctrl-a/e/u/w
+    app.on_key("end")
+    assert app.cursor == 5, app.cursor
+    app.on_key("home")
+    assert app.cursor == 0, app.cursor
+    app.on_key("ctrl-e")
+    assert app.cursor == 5, app.cursor
+    app.on_key("ctrl-a")
+    app.on_key("ctrl-w")  # no word before the caret -> nothing to kill
+    assert app.query == "matri" and app.cursor == 0, (app.query, app.cursor)
+    app.on_key("ctrl-e")
+    app.on_key("ctrl-w")  # kills the whole word
+    assert app.query == "" and app.cursor == 0, (app.query, app.cursor)
+    for ch in "foo bar baz":
+        app.on_key(ch)
+    assert app.query == "foo bar baz" and app.cursor == 11, (app.query, app.cursor)
+    app.on_key("ctrl-a")
+    for _ in range(4):
+        app.on_key("right")  # caret after "foo "
+    app.on_key("ctrl-w")  # kills "foo " including the gap
+    assert app.query == "bar baz" and app.cursor == 0, (app.query, app.cursor)
+    app.on_key("end")
+    app.on_key("ctrl-u")  # kill to start
+    assert app.query == "", app.query
+    app.query, app.cursor = "matri", 5  # restore for the nav checks below
     app.search = Search.__new__(Search)  # simulate a completed search -> browse nav
     app.search_done = app.search_total
     app.results = [
@@ -2330,6 +2412,14 @@ def selftest() -> None:
         Result("b" * 40, "The Matrix Reloaded", 2_000_000_000, 0, 0, "fitgirl", "magnet:?xt=m"),
     ]
     app.editing = False
+    app.on_key("down")
+    assert app.sel == 1, app.sel
+    app.on_key("pageup")  # paged nav clamps to the top
+    assert app.sel == 0, app.sel
+    app.on_key("end")
+    assert app.sel == 1, app.sel
+    app.on_key("home")
+    assert app.sel == 0, app.sel
     app.on_key("down")
     assert app.sel == 1, app.sel
     grabbed = {}
