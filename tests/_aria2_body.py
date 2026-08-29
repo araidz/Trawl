@@ -15,35 +15,42 @@ live = to_download({"gid": "b", "status": "active", "totalLength": "100",
 assert live.progress == 0.5 and live.eta == 5.0 and live.peers == 7, live
 assert _follow({"status": "complete", "followedBy": ["z"]}) == "z"
 assert _follow({"status": "active", "followedBy": ["z"]}) is None
-# poll reuses the status fetched while resolving: one steady call, root+child on handoff
+# poll batches via system.multicall: one steady call, root+child on handoff
 mock = Aria2(conf=None)
 mock.roots = ["root"]
 mock._resolved = {"root": "root"}
 calls = []
-steady = {"gid": "root", "status": "active", "totalLength": "1",
-          "completedLength": "0", "files": []}
-mock._call = lambda method, params=None: calls.append((method, params)) or steady  # type: ignore[method-assign]
+steady = [{"gid": "root", "status": "active", "totalLength": "1",
+           "completedLength": "0", "files": []}]
+mock._call = lambda method, params=None, **k: calls.append((method, params)) or steady  # type: ignore[method-assign]
 rows = mock.poll()
-assert len(calls) == 1 and calls[0][0] == "aria2.tellStatus", calls
+assert len(calls) == 1 and calls[0][0] == "system.multicall", calls
+assert len(calls[0][1][0]) == 1, "one batched tellStatus per root"
+assert calls[0][1][0][0]["methodName"] == "aria2.tellStatus"
 assert rows[0].gid == "root" and rows[0].root == "root"
 calls.clear()
-statuses = {
-    "root": {"gid": "root", "status": "complete", "followedBy": ["child"], "files": []},
-    "child": {"gid": "child", "status": "active", "totalLength": "10",
-              "completedLength": "2", "files": [{"path": "/x/movie"}]},
-}
-mock._call = lambda method, params=None: calls.append((method, params)) or statuses[params[0]]  # type: ignore[method-assign,index]
+def _batched_gid(params):
+    return params[0][0]["params"][1]  # token, gid, fields
+def batched(method, params=None, statuses=None, **k):
+    calls.append((method, params))
+    return [statuses[_batched_gid(params)]]
+mock._call = lambda method, params=None, statuses={"root": {"gid": "root", "status": "complete",
+        "followedBy": ["child"], "files": []}, "child": {"gid": "child", "status": "active",
+        "totalLength": "10", "completedLength": "2", "files": [{"path": "/x/movie"}]}}, **k: \
+    batched(method, params, statuses, **k)  # type: ignore[method-assign]
 rows = mock.poll()
-assert [c[1][0] for c in calls] == ["root", "child"], calls
+assert [_batched_gid(c[1]) for c in calls] == ["root", "child"], calls
 assert rows[0].gid == "child" and rows[0].root == "root" and mock._resolved["root"] == "child", rows[0]
 # A vanished/erroring metadata child is skipped, while file APIs follow a
 # successful metadata handoff before asking for the child file list.
 missing = Aria2(conf=None)
 missing.roots = ["root"]
 missing._resolved = {"root": "root"}
-def missing_call(method, params=None):
-    if params[0] == "root":
-        return {"gid": "root", "status": "complete", "followedBy": ["gone"]}
+def missing_call(method, params=None, **k):
+    gid = _batched_gid(params)
+    if gid == "root":
+        return [{"gid": "root", "status": "complete",
+                 "followedBy": ["gone"], "files": []}]
     raise Aria2Error("missing child")
 missing._call = missing_call  # type: ignore[method-assign]
 assert missing.poll() == [], "missing metadata child should not escape poll"
@@ -58,11 +65,13 @@ assert broken_root.poll() == [] and broken_root._resolved["root"] == "root"
 failed = Aria2(conf=None)
 failed.roots = ["root"]
 failed._resolved = {"root": "root"}
-failed._call = lambda method, params=None: {  # type: ignore[method-assign]
-    "gid": "child", "status": "error", "errorMessage": "disk full", "files": []
-} if params[0] == "child" else {
-    "gid": "root", "status": "complete", "followedBy": ["child"]
-}
+def failed_call(method, params=None, **k):
+    gid = _batched_gid(params)
+    st = {"gid": "child", "status": "error", "errorMessage": "disk full", "files": []} \
+        if gid == "child" else {"gid": "root", "status": "complete",
+                                "followedBy": ["child"], "files": []}
+    return [st]
+failed._call = failed_call  # type: ignore[method-assign]
 failed_row = failed.poll()[0]
 assert failed_row.gid == "child" and failed_row.root == "root"
 assert failed_row.status == "error" and failed_row.error == "disk full"

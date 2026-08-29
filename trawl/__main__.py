@@ -71,11 +71,14 @@ def main(argv: list[str] | None = None) -> int:
     try:
         while app.running:
             cols, rows = term.size()
-            for k in term.read_keys(0.04 if app.animating(rows) else 0.2):
+            dirty = bool(keys := term.read_keys(0.04 if app.animating(rows) else 0.2))
+            for k in keys:
                 app.on_key(k)
+                dirty = True  # also covers keys that open/close views without state change
             if not app.running:
                 break
-            app.drain_search()
+            if app.drain_search():
+                dirty = True
             now = time.monotonic()
             if now - last_poll > 0.5:
                 try:
@@ -86,8 +89,12 @@ def main(argv: list[str] | None = None) -> int:
                 except Aria2Error:
                     pass
                 last_poll = now
-            cols, rows = term.size()
-            term.write(render(app, cols, rows), (cols, rows))
+                dirty = True
+            if app.animating(rows):
+                dirty = True  # the sheen needs the animation frame rate
+            if dirty or term.size() != (cols, rows):
+                cols, rows = term.size()
+                term.write(render(app, cols, rows), (cols, rows))
     except KeyboardInterrupt:
         pass
     finally:

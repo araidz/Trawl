@@ -300,12 +300,49 @@ class Aria2:
         return have
 
     def poll(self) -> list[Download]:
-        """Current state of every tracked download, metadata->real gid resolved."""
-        out: list[Download] = []
-        for root in list(self.roots):
+        """Current state of every tracked download, batched: one
+        system.multicall per metadata-handoff round instead of one RPC per
+        download. Per-call errors drop that row for the tick, like before."""
+        roots = list(self.roots)
+        if not roots:
+            return []
+        fields = ["gid", "status", "totalLength", "completedLength", "downloadSpeed",
+                  "connections", "errorMessage", "files", "bittorrent", "followedBy"]
+        statuses: dict[str, dict] = {}
+        proposed: dict[str, str] = {}  # advances committed only on a terminal status
+        pending = roots
+        for _ in range(8):  # ponytail: cap the walk; a magnet is one hop
             try:
-                st, _ = self._resolved_status(root)
+                results = self._call("system.multicall", [[
+                    {"methodName": "aria2.tellStatus",
+                     "params": [f"token:{self.secret}",
+                                proposed.get(r, self._resolved.get(r, r)), fields]}
+                    for r in pending]], token=False) or []
             except Aria2Error:
+                break  # no terminal status -> no commits, last valid gids stand
+            next_pending = []
+            for root, res in zip(pending, results):
+                if isinstance(res, list) and len(res) == 1:
+                    res = res[0]  # aria2 wraps each success in a one-element list
+                st = res if isinstance(res, dict) and "code" not in res else None
+                if st is None:
+                    continue  # per-call error: row dropped this tick
+                nxt = _follow(st)
+                if nxt is not None:
+                    proposed[root] = nxt
+                    next_pending.append(root)
+                else:
+                    statuses[root] = st
+            pending = next_pending
+            if not pending:
+                break
+        for root, gid in proposed.items():
+            if root in statuses:
+                self._resolved[root] = gid
+        out = []
+        for root in roots:
+            st = statuses.get(root)
+            if st is None:
                 continue
             d = to_download(st)
             d.root = root
@@ -360,12 +397,13 @@ class Aria2:
         self._resolved[root] = gid
         return st, gid
 
-    def _call(self, method: str, params: list | None = None):
+    def _call(self, method: str, params: list | None = None, *, token: bool = True):
+        # system.multicall carries no outer token: each inner struct embeds its own.
         payload = {
             "jsonrpc": "2.0",
             "id": "trawl",
             "method": method,
-            "params": [f"token:{self.secret}", *(params or [])],
+            "params": ([f"token:{self.secret}"] if token else []) + (params or []),
         }
         req = urllib.request.Request(
             self.endpoint,

@@ -1074,9 +1074,11 @@ class App:
                            else "couldn't set file selection")
             self.picker = None
 
-    def drain_search(self) -> None:
+    def drain_search(self) -> bool:
+        """Drain finished source updates into the result list. True if the
+        search state changed (caller may then skip a redundant render)."""
         if not self.search:
-            return
+            return False
         changed = False
         selected = self._cur()
         selected_id = ((result_identity(selected) or (selected.name, selected.magnet))
@@ -1104,6 +1106,7 @@ class App:
                              if (result_identity(r) or (r.name, r.magnet)) == selected_id), None)
             self.sel = (restored if restored is not None
                         else min(self.sel, max(0, len(visible) - 1)))
+        return changed
 
     def retry_failed_sources(self) -> None:
         if not self.search or not self.errors:
@@ -2181,13 +2184,18 @@ def _main_heights(rows: int) -> tuple[int, int]:
     return body_h, body_h - 4
 
 
+@lru_cache(maxsize=8)
+def _secret_re(forms: tuple[str, ...]) -> re.Pattern:
+    return re.compile("|".join(map(re.escape, sorted(forms, key=len, reverse=True))), re.I)
+
+
 def _redact_frame(lines: list[str], app: App) -> list[str]:
     candidates = {form for secret in app._all_secrets() for form in
                   (secret, urllib.parse.quote(secret, safe=""), urllib.parse.quote_plus(secret))
                   if form}
     if not candidates:
         return lines
-    secrets = re.compile("|".join(map(re.escape, sorted(candidates, key=len, reverse=True))), re.I)
+    secrets = _secret_re(tuple(sorted(candidates)))
 
     def redact_plain(text: str) -> str:
         return secrets.sub(lambda m: "*" * (dwidth(m.group()) or 3), text)
