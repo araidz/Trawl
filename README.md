@@ -77,10 +77,12 @@ Trawl is a from-scratch Python TUI inspired by
   report swarm counts; library/RSS sources with no swarm data (FitGirl,
   SubsPlease, LibGen, Anna's) always show their health as `—`.
 - **Resume** — unfinished downloads resume automatically on the next launch;
-  `s` additionally scans the download folder for stray partial `*.aria2` files.
+  `s` additionally scans the download folder for stray partial `*.aria2` files
+  (torrents and remembered direct-http grabs).
 - **Quality of life** — persistent search history, completion notifications,
-  clipboard magnet auto-detect, mouse-wheel scrolling, a settings overlay
-  (toggle sources, set the download dir), and confirm-on-quit.
+  clipboard magnet auto-detect (new magnets/links are offered as they appear),
+  mouse-wheel scrolling, a settings overlay (toggle sources, set the download
+  dir and an optional speed cap), and confirm-on-quit.
 - **Single file** — ships as one stdlib zipapp executable on your `PATH`.
 
 ## Requirements
@@ -114,13 +116,15 @@ Needs `aria2` (`brew install aria2`). Or run without building: `python3 -m trawl
 
 Trawl opens to a search bar. Type and press Enter to search, press Enter on an
 empty box to browse the latest, or paste a magnet or direct http(s) link to grab it.
+You can also start straight into a search: `trawl oppenheimer`.
 
 **Search**
 
 | Key | Action |
 | --- | --- |
 | type · `Enter` | search (paste a magnet or link to grab) |
-| `↑ ↓` | recall past searches / scroll results |
+| `↑ ↓` | recall past searches · `PgUp/PgDn` page · `Home/End` jump |
+| `Ctrl-A/E` caret · `Ctrl-U/W` kill · `Esc` exit the box | edit the query |
 | `Enter` | result details |
 | `d` | download selected |
 | `D` | download selected to a chosen folder (remembered for next time) |
@@ -130,15 +134,16 @@ empty box to browse the latest, or paste a magnet or direct http(s) link to grab
 | `y` copy selected URI/link · `v` | grab a magnet or link from the clipboard |
 | `S` | cycle sort (seeders / size / newest) |
 | `r` | retry failed sources, preserving successful results |
+| `E` | show which sources failed and why |
 | `← →` filter category · `c` | clear results |
-| `s` | resume partial downloads found on disk |
+| `s` | resume partial downloads found on disk (torrents and direct links) |
 | `g` settings · `?` keys · `q` | quit |
 
 **Downloads** (`Tab` to switch)
 
 | Key | Action |
 | --- | --- |
-| `↑ ↓` | move / scroll |
+| `↑ ↓` | move / scroll · `PgUp/PgDn` page · `Home/End` jump |
 | `p` | pause / resume · `x` cancel (asks: delete files or keep) |
 | `r` | retry a failed download |
 | `f` | choose which files to download (season packs) |
@@ -162,7 +167,7 @@ the search carries on without it.
 ### Torznab feeds
 
 In settings (`g`), press `a` and paste a Torznab endpoint URL. You may also
-enter a separate API key with `k`; a separate key overrides an `apikey` already
+enter a separate API key with `K`; a separate key overrides an `apikey` already
 present in the endpoint URL. User feeds are search-only: Trawl does not request
 capabilities and currently provides neither browse-latest nor pagination for
 them. Feed availability and contents depend on the endpoint.
@@ -185,7 +190,7 @@ uses a private session file so it never touches your own aria2 state.
 
 State lives in `~/Library/Application Support/Trawl/`:
 `history.txt` (searches), `downloads.jsonl` (completed), `config.json` (settings),
-`aria2-session.txt` (private session).
+`pending.jsonl` (direct-link grabs, for resuming), `aria2-session.txt` (private session).
 
 Torznab endpoint keys are masked in the UI and errors, as are metadata keys.
 They are stored as plaintext in `config.json`, so protect that file like any
