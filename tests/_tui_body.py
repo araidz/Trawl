@@ -339,14 +339,42 @@ assert seed_leech(appz.results[1], reports_health=False) == "—", "unknown heal
 assert seed_leech(appz.results[0], reports_health=True) == "-", "dead swarm shows dash-minus"
 
 # s scans for resumables via the engine; metadata reveal gives a clear message
+from pathlib import Path
 class _ScanEng:
     def download_dir(self): return "/no-such-dir-xyz"
     def active_infohashes(self): return set()
+    def active_uris(self): return set()
+    def add(self, uri, options=None): raise AssertionError("nothing should be re-added")
 
+globals()["PENDING_FILE"] = Path(_tf.mkdtemp()) / "pending.jsonl"
 apps = App(eng=_ScanEng())
 apps.view = "downloads"
 apps.on_key("s")
 assert apps.status == "nothing to resume on disk", apps.status
+# direct-http resume: pending.jsonl re-adds, dedupes in-flight uris, clears
+pend = Path(tempfile.mkdtemp()) / "pending.jsonl"
+pend.write_text(json.dumps({"uri": "https://x.invalid/book.epub", "dir": "/dl"}) + "\n")
+added = []
+class _PendEng:
+    def download_dir(self): return None
+    def active_infohashes(self): return set()
+    def active_uris(self): return set()
+    def add(self, uri, options=None): added.append((uri, options))
+globals()["PENDING_FILE"] = pend
+appp = App(eng=_PendEng())
+assert appp.scan_resume() == 1 and added == [("https://x.invalid/book.epub", {"dir": "/dl"})], added
+assert not pend.exists(), "pending file cleared after a scan"
+pend2 = Path(tempfile.mkdtemp()) / "pending.jsonl"
+pend2.write_text(json.dumps({"uri": "https://x.invalid/live.iso", "dir": None}) + "\n")
+class _LiveEng:
+    def download_dir(self): return None
+    def active_infohashes(self): return set()
+    def active_uris(self): return {"https://x.invalid/live.iso"}
+    def add(self, uri, options=None): raise AssertionError("in-flight uri re-added")
+globals()["PENDING_FILE"] = pend2
+appq = App(eng=_LiveEng())
+assert appq.scan_resume() == 0, "in-flight uri skipped"
+assert not pend2.exists(), "pending cleared even with nothing to re-add"
 apps.downloads = [Download("g", "m", "metadata", 0, 0, 0, 0, None, root="r", path="")]
 apps.dsel = 0
 apps.on_key("o")
@@ -544,6 +572,26 @@ gp["paste_clipboard"] = lambda: "not a magnet or link"
 appv.on_key("v")
 assert appv.status == "no magnet or link in clipboard", appv.status
 gp["paste_clipboard"] = orig_paste
+# clipboard watcher (check_clipboard) offers v once per new grabbable clipboard
+def _clip_seq():
+    _clip_seq.n = getattr(_clip_seq, "n", 0) + 1
+    return ["", "magnet:?xt=urn:btih:" + "a" * 40, "magnet:?xt=urn:btih:" + "a" * 40][min(_clip_seq.n - 1, 2)]
+gp["paste_clipboard"] = _clip_seq
+appw = App(eng=None)
+appw.editing = False
+appw.clipboard_seen = ""
+appw.check_clipboard()
+assert appw.status == "", "empty clipboard offers nothing"
+appw.check_clipboard()
+assert "press v" in appw.status, appw.status
+appw.status = ""
+appw.check_clipboard()
+assert appw.status == "", "same clipboard is not re-offered"
+appw.editing = True
+appw.clipboard_seen = ""
+appw.check_clipboard()
+assert appw.status == "", "no offer while editing"
+gp["paste_clipboard"] = orig_paste
 # .torrent link: submit opens the file-vs-contents prompt (no immediate grab);
 # t = contents (follow-torrent), f = the .torrent file; a plain link grabs directly.
 appt = App(eng=None)
@@ -621,6 +669,23 @@ for ch in "/tmp/dl":
     appg.on_key(ch)
 appg.on_key("enter")
 assert appg.download_dir == "/tmp/dl" and saved_cfg["download_dir"] == "/tmp/dl", saved_cfg
+# speed limit row: edit, validate, persist a cap, then clear it
+appg.set_sel = next(i for i, it in enumerate(appg.setting_items()) if it[0] == "limit")
+appg.on_key("enter")
+assert appg.edit_field == "limit"
+for ch in "2M":
+    appg.on_key(ch)
+appg.on_key("enter")
+assert appg.speed_limit == "2M" and saved_cfg["speed_limit"] == "2M", saved_cfg
+appg.on_key("enter")
+appg.edit_buf = "abc"
+appg.on_key("enter")
+assert appg.speed_limit == "2M" and "limit" in appg.status, (appg.speed_limit, appg.status)
+appg.on_key("esc")
+appg.on_key("enter")  # reopen, clear, commit -> unlimited
+appg.on_key("ctrl-u")
+appg.on_key("enter")
+assert appg.speed_limit is None, appg.speed_limit
 appg.on_key("g")
 assert not appg.settings, "g closes settings"
 gc["load_config"], gc["save_config"] = o_load_cfg, o_save_cfg

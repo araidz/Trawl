@@ -52,6 +52,9 @@ def main(argv: list[str] | None = None) -> int:
     app = App(eng)
     if app.download_dir:
         eng.set_dir(app.download_dir)
+    if app.speed_limit:
+        eng.set_limit(app.speed_limit)
+    app.clipboard_seen = paste_clipboard()
     if initial:
         pm = parse_source(initial)
         if pm:
@@ -61,7 +64,7 @@ def main(argv: list[str] | None = None) -> int:
         else:  # a plain query: seed and run the search
             app.query = initial
             app.submit()
-    elif parse_magnet(paste_clipboard()):
+    elif parse_magnet(app.clipboard_seen):
         app.status = "magnet detected in clipboard — press v to grab it"
 
     term = Terminal()
@@ -91,6 +94,7 @@ def main(argv: list[str] | None = None) -> int:
                     pass
                 last_poll = now
                 dirty = True
+                app.check_clipboard()
             if app.animating(rows):
                 dirty = True  # the sheen needs the animation frame rate
             if dirty or term.size() != (cols, rows):

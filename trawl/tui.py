@@ -61,6 +61,7 @@ def save_history(hist: list[str]) -> None:
     except OSError:
         pass
 
+PENDING_FILE = STATE_DIR / "pending.jsonl"  # direct-http grabs, for scan_resume
 DL_HIST_FILE = STATE_DIR / "downloads.jsonl"
 DL_HIST_MAX = 100
 CONFIG_FILE = STATE_DIR / "config.json"
@@ -550,6 +551,8 @@ class App:
         self._rebuild_sources()
         self.disabled_sources: set[str] = set(cfg.get("disabled_sources", []))
         self.download_dir: str | None = cfg.get("download_dir")
+        self.speed_limit: str | None = cfg.get("speed_limit")  # e.g. "2M"; None = unlimited
+        self.clipboard_seen = ""  # last clipboard content offered for v
         self.dl_history: list[dict] = load_dl_history()  # completed downloads, oldest->newest
         self.settings = False  # settings overlay open
         self.set_sel = 0  # settings selection (never a 'section' row)
@@ -775,9 +778,23 @@ class App:
             return
         try:
             self.eng.add(magnet, {"dir": dir_} if dir_ else None)
+            uri = magnet if magnet.lower().startswith(("http://", "https://")) else ""
+            self._record_pending(uri, dir_)  # http links: remembered for scan_resume
             self.status = redact(f"grabbing: {clean(name)[:48]}", secrets)
         except Aria2Error as e:
             self.status = redact(f"error: {e}", secrets)
+
+    def _record_pending(self, uri: str, dir_: str | None) -> None:
+        """Stash direct-http grabs so scan_resume can re-add unfinished ones
+        (.aria2 control files only carry BT infohashes)."""
+        if not uri:
+            return
+        try:
+            STATE_DIR.mkdir(parents=True, exist_ok=True)
+            with PENDING_FILE.open("a") as f:
+                f.write(json.dumps({"uri": uri, "dir": dir_}) + "\n")
+        except OSError:
+            pass
 
     def _start_folder_prompt(self, uri: str, name: str) -> None:
         self.folder_prompt = (uri, name)
@@ -841,6 +858,8 @@ class App:
             return
         try:
             self.eng.add(url, {"follow-torrent": "mem" if contents else "false"})
+            if url.lower().startswith(("http://", "https://")):
+                self._record_pending(url, None)
             self.status = redact(f"grabbing torrent: {clean(name)[:40]}" if contents
                                  else f"downloading .torrent file: {clean(name)[:40]}", secrets)
             self.view = "downloads"
@@ -860,30 +879,72 @@ class App:
         self.dsel = max(0, self.dsel - 1)
 
     def scan_resume(self) -> int:
-        """Re-add incomplete BT downloads (*.aria2 control files) found in the
-        download dir that aria2 isn't already running."""
+        """Re-add incomplete downloads found on disk that aria2 isn't already
+        running: BT via *.aria2 control files (infohash), direct-http via the
+        remembered pending.jsonl."""
         if not self.eng:
             return 0
-        dir_path = self.eng.download_dir()
-        if not dir_path or not os.path.isdir(dir_path):
-            return 0
-        have = self.eng.active_infohashes()
+        have = self.eng.active_infohashes() | self.eng.active_uris()
         n = 0
-        for ctrl in glob.glob(os.path.join(dir_path, "*.aria2")):
-            ih = control_infohash(ctrl)
-            if not ih or ih in have:
+        dir_path = self.eng.download_dir()
+        if dir_path and os.path.isdir(dir_path):
+            for ctrl in glob.glob(os.path.join(dir_path, "*.aria2")):
+                ih = control_infohash(ctrl)
+                if not ih or ih in have:
+                    continue
+                try:
+                    self.eng.add(build_magnet(ih, os.path.basename(ctrl)[:-7]), {"dir": dir_path})
+                    have.add(ih)
+                    n += 1
+                except Aria2Error:
+                    pass
+        pending = self._load_pending()
+        for rec in pending:
+            uri = rec.get("uri", "")
+            if not uri or uri in have:
                 continue
+            opts = {"dir": rec["dir"]} if rec.get("dir") else None
             try:
-                self.eng.add(build_magnet(ih, os.path.basename(ctrl)[:-7]), {"dir": dir_path})
-                have.add(ih)
+                self.eng.add(uri, opts)
+                have.add(uri)
                 n += 1
             except Aria2Error:
                 pass
+        if pending:
+            self._clear_pending()
         return n
+
+    def _load_pending(self) -> list[dict]:
+        out: list[dict] = []
+        try:
+            for ln in PENDING_FILE.read_text().splitlines():
+                try:
+                    rec = json.loads(ln)
+                    if isinstance(rec, dict) and rec.get("uri"):
+                        out.append(rec)
+                except ValueError:
+                    pass
+        except OSError:
+            pass
+        return out
+
+    def _clear_pending(self) -> None:
+        try:
+            PENDING_FILE.unlink()
+        except OSError:
+            pass
+
+    def check_clipboard(self) -> None:
+        """If a grabbable magnet/link appears on the clipboard, offer v once."""
+        clip = paste_clipboard()
+        if clip and clip != self.clipboard_seen and parse_source(clip) and not self.editing:
+            self.clipboard_seen = clip
+            self.status = "magnet or link detected in clipboard — press v to grab it"
 
     def _save_settings(self) -> None:
         self.config.update({"disabled_sources": sorted(self.disabled_sources),
-                            "download_dir": self.download_dir, "meta_provider": self.meta_provider,
+                            "download_dir": self.download_dir, "speed_limit": self.speed_limit,
+                            "meta_provider": self.meta_provider,
                             "theme": self.theme, "hide_dead": self.hide_dead,
                             "tmdb_key": self.tmdb_key, "omdb_key": self.omdb_key,
                             "torznab_feeds": [dict(feed) for feed in self.torznab_feeds]})
@@ -894,8 +955,8 @@ class App:
         _logo_lines.cache_clear()  # the gradient logo is baked at first render
 
     def setting_items(self) -> list[tuple[str, object]]:
-        return ([('section', 'General'), ('dir', None), ('provider', None), ('meta-key', None),
-                 ('theme', None),
+        return ([('section', 'General'), ('dir', None), ('limit', None), ('provider', None),
+                 ('meta-key', None), ('theme', None),
                  ('section', 'Sources')]
                 + [('source', s) for s in SOURCES]
                 + [('section', 'Torznab feeds')]
@@ -985,9 +1046,10 @@ class App:
                 else:
                     self.remove_feed = value["id"]
                     self.status = f"press x or Enter to remove {torznab_label(value['url'])}"
-            elif k in ("enter", " ") and kind == "dir":
-                self.edit_field = "dir"
-                self.edit_buf = self.download_dir or (self.eng.download_dir() if self.eng else "") or ""
+            elif k in ("enter", " ") and kind in ("dir", "limit"):
+                self.edit_field = kind
+                self.edit_buf = (self.download_dir or (self.eng.download_dir() if self.eng else "") or ""
+                                 if kind == "dir" else self.speed_limit or "")
             elif k in ("enter", " ") and kind == "provider":
                 self.meta_provider = "omdb" if self.meta_provider == "tmdb" else "tmdb"
                 self.meta.clear()  # cached results are provider-specific
@@ -1020,6 +1082,14 @@ class App:
             self.download_dir = self.edit_buf.strip() or None
             if self.eng and self.download_dir:
                 self.eng.set_dir(self.download_dir)
+        elif self.edit_field == "limit":
+            raw = self.edit_buf.strip()
+            if raw and not re.fullmatch(r"\d+[KMG]?", raw, re.I):
+                self.status = "speed limit: number + optional K/M/G suffix"
+                return
+            self.speed_limit = raw or None
+            if self.eng:
+                self.eng.set_limit(raw or "0")  # 0 = unlimited
         elif self.edit_field == "key":
             self._set_provider_key(self.edit_buf.strip() or None)
             self.meta.clear()  # re-fetch with the new key
@@ -1913,11 +1983,15 @@ def _settings_panel(app: App, width: int, height: int) -> list[str]:
             inner.append(cell(str(value).upper(), inner_w, color=T.ALT, bold=True, dim=True))
             continue
         prefix = cell(T.PTR if selected else "", 2, color=T.ACCENT)
-        if kind in ("dir", "provider", "meta-key", "theme"):
+        if kind in ("dir", "limit", "provider", "meta-key", "theme"):
             if kind == "dir":
                 label = "Download dir"
                 shown = app.edit_buf + "▌" if app.edit_field == "dir" else app.download_dir or "(from aria2.conf)"
                 on = bool(app.download_dir or app.edit_field == "dir")
+            elif kind == "limit":
+                label = "Speed limit"
+                shown = app.edit_buf + "▌" if app.edit_field == "limit" else app.speed_limit or "(unlimited)"
+                on = bool(app.speed_limit or app.edit_field == "limit")
             elif kind == "provider":
                 label = "Metadata provider"
                 shown = app.meta_provider.upper()
@@ -2059,7 +2133,7 @@ def _footer(app: App, width: int) -> str:
                 hints = [("↑↓", "move"), ("enter", "add"), ("a", "add"), ("g/esc", "close")]
             elif kind == "source":
                 hints = [("↑↓", "move"), ("space/enter", "toggle"), ("a", "add"), ("g/esc", "close")]
-            elif kind in ("dir", "meta-key"):
+            elif kind in ("dir", "meta-key", "limit"):
                 hints = [("↑↓", "move"), ("enter/space", "edit"), ("a", "add"), ("g/esc", "close")]
             else:  # provider / theme
                 hints = [("↑↓", "move"), ("enter/space", "toggle"), ("a", "add"), ("g/esc", "close")]

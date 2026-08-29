@@ -285,6 +285,13 @@ class Aria2:
         except Aria2Error:
             pass
 
+    def set_limit(self, value: str) -> None:
+        """Overall download speed cap per aria2 (e.g. "2M"); "0" = unlimited."""
+        try:
+            self._call("aria2.changeGlobalOption", [{"max-overall-download-limit": value}])
+        except Aria2Error:
+            pass
+
     def active_infohashes(self) -> set[str]:
         """infohashes aria2 already has in flight (so a scan never double-adds)."""
         have: set[str] = set()
@@ -295,6 +302,21 @@ class Aria2:
                     ih = (t.get("infoHash") or "").lower()
                     if ih:
                         have.add(ih)
+            except Aria2Error:
+                pass
+        return have
+
+    def active_uris(self) -> set[str]:
+        """URIs aria2 is already fetching (http(s) adds; magnets have none)."""
+        have: set[str] = set()
+        for method, params in (("aria2.tellActive", [["files"]]),
+                               ("aria2.tellWaiting", [0, 1000, ["files"]])):
+            try:
+                for t in self._call(method, params) or []:
+                    for f in t.get("files") or []:
+                        for u in f.get("uris") or []:
+                            if u.get("uri"):
+                                have.add(u["uri"])
             except Aria2Error:
                 pass
         return have
