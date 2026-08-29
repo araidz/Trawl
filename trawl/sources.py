@@ -22,6 +22,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError, dataclass, field
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -825,16 +826,11 @@ def _x1337(query: str, cat: str, source: str) -> list[Result]:
         rows = [r for r in rows if all(t in r["name"].lower() for t in need)]
     rows.sort(key=lambda r: r["seeders"], reverse=True)
     rows = rows[:_X_MAX]
+    if not rows:
+        return []
     # detail pages fetched in parallel; order preserved, failures dropped
-    magnets: list[str | None] = [None] * len(rows)
-    def _get(i: int, path: str) -> None:
-        magnets[i] = _x_magnet(base, path)
-    threads = [threading.Thread(target=_get, args=(i, r["path"]), daemon=True)
-               for i, r in enumerate(rows)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join(timeout=20)
+    with ThreadPoolExecutor(max_workers=len(rows)) as ex:
+        magnets = list(ex.map(lambda r: _x_magnet(base, r["path"]), rows))
     out = []
     for r, magnet in zip(rows, magnets):
         if not magnet:

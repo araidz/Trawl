@@ -496,7 +496,6 @@ class App:
         self.history = load_history()  # past queries, oldest -> newest
         self.hist_idx = len(self.history)  # cursor; == len means "live draft"
         self.draft = ""  # query in progress before browsing history
-        self._results_revision = 0
         self._results: tuple[Result, ...] = ()
         self.results = []
         self.errors: dict[str, str] = {}
@@ -542,10 +541,8 @@ class App:
                 seen.add(sid)
                 self.torznab_feeds.append({"id": sid, "url": url, "api_key": key})
         self.sources = []
-        self.source_labels: dict[str, str] = {}
-        self.source_groups: dict[str, str] = {}
+        self.source_by_id: dict[str, Source] = {}
         self.source_secrets: dict[str, tuple[str, ...]] = {}
-        self.source_reports_health: dict[str, bool] = {}
         self._rebuild_sources()
         self.disabled_sources: set[str] = set(cfg.get("disabled_sources", []))
         self.download_dir: str | None = cfg.get("download_dir")
@@ -567,10 +564,6 @@ class App:
         self.tmdb_key = cfg.get("tmdb_key") or os.environ.get("TMDB_API_KEY")
         self.omdb_key = cfg.get("omdb_key") or os.environ.get("OMDB_API_KEY")
         self.meta: dict[str, object] = {}  # "provider:kind:name" -> "loading" | Meta | None
-        self._visible_revision = -1
-        self._visible_cat: str | None = None
-        self._visible_hide_dead = False
-        self._visible_cache: tuple[Result, ...] = ()
 
     # -- derived
     @property
@@ -580,22 +573,14 @@ class App:
     @results.setter
     def results(self, value: Iterable[Result]) -> None:
         self._results = tuple(value)
-        self._results_revision += 1
 
     def visible_results(self) -> tuple[Result, ...]:
-        if (self._results_revision == self._visible_revision and self.cat == self._visible_cat
-                and self.hide_dead == self._visible_hide_dead):
-            return self._visible_cache
         base = tuple(r for r in self.results
                      if not (self.hide_dead and r.seeders == 0
-                             and self.source_reports_health.get(r.source, True)))
+                             and self.source_reports_health(r.source)))
         if self.cat != "all":
             g = CAT_GROUP[self.cat]
-            out = tuple(r for r in base if self.result_group(r) == g)
-            self._visible_revision, self._visible_cat = self._results_revision, self.cat
-            self._visible_hide_dead = self.hide_dead
-            self._visible_cache = out
-            return out
+            return tuple(r for r in base if self.result_group(r) == g)
         # All: round-robin across categories so one prolific group (e.g. anime)
         # can't monopolize the top. Buckets keep first-seen order (= current sort),
         # so the group holding the overall-top result still leads.
@@ -606,11 +591,7 @@ class App:
         ordered: list[Result] = []
         for i in range(max((len(c) for c in cols), default=0)):
             ordered += [c[i] for c in cols if i < len(c)]
-        out = tuple(ordered)
-        self._visible_revision, self._visible_cat = self._results_revision, self.cat
-        self._visible_hide_dead = self.hide_dead
-        self._visible_cache = out
-        return out
+        return tuple(ordered)
 
     def _cur(self) -> Result | None:
         """The selected search result, or None if the list is empty/out of range."""
@@ -628,15 +609,18 @@ class App:
             except Exception:
                 pass
         self.sources = [*SOURCES, *configured]
+        self.source_by_id = {s.id: s for s in self.sources}
         for source in self.sources:
-            self.source_labels[source.id] = source.label
-            self.source_groups[source.id] = source.group
-            self.source_reports_health[source.id] = source.reports_health
             self.source_secrets[source.id] = tuple(dict.fromkeys(
                 (*self.source_secrets.get(source.id, ()), *source.secrets)))
 
     def source_label(self, source_id: str) -> str:
-        return self.source_labels.get(source_id, source_id)
+        src = self.source_by_id.get(source_id)
+        return src.label if src else source_id
+
+    def source_reports_health(self, source_id: str) -> bool:
+        src = self.source_by_id.get(source_id)
+        return src.reports_health if src else True
 
     def source_secrets_for(self, source_id: str) -> tuple[str, ...]:
         return self.source_secrets.get(source_id, ())
@@ -646,7 +630,8 @@ class App:
                                    for secret in secrets if secret))
 
     def result_group(self, result: Result) -> str | None:
-        return result.group or self.source_groups.get(result.source)
+        src = self.source_by_id.get(result.source)
+        return result.group or (src.group if src else None)
 
     def source_tag(self, source_id: str) -> tuple[str, str]:
         if source_id in {s.id for s in SOURCES}:
@@ -700,10 +685,8 @@ class App:
     def animating(self, rows: int) -> bool:
         if self.view != "downloads" or self.help or self.settings or self.picker is not None:
             return False
-        covered = set(_overlay_rows(rows)) if (self.confirm_quit or self.torrent_prompt
-                                               or self.cancel_prompt) else set()
-        return any(self.downloads[idx].status in ("active", "metadata") and bar_row not in covered
-                   for idx, bar_row in _visible_download_rows(self, rows))
+        return any(self.downloads[idx].status in ("active", "metadata")
+                   for idx, _ in _visible_download_rows(self, rows))
 
     def enabled_sources(self) -> list:
         return [s for s in self.sources if s.id not in self.disabled_sources]
@@ -912,10 +895,12 @@ class App:
         sel = min(max(0, sel), n - 1)
         if items[sel][0] != "section":
             return sel
-        for d in range(1, n):
-            for cand in (sel - d, sel + d):
-                if 0 <= cand < n and items[cand][0] != "section":
-                    return cand
+        for cand in range(sel + 1, n):
+            if items[cand][0] != "section":
+                return cand
+        for cand in range(sel - 1, -1, -1):
+            if items[cand][0] != "section":
+                return cand
         return 0
 
     def _move_setting(self, delta: int) -> None:
@@ -1000,10 +985,13 @@ class App:
                 self._save_settings()
 
     def _remove_selected_feed(self, feed: dict[str, str]) -> None:
+        removed = next((s for s in self.sources if s.id == feed["id"]), None)
         self.torznab_feeds.remove(feed)
         self.disabled_sources.discard(feed["id"])
         self.remove_feed = None
         self._rebuild_sources()
+        if removed:  # retire, don't drop: in-flight results keep their labels/groups
+            self.source_by_id[removed.id] = removed
         self._save_settings()
         self.set_sel = self._snap_setting(self.set_sel)
         self.status = "feed removed"
@@ -1518,7 +1506,7 @@ def _detail_panel(app: App, r: Result, width: int, height: int) -> list[str]:
             inner.append(cell(T.PTR if here else " ", 2, color=T.ACCENT) + " "
                          + cell(app.source_label(v.source), vlw,
                                 color=T.ACCENT if here else T.TEXT, bold=here)
-                         + cell(seed_leech(v, app.source_reports_health.get(v.source, True)),
+                         + cell(seed_leech(v, app.source_reports_health(v.source)),
                                 9, "right", color=seed_color(v.seeders), bold=here)
                          + cell(vtag, 5, "right", color=T.ACCENT if here else T.ALT, bold=here))
         inner.append(cell("", inner_w))
@@ -1747,7 +1735,7 @@ def _results_panel(app: App, width: int, height: int) -> list[str]:
             r = results[idx]
             here = idx == app.sel
             tag, tcolor = app.source_tag(r.source)
-            sl = seed_leech(r, app.source_reports_health.get(r.source, True))
+            sl = seed_leech(r, app.source_reports_health(r.source))
             if here:  # selected row: the whole line lights up in accent
                 inner.append(
                     cell(T.PTR, 2, color=T.ACCENT) + " "

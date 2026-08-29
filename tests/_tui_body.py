@@ -492,12 +492,12 @@ appi.results = [
 assert [r.name for r in appi.visible_results()] == ["anime1", "tv1", "anime2", "anime3"], \
     [r.name for r in appi.visible_results()]
 cached = appi.visible_results()
-assert appi.visible_results() is cached, "visible results identity cache"
+assert appi.visible_results() == cached, "visible results re-render stable"
 appi.results = appi.results[:]
-assert appi.visible_results() is not cached, "results replacement invalidates"
+assert appi.visible_results() == cached, "replacement keeps order and content"
 cached = appi.visible_results()
 appi.cat = "anime"
-assert appi.visible_results() is not cached, "category invalidates"
+assert {r.name for r in appi.visible_results()} == {"anime1", "anime2", "anime3"}, "category filter"
 try:
     appi.visible_results().append(appi.results[0])  # type: ignore[attr-defined]
     assert False, "cached output must be immutable"
@@ -516,18 +516,16 @@ appc.search = _QueuedSearch()  # type: ignore[assignment]
 first = Result("q1" + "x" * 38, "first", 1, 1, 0, "yts", "m")
 second = Result("q2" + "x" * 38, "second", 2, 9, 0, "yts", "m")
 appc.results = [first]
-before_results, before_revision = appc.results, appc._results_revision
+before_results = appc.results
 update = type("Update", (), {"source": "yts", "results": [second], "error": ""})()
 appc.search.updates.put(update)
 appc.drain_search()
-assert appc.results is not before_results and appc._results_revision == before_revision + 1
+assert appc.results is not before_results, "update replaces the results tuple"
 assert {r.name for r in appc.visible_results()} == {"first", "second"}, "append-like update"
-cached = appc.visible_results()
 appc._cycle_sort()
-assert appc.visible_results() is not cached and appc.results[0] is second, "sort replacement"
-cached = appc.visible_results()
+assert appc.results[0] is second, "sort replacement"
 appc.results = []
-assert appc.visible_results() == () and appc.visible_results() is not cached, "clear replacement"
+assert appc.visible_results() == (), "clear replacement"
 # clipboard grab (v): a magnet on the clipboard gets grabbed
 gp = globals()
 orig_paste = gp["paste_clipboard"]
@@ -930,10 +928,10 @@ assert app2.animating(24), "partial prompt leaves the active bar visible"
 app2.confirm_quit = False
 app2.dsel = 0
 app2.downloads[-1].status = "complete"
-app2.downloads[1].status = "active"  # second bar is on the centered overlay row
+app2.downloads[1].status = "active"  # second bar visible; overlays no longer stop it
 for prompt in ("confirm_quit", "torrent_prompt", "cancel_prompt"):
     setattr(app2, prompt, True)
-    assert not app2.animating(24), f"only active bar hidden by {prompt}"
+    assert app2.animating(24), f"overlay must not stop animation: {prompt}"
     setattr(app2, prompt, False if prompt == "confirm_quit" else None)
 app2.downloads[0].status = "active"  # first bar remains above the overlay
 app2.confirm_quit = True
