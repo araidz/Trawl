@@ -68,6 +68,7 @@ def main(argv: list[str] | None = None) -> int:
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     term.enter()
     last_poll = 0.0
+    prev_title = None
     try:
         while app.running:
             cols, rows = term.size()
@@ -95,6 +96,10 @@ def main(argv: list[str] | None = None) -> int:
             if dirty or term.size() != (cols, rows):
                 cols, rows = term.size()
                 term.write(render(app, cols, rows), (cols, rows))
+                title = app.page_title
+                if title != prev_title:
+                    term.set_title(title)
+                    prev_title = title
     except KeyboardInterrupt:
         pass
     finally:

@@ -690,8 +690,8 @@ try:
     assert len(aset.torznab_feeds) == 1, "feed add"
     old_endpoint_secret, old_key_secret = "OLD-ENDPOINT-SECRET", "OLD-SEPARATE-KEY"
     aset.on_key("e"); aset.edit_buf = f"https://new.invalid/api?apikey={old_endpoint_secret}"; aset.on_key("enter")
-    aset.on_key("k"); aset.edit_buf = old_key_secret; aset.on_key("enter")
-    aset.on_key("k"); aset.edit_buf = "separate"; aset.on_key("enter")
+    aset.on_key("K"); aset.edit_buf = old_key_secret; aset.on_key("enter")
+    aset.on_key("K"); aset.edit_buf = "separate"; aset.on_key("enter")
     assert aset.torznab_feeds[0]["api_key"] == "separate", "feed key edit"
     aset.on_key("e"); aset.edit_buf = "https://edited.invalid/api"; aset.on_key("enter")
     assert aset.torznab_feeds[0]["url"] == "https://edited.invalid/api", "feed URL edit"
@@ -783,6 +783,22 @@ try:
     ar.search.updates.put(type("U", (), {"source": "bad", "results": [], "error": ""})())
     ar.drain_search()
     assert ar.search_done == ar.search_total == 4 and not ar.errors, "successful retry completion accounting"
+
+    # E toggles the per-source error viewer; the panel shows labels + messages
+    err_app = App(eng=None)
+    err_app.search = Search.__new__(Search)
+    err_app.errors = {"tpb-tv": "HTTP 403", "annas": "blocked by Cloudflare"}
+    err_app.editing = False
+    err_app.on_key("E")
+    assert err_app.show_errors, "E opens the errors viewer"
+    ep = "\n".join(strip_ansi(x) for x in render(err_app, 100, 30))
+    assert "Failed sources" in ep and "TPB" in ep and "HTTP 403" in ep, ep
+    assert "blocked by Cloudflare" in ep, ep
+    err_app.on_key("esc")
+    assert not err_app.show_errors, "esc closes the errors viewer"
+    err_app.errors = {}
+    err_app.on_key("E")
+    assert not err_app.show_errors and "nothing" in err_app.status, err_app.status
 
     # Variant state and actions are isolated to details; canonical list remains unchanged.
     variants = (ResultVariant("one", "magnet:?xt=one", "https://one.invalid", 1, 0),

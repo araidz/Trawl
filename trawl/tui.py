@@ -443,10 +443,14 @@ class Terminal:
         self._lines = self._size = None
 
     def leave(self) -> None:
-        sys.stdout.write("\x1b[?1000l\x1b[?1006l\x1b[?2004l\x1b[?25h\x1b[?1049l")
+        sys.stdout.write("\x1b]0;\x07\x1b[?1000l\x1b[?1006l\x1b[?2004l\x1b[?25h\x1b[?1049l")
         sys.stdout.flush()
         if self.saved:
             termios.tcsetattr(self.fd, termios.TCSADRAIN, self.saved)
+
+    def set_title(self, text: str) -> None:
+        sys.stdout.write(f"\x1b]0;trawl — {text}\x07")
+        sys.stdout.flush()
 
     def size(self) -> tuple[int, int]:
         s = shutil.get_terminal_size((100, 30))
@@ -552,6 +556,7 @@ class App:
         self.edit_field: str | None = None  # settings text-edit: "dir" | "key"
         self.edit_buf = ""
         self.remove_feed: str | None = None
+        self.show_errors = False  # per-source failure viewer over the results
         self.hide_dead = bool(cfg.get("hide_dead", False))
         self.folder_prompt: tuple[str, str] | None = None  # (uri, name) for D download
         self.folder_buf = ""
@@ -637,6 +642,19 @@ class App:
         if source_id in {s.id for s in SOURCES}:
             return T.source_style(source_id)
         return dtrunc(self.source_label(source_id), 5), T.ALT
+
+    @property
+    def page_title(self) -> str:
+        """Short label for the terminal title bar (callers rate-limit it)."""
+        if self.view == "downloads":
+            return "downloads"
+        if self.show_errors:
+            return f"errors · {len(self.errors)}"
+        if self.detail is not None:
+            return "details"
+        if self.query.strip():
+            return clean(self.query)[:40]
+        return "latest" if self.search is not None else "search"
 
     def _variants(self, result: Result | None = None) -> tuple[ResultVariant, ...]:
         result = result or self.detail
@@ -747,6 +765,7 @@ class App:
         self.editing = False
         self.detail = None
         self.variant_idx = 0
+        self.show_errors = False
         self.status = ""
 
     def grab(self, magnet: str, name: str, dir_: str | None = None) -> None:
@@ -938,7 +957,7 @@ class App:
                 self.status = ""
             else:
                 self.settings = False
-        elif k in ("up", "pageup") or (k == "k" and self._selected_setting()[0] != "feed"):
+        elif k in ("up", "k", "pageup"):
             for _ in range(8 if k == "pageup" else 1):
                 self._move_setting(-1)
         elif k in ("down", "j", "pagedown"):
@@ -957,7 +976,7 @@ class App:
                     self._remove_selected_feed(value)
                 else:
                     self._start_feed_edit(value)
-            elif k == "k" and kind == "feed":
+            elif k == "K" and kind == "feed":
                 self.edit_field, self.edit_buf = "feed-key", value["api_key"]
                 self.remove_feed = None
             elif k == "x" and kind == "feed":
@@ -1362,6 +1381,7 @@ class App:
             self.view = "downloads" if self.view == "search" else "search"
             self.detail = None
             self.variant_idx = 0
+            self.show_errors = False
         elif k == "s":
             n = self.scan_resume()
             self.status = (f"resumed {n} download{'' if n == 1 else 's'}" if n
@@ -1396,6 +1416,14 @@ class App:
                 self._cycle_cat(1)
             elif k in ("/", "i"):
                 self.editing = True
+            elif k == "E":
+                if self.errors:
+                    self.show_errors = not self.show_errors
+                else:
+                    self.status = "all sources answered — nothing to show"
+            elif k == "esc":
+                if self.show_errors:
+                    self.show_errors = False
             elif k == "c":
                 self.clear()
             elif k == "S":
@@ -1673,6 +1701,20 @@ def _search_line(app: App, inner_w: int) -> str:
     caret = f"\x1b[7m{at or ' '}\x1b[0m"  # reverse-video block cursor
     used = dwidth(before) + (_cw(at) if at else 1) + dwidth(after)
     return prompt + style(before, T.TEXT) + caret + style(after, T.TEXT) + " " * max(0, avail - used)
+
+
+def _errors_panel(app: App, width: int, height: int) -> list[str]:
+    inner_w = width - 4
+    inner: list[str] = []
+    if not app.errors:
+        inner.append(cell("No failed sources — every source answered.", inner_w, dim=True))
+    for sid, msg in app.errors.items():
+        inner.append(cell(f" {app.source_label(sid)} —", inner_w, color=T.BAD, bold=True))
+        for ln in _wrap(clean(msg) or "unknown error", inner_w - 2):
+            inner.append("  " + cell(ln, inner_w - 2, dim=True))
+        inner.append(cell("", inner_w))
+    count = f"({len(app.errors)})" if app.errors else None
+    return _wrap_panel("Failed sources", inner, width, height, True, count)
 
 
 def _search_panel(app: App, width: int) -> list[str]:
@@ -1968,7 +2010,7 @@ def _help_panel(app: App, width: int, height: int) -> list[str]:
                      ("d / D / e", "download / to folder / save .torrent")]),
         ("Settings", [("enter / space", "edit or toggle the selected row"),
                        ("a", "add Torznab feed"),
-                       ("on a feed row", "e endpoint · k separate key · x remove"),
+                       ("on a feed row", "e endpoint · K separate key · x remove"),
                        ("g / esc", "close")]),
         ("Navigate", [("↑ ↓  j k", "move selection / scroll wheel"),
                       ("tab", "switch search / downloads")]),
@@ -2011,7 +2053,7 @@ def _footer(app: App, width: int) -> str:
             items = app.setting_items()
             kind = items[app._snap_setting(app.set_sel)][0]
             if kind == "feed":
-                hints = [("↑↓", "move"), ("enter/e", "endpoint"), ("k", "key"),
+                hints = [("↑↓", "move"), ("enter/e", "endpoint"), ("K", "key"),
                          ("x", "remove"), ("space", "toggle"), ("a", "add"), ("g/esc", "close")]
             elif kind == "add-feed":
                 hints = [("↑↓", "move"), ("enter", "add"), ("a", "add"), ("g/esc", "close")]
@@ -2027,12 +2069,14 @@ def _footer(app: App, width: int) -> str:
     elif app.detail is not None:
         hints = [("←→", "variant"), ("d", "download"), ("D", "folder"), ("e", ".torrent"),
                  ("o", "page"), ("y", "copy"), ("p", "poster"), ("esc/q", "back")]
+    elif app.show_errors:
+        hints = [("esc/E", "close"), ("r", "retry"), ("q", "quit")]
     elif app.view == "search" and app.editing:
         hints = [("enter", "search"), ("↑↓", "history"), ("esc", "nav"), ("tab", "downloads"), ("^c", "quit")]
     elif app.view == "search":
         hints = [("↑↓", "move"), ("enter", "details"), ("d", "grab"), ("D", "folder"), ("e", ".torrent"),
                  ("o", "page"), ("y", "copy"),
-                 ("r", "retry"), ("z", "hide dead"), ("S", "sort"), ("←→", "category"),
+                 ("r", "retry"), ("E", "errors"), ("z", "hide dead"), ("S", "sort"), ("←→", "category"),
                  ("v", "paste"), ("g", "settings"), ("q", "quit")]
     else:
         hints = [("↑↓", "move"), ("p", "pause/resume"), ("x", "cancel"), ("r", "retry"),
@@ -2241,7 +2285,9 @@ def render(app: App, cols: int, rows: int) -> list[str]:
         content = _picker_panel(app, content_w, body_h)
     else:
         content = _search_panel(app, content_w) + [""]
-        if app.view == "search" and app.detail is not None:
+        if app.view == "search" and app.show_errors:
+            content += _errors_panel(app, content_w, panel_h)
+        elif app.view == "search" and app.detail is not None:
             content += _detail_panel(app, app.detail, content_w, panel_h)
         elif app.view == "search":
             content += _results_panel(app, content_w, panel_h)
