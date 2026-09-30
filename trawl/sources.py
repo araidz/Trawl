@@ -13,8 +13,10 @@ import html
 import ipaddress
 import json
 import math
+import os
 import queue
 import re
+import shlex
 import sys
 import threading
 import time
@@ -112,7 +114,7 @@ class ParsedMagnet:
     info_hash: str
     name: str
     magnet: str  # the URI handed to aria2: a magnet or an http(s) link
-    kind: str = "magnet"  # magnet | link | torrent (.torrent link)
+    kind: str = "magnet"  # magnet | link | torrent (.torrent link) | file (local .torrent)
 
 
 @dataclass(frozen=True)
@@ -486,13 +488,33 @@ def parse_magnet(s: str) -> ParsedMagnet | None:
     return ParsedMagnet(info_hash, name, s)
 
 
+def _local_torrent(s: str) -> str | None:
+    """A dropped/pasted path to an existing .torrent. shlex undoes the quoting or
+    backslash-escaping most terminals apply when a file is dragged onto them; the
+    raw string covers the ones that paste the bare path."""
+    try:
+        parts = shlex.split(s)
+    except ValueError:
+        parts = []
+    for cand in (*parts[:1], s) if len(parts) == 1 else (s,):
+        path = os.path.expanduser(cand)
+        if path.lower().endswith(".torrent") and os.path.isfile(path):
+            return path
+    return None
+
+
 def parse_source(s: str) -> ParsedMagnet | None:
-    """A grabbable input: a magnet or a direct http(s) link. Both go straight to
-    aria2's addUri; the name is only a UI label. info_hash is "" for links."""
+    """A grabbable input: a magnet, a bare 40-hex infohash, a direct http(s) link,
+    or a local .torrent path. Magnets/links go to aria2's addUri, files to
+    addTorrent; the name is only a UI label. info_hash is "" for links/files."""
     s = s.strip()
     pm = parse_magnet(s)
     if pm:
         return pm
+    if re.fullmatch(r"[0-9a-fA-F]{40}", s):
+        return parse_magnet(build_magnet(s.lower(), s.lower()))
+    if path := _local_torrent(s):
+        return ParsedMagnet("", os.path.basename(path), path, "file")
     if s.lower().startswith(("http://", "https://")):
         p = urllib.parse.urlparse(s)
         name = urllib.parse.unquote(p.path.rsplit("/", 1)[-1]) or p.netloc or s
@@ -554,7 +576,7 @@ _EXTRAS = tuple((re.compile(rf"\b(?:{p})\b", re.I), label) for p, label in (
     (r"atmos", "Atmos"), (r"truehd", "TrueHD"), (r"dts(?:-?hd|-?x)?", "DTS"),
     (r"ddp5\.?1|dd\+|eac3", "DD+"), (r"dd5\.?1|ac3", "DD5.1"), (r"aac", "AAC"),
     (r"extended", "Extended"), (r"unrated", "Unrated"), (r"remastered", "Remastered"),
-    (r"imax", "IMAX"), (r"director'?s[ .-]?cut", "Director's Cut"), (r"repack|proper", "Repack")))
+    (r"imax", "IMAX"), (r"director'?s[ .-]?cut", "Director's Cut")))
 
 
 @lru_cache(maxsize=4096)

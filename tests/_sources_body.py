@@ -17,6 +17,19 @@ assert lk and lk.info_hash == "" and lk.name == "My Book.epub" and lk.kind == "l
 assert parse_source("https://example.com").name == "example.com"
 assert parse_source("https://x.org/a/b.torrent").kind == "torrent"
 assert parse_source("oppenheimer 2023") is None
+# bare infohash -> magnet; a 39/41-char or non-hex string is just a query
+bare = parse_source(h40.upper())
+assert bare and bare.info_hash == h40 and bare.kind == "magnet" and bare.magnet.startswith("magnet:?xt=urn:btih:" + h40), bare
+assert parse_source(h40[:-1]) is None and parse_source(h40 + "0") is None and parse_source("z" * 40) is None
+# a local .torrent path (as terminals paste dropped files) -> kind "file"
+import tempfile as _tf2
+_td2 = os.path.join(_tf2.mkdtemp(), "My Show [1080p].torrent")
+open(_td2, "wb").write(b"d4:infod4:name1:xee")
+for pasted in (_td2, _td2.replace(" ", "\\ ") + " ", f"'{_td2}'", f'"{_td2}"'):
+    pf = parse_source(pasted)
+    assert pf and pf.kind == "file" and pf.magnet == _td2 and pf.name == "My Show [1080p].torrent", (pasted, pf)
+assert parse_source(_td2 + ".missing.torrent") is None and parse_source("a.torrent b.torrent") is None
+assert parse_source("it's a query.torrent") is None, "unbalanced quote is not a path"
 merged = dedupe([
     Result(h40, "lo", 1, 5, 0, "a", "m"),
     Result(h40, "hi", 1, 50, 0, "b", "m"),

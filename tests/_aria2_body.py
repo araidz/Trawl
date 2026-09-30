@@ -15,6 +15,16 @@ live = to_download({"gid": "b", "status": "active", "totalLength": "100",
 assert live.progress == 0.5 and live.eta == 5.0 and live.peers == 7, live
 assert _follow({"status": "complete", "followedBy": ["z"]}) == "z"
 assert _follow({"status": "active", "followedBy": ["z"]}) is None
+# add_torrent_file: base64 blob -> aria2.addTorrent, tracked like any root
+import tempfile as _tf3
+_tp = os.path.join(_tf3.mkdtemp(), "x.torrent")
+open(_tp, "wb").write(b"d4:infod4:name1:xee")
+_tm = Aria2(conf=None)
+_tc = []
+_tm._call = lambda method, params=None, **k: _tc.append((method, params)) or "gid1"  # type: ignore[method-assign]
+assert _tm.add_torrent_file(_tp) == "gid1" and _tm.roots == ["gid1"]
+assert _tc[0][0] == "aria2.addTorrent" and base64.b64decode(_tc[0][1][0]) == b"d4:infod4:name1:xee", _tc
+assert _tc[0][1][1:] == [[], {}], "no web seeds, no options"
 # poll batches via system.multicall: one steady call, root+child on handoff
 mock = Aria2(conf=None)
 mock.roots = ["root"]

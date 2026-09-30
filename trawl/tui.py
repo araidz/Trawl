@@ -28,10 +28,10 @@ import uuid
 from collections.abc import Iterable, Sequence
 from functools import cache, lru_cache
 
-from . import theme as T
+from . import __version__, theme as T
 from .aria2 import STATE_DIR, Aria2Error, Download, control_infohash
-from .sources import (SOURCES, LocalQuery, Result, ResultVariant, Search, TorznabFeed,
-                      build_magnet, dedupe, make_torznab_source, matches_query,
+from .sources import (SOURCES, LocalQuery, Result, ResultVariant, Search, SourceError, TorznabFeed,
+                      build_magnet, dedupe, fetch_json, make_torznab_source, matches_query,
                       parse_magnet, parse_query, parse_release, parse_source, redact, redact_url,
                       result_identity, torznab_label, validate_torznab_url)
 from .meta import Meta, kind_for, lookup
@@ -293,6 +293,60 @@ def open_url(url: str) -> bool:
         return True
     except (OSError, subprocess.CalledProcessError):
         return False
+
+
+def open_target(path: str, name: str) -> str:
+    """What `enter` opens for a finished download: the torrent's own top-level
+    folder for multi-file torrents (the ancestor named like the torrent), else the file."""
+    p = os.path.dirname(path)
+    while p != os.path.dirname(p):
+        if os.path.basename(p) == name:
+            return p
+        p = os.path.dirname(p)
+    return path
+
+
+SPACE_MARGIN = 1 << 30  # keep 1 GiB free beyond the torrent itself
+
+
+def free_space(path: str) -> int | None:
+    """Free bytes on the volume that will hold `path` (nearest existing parent)."""
+    p = os.path.abspath(os.path.expanduser(path or "~"))
+    while not os.path.exists(p) and p != os.path.dirname(p):
+        p = os.path.dirname(p)
+    try:
+        return shutil.disk_usage(p).free
+    except OSError:
+        return None
+
+
+UPDATE_FILE = STATE_DIR / "update.json"
+UPDATE_URL = "https://api.github.com/repos/araidz/Trawl/releases/latest"
+
+
+def _newer(tag: str, current: str) -> bool:
+    try:
+        return tuple(map(int, tag.lstrip("v").split("."))) > tuple(map(int, current.split(".")))
+    except ValueError:
+        return False
+
+
+def update_available() -> str:
+    """The latest release tag if it's newer than this build, else "". Asks GitHub
+    at most once a day (cached in update.json); any failure just means no notice."""
+    try:
+        cache = json.loads(UPDATE_FILE.read_text())
+        tag, ts = str(cache["tag"]), float(cache["ts"])
+    except (OSError, ValueError, KeyError, TypeError):
+        tag, ts = "", 0.0
+    if time.time() - ts > 86400:
+        try:
+            tag = str(fetch_json(UPDATE_URL, timeout=5)["tag_name"])
+            STATE_DIR.mkdir(parents=True, exist_ok=True)
+            UPDATE_FILE.write_text(json.dumps({"ts": time.time(), "tag": tag}))
+        except (SourceError, KeyError, TypeError, OSError):
+            pass
+    return tag.lstrip("v") if _newer(tag, __version__) else ""
 
 
 def notify(title: str, message: str) -> None:
@@ -561,7 +615,10 @@ class App:
         self.remove_feed: str | None = None
         self.show_errors = False  # per-source failure viewer over the results
         self.hide_dead = bool(cfg.get("hide_dead", False))
-        self.folder_prompt: tuple[str, str] | None = None  # (uri, name) for D download
+        self.update_check = bool(cfg.get("update_check", True))
+        self.update_tag = ""  # newer release found by check_update, shown in header/splash
+        self._space_warned = ""  # uri whose low-disk warning was shown; pressing again overrides
+        self.folder_prompt: tuple[str, str, int] | None = None  # (uri, name, size) for D download
         self.folder_buf = ""
         self.last_dir: str | None = None  # last Shift+D destination, reused as prompt default
         self._exports: dict[str, tuple[str, str, str, float]] = {}  # gid -> (ih, name, dir, started)
@@ -796,12 +853,23 @@ class App:
         except OSError:
             pass
 
-    def _start_folder_prompt(self, uri: str, name: str) -> None:
-        self.folder_prompt = (uri, name)
+    def _space_ok(self, uri: str, size: int, dir_: str | None = None) -> bool:
+        """False (once) when `size` won't fit with SPACE_MARGIN to spare; pressing
+        the same grab key again overrides. Unknown size or free space never blocks."""
+        free = free_space(dir_ or self.download_dir or (self.eng.download_dir() if self.eng else "") or "")
+        if not size or free is None or size + SPACE_MARGIN <= free or self._space_warned == uri:
+            self._space_warned = ""
+            return True
+        self._space_warned = uri
+        self.status = f"only {fmt_bytes(free)} free, needs {fmt_bytes(size)} — press again to grab anyway"
+        return False
+
+    def _start_folder_prompt(self, uri: str, name: str, size: int = 0) -> None:
+        self.folder_prompt = (uri, name, size)
         self.folder_buf = self.last_dir or self.download_dir or ""
 
     def _commit_folder_prompt(self) -> None:
-        uri, name = self.folder_prompt or ("", "")
+        uri, name, size = self.folder_prompt or ("", "", 0)
         self.folder_prompt = None
         path = os.path.expanduser(self.folder_buf.strip())
         if not path:
@@ -813,6 +881,8 @@ class App:
             self.status = f"couldn't create folder: {e.strerror or e}"
             return
         self.last_dir = path
+        if not self._space_ok(uri, size, path):
+            return
         self.grab(uri, name, dir_=path)
         if self.view == "search":
             self.view = "downloads"
@@ -846,8 +916,33 @@ class App:
         """Grab a parsed input; a .torrent link first asks file-vs-contents."""
         if pm.kind == "torrent":
             self.torrent_prompt = pm
+        elif pm.kind == "file":
+            self.grab_file(pm.magnet, pm.name)
         else:
             self.grab(pm.magnet, pm.name)
+
+    def grab_file(self, path: str, name: str) -> None:
+        """A local .torrent (dropped onto the window or passed as an argument)."""
+        if not self.eng:
+            self.status = f"(no engine) {clean(name)[:48]}"
+            return
+        try:
+            self.eng.add_torrent_file(path)
+            self.status = f"grabbing: {clean(name)[:48]}"
+        except (Aria2Error, OSError) as e:
+            self.status = f"error: {e}"
+
+    def check_update(self) -> None:
+        """Background thread: note a newer release for the header/splash."""
+        if self.update_check:
+            self.update_tag = update_available()
+
+    def _quit(self) -> None:
+        """Quit at once when nothing is in flight; otherwise ask first."""
+        if any(d.status in ("active", "waiting", "metadata") for d in self.downloads):
+            self.confirm_quit = True
+        else:
+            self.running = False
 
     def grab_torrent(self, url: str, name: str, contents: bool) -> None:
         """A .torrent link: follow-torrent=mem grabs its contents; =false saves
@@ -946,6 +1041,7 @@ class App:
                             "download_dir": self.download_dir, "speed_limit": self.speed_limit,
                             "meta_provider": self.meta_provider,
                             "theme": self.theme, "hide_dead": self.hide_dead,
+                            "update_check": self.update_check,
                             "tmdb_key": self.tmdb_key, "omdb_key": self.omdb_key,
                             "torznab_feeds": [dict(feed) for feed in self.torznab_feeds]})
         save_config(self.config)
@@ -956,7 +1052,7 @@ class App:
 
     def setting_items(self) -> list[tuple[str, object]]:
         return ([('section', 'General'), ('dir', None), ('limit', None), ('provider', None),
-                 ('meta-key', None), ('theme', None),
+                 ('meta-key', None), ('theme', None), ('updates', None),
                  ('section', 'Sources')]
                 + [('source', s) for s in SOURCES]
                 + [('section', 'Torznab feeds')]
@@ -1059,6 +1155,9 @@ class App:
                 self.edit_buf = self._provider_key() or ""
             elif k in ("enter", " ") and kind == "theme":
                 self._set_theme("light" if self.theme == "violet" else "violet")
+                self._save_settings()
+            elif k in ("enter", " ") and kind == "updates":
+                self.update_check = not self.update_check
                 self._save_settings()
             elif k in ("enter", " ") and kind in ("source", "feed"):
                 sid = value.id if kind == "source" else value["id"]
@@ -1367,11 +1466,12 @@ class App:
                 if len(variants) > 1:
                     self.variant_idx = (self.variant_idx + (-1 if k == "left" else 1)) % len(variants)
             elif k == "d":
-                self.grab(self._variant().uri, self.detail.name)
-                self.detail = None
-                self.variant_idx = 0
+                if self._space_ok(self._variant().uri, self.detail.size):
+                    self.grab(self._variant().uri, self.detail.name)
+                    self.detail = None
+                    self.variant_idx = 0
             elif k == "D":
-                self._start_folder_prompt(self._variant().uri, self.detail.name)
+                self._start_folder_prompt(self._variant().uri, self.detail.name, self.detail.size)
             elif k == "e":
                 self.export_torrent(self._variant().uri, self.detail.name)
             elif k == "o":
@@ -1424,7 +1524,7 @@ class App:
             return
         if self.view == "search" and self.search is None and not self.editing:
             if k == "q":
-                self.confirm_quit = True
+                self._quit()
             elif k == "tab":
                 self.view = "downloads"
             elif k == "enter":
@@ -1441,7 +1541,7 @@ class App:
             return
         # nav (results) / downloads
         if k == "q":
-            self.confirm_quit = True
+            self._quit()
         elif k == "?":
             self.help = True
         elif k == "g":
@@ -1506,11 +1606,11 @@ class App:
             elif k == "r":
                 self.retry_failed_sources()
             elif k == "d":
-                if (r := self._cur()):
+                if (r := self._cur()) and self._space_ok(r.magnet, r.size):
                     self.grab(r.magnet, r.name)
             elif k == "D":
                 if (r := self._cur()):
-                    self._start_folder_prompt(r.magnet, r.name)
+                    self._start_folder_prompt(r.magnet, r.name, r.size)
             elif k == "e":
                 if (r := self._cur()):
                     self.export_torrent(r.magnet, r.name)
@@ -1533,7 +1633,14 @@ class App:
             if not self.downloads or not (0 <= self.dsel < len(self.downloads)):
                 return
             d = self.downloads[self.dsel]
-            if k == "x":
+            if k == "enter":
+                if d.status != "complete" or not d.path:
+                    self.status = "not finished yet — o reveals the folder"
+                elif open_url(open_target(d.path, d.name)):
+                    self.status = f"opened: {clean(d.name)[:40]}"
+                else:
+                    self.status = "couldn't open — was it moved or deleted?"
+            elif k == "x":
                 self.cancel_prompt = d
             elif k == "p":
                 if d.status == "paused":
@@ -1836,7 +1943,7 @@ def seed_leech(r: Result, reports_health: bool = True) -> str:
 
 
 _BADGE_W = 15      # "2160p REMUX HDR"
-_BADGE_MIN_W = 88  # inner columns needed before the badge column appears
+_BADGE_MIN_W = 76  # inner panel columns (≈103-col terminal) before the badge column appears
 
 
 def _results_panel(app: App, width: int, height: int) -> list[str]:
@@ -1844,7 +1951,7 @@ def _results_panel(app: App, width: int, height: int) -> list[str]:
     results = app.visible_results()
     app.sel = min(app.sel, max(0, len(results) - 1))
     badge_w = _BADGE_W + 1 if inner_w >= _BADGE_MIN_W else 0  # narrow panels keep the old layout
-    name_w = max(8, inner_w - 28 - badge_w)  # ptr2 + name + 9 + 9 + 5 + 3 seps
+    name_w = max(8, inner_w - 29 - badge_w)  # ptr2 + name + 9 + 9 + 5 + 4 seps
     inner: list[str] = [_status_line(app, results, inner_w)]
     if results:
         header = (cell("", 2) + " " + cell("Name", name_w, dim=True, bold=True) + " "
@@ -1998,8 +2105,12 @@ def _settings_panel(app: App, width: int, height: int) -> list[str]:
             inner.append(cell(str(value).upper(), inner_w, color=T.ALT, bold=True, dim=True))
             continue
         prefix = cell(T.PTR if selected else "", 2, color=T.ACCENT)
-        if kind in ("dir", "limit", "provider", "meta-key", "theme"):
-            if kind == "dir":
+        if kind in ("dir", "limit", "provider", "meta-key", "theme", "updates"):
+            if kind == "updates":
+                label = "Update check"
+                shown = "daily (GitHub)" if app.update_check else "off"
+                on = app.update_check
+            elif kind == "dir":
                 label = "Download dir"
                 shown = app.edit_buf + "▌" if app.edit_field == "dir" else app.download_dir or "(from aria2.conf)"
                 on = bool(app.download_dir or app.edit_field == "dir")
@@ -2086,7 +2197,7 @@ def _picker_panel(app: App, width: int, height: int) -> list[str]:
 def _help_panel(app: App, width: int, height: int) -> list[str]:
     inner_w = width - 4
     groups = [
-        ("Search", [("type", "search (paste a magnet or link to grab)"), ("enter", "details"),
+        ("Search", [("type", "search (paste a magnet, infohash or link; drop a .torrent)"), ("enter", "details"),
                      ("d", "download"), ("D", "download to a folder"), ("e", "save .torrent"),
                      ("o", "open page in browser"), ("y", "copy magnet"),
                      ("/  i", "edit query"), ("↑ ↓", "recall past searches"),
@@ -2104,7 +2215,8 @@ def _help_panel(app: App, width: int, height: int) -> list[str]:
                        ("g / esc", "close")]),
         ("Navigate", [("↑ ↓  j k", "move selection / scroll wheel"),
                       ("tab", "switch search / downloads")]),
-        ("Downloads", [("p", "pause / resume"), ("x", "cancel (ask: delete or keep files)"),
+        ("Downloads", [("enter", "open a finished download"),
+                       ("p", "pause / resume"), ("x", "cancel (ask: delete or keep files)"),
                        ("r", "retry a failed download"), ("f", "choose files (season packs)"),
                        ("o", "reveal in Finder"), ("s", "resume partial downloads on disk")]),
         ("General", [("g", "settings (sources, download dir)"), ("?", "this help"),
@@ -2169,7 +2281,7 @@ def _footer(app: App, width: int) -> str:
                  ("r", "retry"), ("E", "errors"), ("z", "hide dead"), ("S", "sort"), ("←→", "category"),
                  ("v", "paste"), ("g", "settings"), ("q", "quit")]
     else:
-        hints = [("↑↓", "move"), ("p", "pause/resume"), ("x", "cancel"), ("r", "retry"),
+        hints = [("↑↓", "move"), ("↵", "open"), ("p", "pause/resume"), ("x", "cancel"), ("r", "retry"),
                  ("f", "files"), ("o", "reveal"), ("s", "resume"), ("g", "settings"),
                  ("tab", "search"), ("q", "quit")]
     out, used = "", 0
@@ -2230,6 +2342,12 @@ def _splash(app: App, cols: int, rows: int) -> list[str]:
         parts.append(style(k, T.ALT) + style(" " + v, dim=True))
         plain += dwidth(k) + 1 + dwidth(v)
     block += ["", _center("".join(parts), plain, cols)]
+    if app.down_speed > 0 or app.num_active > 0:
+        stat = f"{T.DOWN} {fmt_speed(app.down_speed)}  {T.DOT}  {app.num_active} active"
+        block += ["", _center(style(stat, T.ALT), dwidth(stat), cols)]
+    if app.update_tag:
+        note = dtrunc(_update_note(app), cols - 4)
+        block += ["", _center(style(note, T.WARN), dwidth(note), cols)]
     if app.status:
         st = dtrunc(redact(clean(app.status), app._all_secrets()), cols - 4)
         block += ["", _center(style(st, T.ALT), dwidth(st), cols)]
@@ -2345,6 +2463,10 @@ def _redact_frame(lines: list[str], app: App) -> list[str]:
     return [redact_line(line) for line in lines]
 
 
+def _update_note(app: App) -> str:
+    return f"trawl {app.update_tag} available · brew upgrade trawl"
+
+
 def render(app: App, cols: int, rows: int) -> list[str]:
     cols = max(40, cols)
     rows = max(12, rows)
@@ -2354,11 +2476,13 @@ def render(app: App, cols: int, rows: int) -> list[str]:
     for L in _logo_lines():
         lines.append(" " * MARGIN + L)
     rule_w = max(0, cols - 2 * MARGIN)
-    if app.down_speed > 0 or app.num_active > 0:
-        stat = f" {T.DOWN} {fmt_speed(app.down_speed)}  {app.num_active} active "
-        dashes = max(0, rule_w - dwidth(stat) - 2)
-        lines.append(" " * MARGIN + style("─" * dashes + "─", T.RULE)
-                     + style(stat, T.ALT) + style("─", T.RULE))
+    stat = f" {T.DOWN} {fmt_speed(app.down_speed)}  {app.num_active} active " \
+        if app.down_speed > 0 or app.num_active > 0 else ""
+    note = f" {_update_note(app)} " if app.update_tag else ""
+    if stat or note:
+        dashes = max(0, rule_w - dwidth(stat) - dwidth(note) - 2)
+        lines.append(" " * MARGIN + style("─", T.RULE) + style(note, T.WARN)
+                     + style("─" * dashes, T.RULE) + style(stat, T.ALT) + style("─", T.RULE))
     else:
         lines.append(" " * MARGIN + style("─" * rule_w, T.RULE))
 

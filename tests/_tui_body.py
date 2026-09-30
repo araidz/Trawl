@@ -90,9 +90,14 @@ print("primitives ok")
 app = App(eng=None)
 assert app.view == "search" and not app.editing and app.search is None, "splash landing"
 app.on_key("q")
-assert app.confirm_quit, "q quits on the splash landing"
+assert not app.running and not app.confirm_quit, "idle q quits at once"
+app.running = True
+app.downloads = [Download("g", "F", "active", 100, 10, 5, 1, None, root="r")]
+app.on_key("q")
+assert app.confirm_quit and app.running, "q asks first while a download is running"
 app.on_key("esc")
 assert not app.confirm_quit
+app.downloads = []
 for ch in "matrix":
     app.on_key(ch)
 assert app.query == "matrix" and app.editing, "typing starts editing"
@@ -166,6 +171,7 @@ assert app.view == "downloads"
 # quit confirmation: q arms it, esc cancels, q+enter quits; ^c is immediate
 appq = App(eng=None)
 appq.view = "downloads"
+appq.downloads = [Download("g", "F", "active", 100, 10, 5, 1, None, root="r")]
 appq.on_key("q")
 assert appq.confirm_quit and appq.running, "q should arm confirm, not quit"
 appq.on_key("esc")
@@ -1158,6 +1164,99 @@ sf = "\n".join(strip_ansi(x) for x in render(app3, 100, 30))
 assert "terminal-native" in sf and "games" in sf and "Search" in sf, "splash content"
 app3.search = Search.__new__(Search)  # once searched, splash gives way to browse
 assert "terminal-native" not in "\n".join(strip_ansi(x) for x in render(app3, 100, 30))
+
+# session 2: layout, disk-space guard, open finished, file drop, update notice
+gs = globals()
+apr = App(eng=None)
+apr.search, apr.query = object(), "x"
+apr.results = [Result("a" * 40, "Dune.2021.1080p.WEB-DL.x265", 10 ** 9, 5, 1, "yts", "m")]
+for w in (45, 60, 79, 80, 120):  # panel widths; below ~41 the 8-col name minimum overflows (old limit)
+    assert {dwidth(strip_ansi(x)) for x in _results_panel(apr, w, 6)} == {w}, f"results panel width {w}"
+assert any("Release" in strip_ansi(x) for x in _results_panel(apr, 80, 6)), "badge at inner 76"
+assert not any("Release" in strip_ansi(x) for x in _results_panel(apr, 79, 6)), "no badge below it"
+assert open_target("/d/Show.S01/E01.mkv", "Show.S01") == "/d/Show.S01", "multi-file opens its folder"
+assert open_target("/d/Pack/CD1/a.mkv", "Pack") == "/d/Pack", "nested file opens the top folder"
+assert open_target("/d/movie.mkv", "movie.mkv") == "/d/movie.mkv", "single file opens the file"
+assert isinstance(free_space("/nonexistent/a/b"), int), "free space walks up to an existing parent"
+assert _newer("v0.6.0", "0.5.0") and _newer("1.0.0", "0.9.9") and not _newer("v0.5.0", "0.5.0")
+assert not _newer("nightly", "0.5.0") and not _newer("", "0.5.0")
+# disk-space guard: warn once, the same key again overrides
+o_free = gs["free_space"]
+gs["free_space"] = lambda p: 5 * (1 << 30)
+aps = App(eng=None)
+assert aps._space_ok("m1", 1 << 30) and aps._space_ok("m1", 0), "fits / unknown size"
+assert not aps._space_ok("m2", 6 * (1 << 30)) and "press again" in aps.status, aps.status
+assert aps._space_ok("m2", 6 * (1 << 30)) and not aps._space_warned, "second press overrides"
+assert not aps._space_ok("m3", 6 * (1 << 30)) and not aps._space_ok("m4", 6 * (1 << 30)), "other uri re-warns"
+gs["free_space"] = lambda p: None
+assert aps._space_ok("m5", 10 ** 15), "unknown free space never blocks"
+gs["free_space"] = o_free
+# enter on a downloads row opens finished items only
+opened = []
+o_open = gs["open_url"]
+gs["open_url"] = lambda u: opened.append(u) or True
+apo = App(eng=None)
+apo.view = "downloads"
+apo.downloads = [Download("g", "Show.S01", "complete", 1, 1, 0, 0, None, root="r", path="/d/Show.S01/E01.mkv")]
+apo.on_key("enter")
+assert opened == ["/d/Show.S01"] and apo.status.startswith("opened"), (opened, apo.status)
+apo.downloads[0].status = "active"
+apo.on_key("enter")
+assert opened == ["/d/Show.S01"] and "not finished" in apo.status, "active rows don't open"
+gs["open_url"] = o_open
+# a dropped .torrent path (escaped/quoted as terminals paste it) goes to addTorrent
+_tor = Path(tempfile.mkdtemp()) / "My Show.torrent"
+_tor.write_bytes(b"d4:infod4:name1:xee")
+added = []
+class _FileEng:
+    def add_torrent_file(self, p): added.append(p)
+apf = App(eng=_FileEng())
+for pasted in (str(_tor).replace(" ", "\\ ") + " ", f"'{_tor}'", str(_tor)):
+    apf.query, apf.editing = pasted, True
+    apf.submit()
+assert added == [str(_tor)] * 3 and apf.status.startswith("grabbing: My Show.torrent"), (added, apf.status)
+apf.query = "not a file.torrent"
+apf.submit()
+assert added == [str(_tor)] * 3 and apf.search is not None, "a missing path is just a search"
+# update notice: header on results views, splash line, settings toggle persists
+apu = App(eng=None)
+apu.update_tag = "9.9.9"
+apu.search, apu.results = object(), apr.results
+for scr in (render(apu, 100, 30), render(App(eng=None), 100, 30)):
+    assert all(dwidth(strip_ansi(x)) <= 100 for x in scr)
+assert "9.9.9 available" in strip_ansi(render(apu, 100, 30)[7]) or any(
+    "9.9.9 available" in strip_ansi(x) for x in render(apu, 100, 30)[:9]), "header notice"
+apu.search = None
+apu.update_tag = "9.9.9"
+assert any("brew upgrade trawl" in strip_ansi(x) for x in render(apu, 100, 30)), "splash notice"
+apu.down_speed, apu.num_active = 2_000_000, 1
+assert any("active" in strip_ansi(x) for x in render(apu, 100, 30)), "splash speed line"
+saved_u = {}
+o_save = gs["save_config"]
+gs["save_config"] = lambda c: saved_u.update(c)
+apu.settings = True
+apu.set_sel = [k for k, _ in apu.setting_items()].index("updates")
+apu._settings_key("enter")
+assert apu.update_check is False and saved_u["update_check"] is False, saved_u
+apu.update_tag = ""
+apu.check_update()
+assert apu.update_tag == "", "disabled update check never runs"
+gs["save_config"] = o_save
+# update_available: one GitHub call a day, failures are silent
+_ufile = Path(tempfile.mkdtemp()) / "update.json"
+o_ufile, o_fetch = gs["UPDATE_FILE"], gs["fetch_json"]
+gs["UPDATE_FILE"] = _ufile
+calls_u = []
+gs["fetch_json"] = lambda url, **kw: calls_u.append(url) or {"tag_name": "v9.9.9"}
+assert update_available() == "9.9.9" and len(calls_u) == 1
+assert update_available() == "9.9.9" and len(calls_u) == 1, "cached for a day"
+_ufile.write_text(json.dumps({"ts": 0, "tag": "v0.0.1"}))
+assert update_available() == "9.9.9" and len(calls_u) == 2, "stale cache refetches"
+_ufile.unlink()
+def _boom(url, **kw): raise SourceError("offline")
+gs["fetch_json"] = _boom
+assert update_available() == "", "offline: no notice, no crash"
+gs["UPDATE_FILE"], gs["fetch_json"] = o_ufile, o_fetch
 print("render ok")
 print("\nPhase 3 selftest passed.")
 

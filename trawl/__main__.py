@@ -20,7 +20,7 @@ from .tui import App, Terminal, paste_clipboard, render
 HELP = ("trawl — terminal torrent finder over aria2.\n"
         "  trawl               start (press s to resume partial downloads on disk)\n"
         "  trawl <query>       start and search for a query\n"
-        "  trawl <magnet|url>  start and grab a magnet or direct link")
+        "  trawl <magnet|url|file.torrent>  start and grab a magnet, link, or torrent file")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -50,6 +50,7 @@ def main(argv: list[str] | None = None) -> int:
     threading.Thread(target=refresh_trackers, daemon=True).start()
 
     app = App(eng)
+    threading.Thread(target=app.check_update, daemon=True).start()
     if app.download_dir:
         eng.set_dir(app.download_dir)
     if app.speed_limit:

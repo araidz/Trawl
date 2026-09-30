@@ -83,6 +83,10 @@ Trawl is a from-scratch Python TUI inspired by
 - **Resume** — unfinished downloads resume automatically on the next launch;
   `s` additionally scans the download folder for stray partial `*.aria2` files
   (torrents and remembered direct-http grabs).
+- **Safety nets** — before a grab, Trawl compares the torrent's size with the
+  free space on the target volume (keeping 1 GiB spare) and warns instead of
+  filling your disk; press the same key again to grab anyway. `q` quits at once
+  when nothing is downloading and only asks while something is in flight.
 - **Quality of life** — persistent search history, completion notifications,
   clipboard magnet auto-detect (new magnets/links are offered as they appear),
   mouse-wheel scrolling, a settings overlay (toggle sources, set the download
@@ -126,7 +130,7 @@ You can also start straight into a search: `trawl oppenheimer`.
 
 | Key | Action |
 | --- | --- |
-| type · `Enter` | search (paste a magnet or link to grab) |
+| type · `Enter` | search (paste a magnet, bare infohash, or link to grab; drag a `.torrent` file onto the window to add it) |
 | `↑ ↓` | recall past searches · `PgUp/PgDn` page · `Home/End` jump |
 | `Ctrl-A/E` caret · `Ctrl-U/W` kill · `Esc` exit the box | edit the query |
 | `Enter` | result details |
@@ -148,6 +152,7 @@ You can also start straight into a search: `trawl oppenheimer`.
 | Key | Action |
 | --- | --- |
 | `↑ ↓` | move / scroll · `PgUp/PgDn` page · `Home/End` jump |
+| `Enter` | open a finished download (a season pack opens its folder) |
 | `p` | pause / resume · `x` cancel (asks: delete files or keep) |
 | `r` | retry a failed download |
 | `f` | choose which files to download (season packs) |
@@ -196,6 +201,7 @@ uses a private session file so it never touches your own aria2 state.
 
 State lives in `~/Library/Application Support/Trawl/`:
 `history.txt` (searches), `downloads.jsonl` (completed), `config.json` (settings),
+`update.json` (last update check),
 `pending.jsonl` (direct-link grabs, for resuming), `aria2-session.txt` (private session).
 
 Torznab endpoint keys are masked in the UI and errors, as are metadata keys.
@@ -204,8 +210,11 @@ other local credential store.
 
 ## Privacy
 
-Your files stay on your disk; nothing routes through a central server. Trawl only
-talks to the sources you search and the torrent network via aria2.
+Your files stay on your disk; nothing routes through a central server. Trawl
+talks to the sources you search, the torrent network via aria2, and GitHub: a
+weekly tracker-list refresh and, at most once a day, the public releases API to
+tell you when a newer Trawl exists. The update check sends nothing but the
+request itself and can be switched off in settings (`g`, "Update check").
 
 ## Credits
 

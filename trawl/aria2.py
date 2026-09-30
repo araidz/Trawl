@@ -7,6 +7,7 @@ user's ~/.aria2/aria2.conf. Transliterated from Riptide's Aria2Client.swift.
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import secrets
@@ -207,6 +208,15 @@ class Aria2:
         self.roots.append(gid)
         self._resolved[gid] = gid
         self._uris[gid] = (magnet, options or {})
+        return gid
+
+    def add_torrent_file(self, path: str, options: dict | None = None) -> str:
+        """Add a local .torrent (addUri can't read files)."""
+        with open(path, "rb") as f:
+            blob = base64.b64encode(f.read()).decode()
+        gid = self._call("aria2.addTorrent", [blob, [], options or {}])
+        self.roots.append(gid)
+        self._resolved[gid] = gid
         return gid
 
     def save_metadata(self, magnet: str, dir_path: str) -> str:
