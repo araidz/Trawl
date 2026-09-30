@@ -21,6 +21,7 @@ import sys
 import termios
 import threading
 import time
+import tempfile
 import tty
 import unicodedata
 import urllib.parse
@@ -29,7 +30,7 @@ from collections.abc import Iterable, Sequence
 from functools import cache, lru_cache
 
 from . import __version__, theme as T
-from .aria2 import STATE_DIR, Aria2Error, Download, control_infohash
+from .aria2 import STATE_DIR, Aria2Error, Download, control_infohash, torrent_files
 from .sources import (SOURCES, LocalQuery, Result, ResultVariant, Search, SourceError, TorznabFeed,
                       build_magnet, dedupe, fetch_json, make_torznab_source, matches_query,
                       parse_magnet, parse_query, parse_release, parse_source, redact, redact_url,
@@ -307,6 +308,7 @@ def open_target(path: str, name: str) -> str:
 
 
 SPACE_MARGIN = 1 << 30  # keep 1 GiB free beyond the torrent itself
+PEEK_TIMEOUT = 45  # seconds to wait for a magnet's file list before giving up
 
 
 def free_space(path: str) -> int | None:
@@ -580,6 +582,8 @@ class App:
         self.picker_sel = 0
         self.picker_on: set[int] = set()  # selected 1-based file indices
         self.picker_bytes = 0
+        self.peek_target: tuple[str, str] | None = None  # (uri, name) when the picker is a pre-grab peek
+        self._peek: tuple | None = None  # in-flight (gid, infohash, uri, name, tmpdir, started)
         self.detail: Result | None = None  # search result shown in the details view
         self.variant_idx = 0
         cfg = self.config = load_config()
@@ -828,13 +832,17 @@ class App:
         self.show_errors = False
         self.status = ""
 
-    def grab(self, magnet: str, name: str, dir_: str | None = None) -> None:
+    def grab(self, magnet: str, name: str, dir_: str | None = None,
+             select: Iterable[int] = ()) -> None:
         secrets = self._all_secrets()
         if not self.eng:
             self.status = redact(f"(no engine) {clean(name)[:48]}", secrets)
             return
+        opts = {"dir": dir_} if dir_ else {}
+        if select:  # 1-based file numbers; aria2 applies them once a magnet's metadata arrives
+            opts["select-file"] = ",".join(map(str, sorted(select)))
         try:
-            self.eng.add(magnet, {"dir": dir_} if dir_ else None)
+            self.eng.add(magnet, opts or None)
             uri = magnet if magnet.lower().startswith(("http://", "https://")) else ""
             self._record_pending(uri, dir_)  # http links: remembered for scan_resume
             self.status = redact(f"grabbing: {clean(name)[:48]}", secrets)
@@ -1214,6 +1222,69 @@ class App:
         self.status = ""
         self._save_settings()
 
+    def start_peek(self, uri: str, name: str) -> None:
+        """Details `f`: fetch just the metadata into a temp dir, then show the
+        torrent's files so a pack can be inspected (and partly grabbed) up front."""
+        pm = parse_magnet(uri)
+        if not pm:
+            self.status = "no file list for direct links"
+        elif not self.eng:
+            self.status = "(no engine)"
+        elif self._peek:
+            self.status = "still reading a file list…"
+        else:
+            tmp = tempfile.mkdtemp(prefix="trawl-peek-")
+            try:
+                gid = self.eng.save_metadata(uri, tmp)
+            except Aria2Error as e:
+                shutil.rmtree(tmp, ignore_errors=True)
+                self.status = redact(f"error: {e}", self._all_secrets())
+                return
+            self._peek = (gid, pm.info_hash, uri, name, tmp, time.monotonic())
+            self.status = "reading file list…"
+
+    def end_peek(self) -> None:
+        """Drop the metadata task and its temp dir (also runs on quit, so a stray
+        task can't come back from the session file as a phantom download)."""
+        if not self._peek:
+            return
+        gid, _, _, _, tmp, _ = self._peek
+        self._peek = None
+        try:
+            if self.eng:
+                self.eng.remove(gid)
+        except Aria2Error:
+            pass
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    def _poll_peek(self) -> None:
+        gid, ih, uri, name, tmp, started = self._peek
+        st = self.eng.status(gid) if self.eng else "error"
+        files = None
+        if st == "complete":  # the .torrent write can lag the status flip: retry next tick
+            try:
+                with open(os.path.join(tmp, f"{ih}.torrent"), "rb") as f:
+                    files = torrent_files(f.read())
+            except (OSError, ValueError):
+                pass
+        if files is None and st != "error" and time.monotonic() - started <= PEEK_TIMEOUT:
+            return
+        self.end_peek()
+        if files is None:
+            self.status = "couldn't read the file list (no peers answered)"
+        elif not (self.detail is not None and (v := self._variant()) and v.uri == uri):
+            return  # the user moved on; nothing to show
+        elif len(files) < 2:
+            self.status = (f"single file: {clean(files[0]['path'])[:40]} · {fmt_bytes(files[0]['length'])}"
+                           if files else "torrent lists no files")
+        else:
+            self.picker = Download("", name, "peek", 0, 0, 0, 0, None)
+            self.peek_target = (uri, name)
+            self.picker_files, self.picker_sel = files, 0
+            self.picker_on = {f["index"] for f in files}
+            self.picker_bytes = sum(f["length"] for f in files)
+            self.status = ""
+
     def _open_picker(self, d: Download) -> None:
         files = self.eng.files(d.root) if self.eng else []
         if len(files) < 2:
@@ -1230,7 +1301,7 @@ class App:
     def _picker_key(self, k: str) -> None:
         n = len(self.picker_files)
         if k in ("esc", "q", "f"):
-            self.picker = None
+            self.picker = self.peek_target = None
         elif k in ("up", "k", "pageup"):
             self.picker_sel = (self.picker_sel - (8 if k == "pageup" else 1)) % n
         elif k in ("down", "j", "pagedown"):
@@ -1256,6 +1327,15 @@ class App:
         elif k == "enter":
             if not self.picker_on:
                 self.status = "select at least one file"
+                return
+            if self.peek_target:  # pre-grab peek: start the download with just these files
+                uri, name = self.peek_target
+                if not self._space_ok(uri, self.picker_bytes):
+                    return
+                every = len(self.picker_on) == n  # everything ticked: a plain grab
+                self.grab(uri, name, select=() if every else self.picker_on)
+                self.picker = self.peek_target = self.detail = None
+                self.variant_idx = 0
                 return
             ok = self.eng.select_files(self.picker.root, sorted(self.picker_on)) if self.eng else False
             self.status = (f"downloading {len(self.picker_on)}/{n} files" if ok
@@ -1328,8 +1408,9 @@ class App:
         are resolved here too: once the metadata fetch completes, the <hash>.torrent
         aria2 wrote is renamed to the item's name and the fetch row is dropped."""
         prev = {d.root: d.status for d in self.downloads}
+        peek = self._peek[0] if self._peek else None
         for d in downloads:
-            if d.root in self._exports:
+            if d.root in self._exports or d.root == peek:
                 continue  # a metadata fetch, not a real download
             was = prev.get(d.root)
             if d.status == "complete" and was is not None and was != "complete":
@@ -1341,6 +1422,8 @@ class App:
         kept = []
         now = time.monotonic()
         for d in downloads:
+            if d.root == peek:
+                continue
             if d.root in exports:
                 ih, name, dir_path, started = exports[d.root]
                 st = self.eng.status(d.root) if self.eng else ""
@@ -1358,6 +1441,8 @@ class App:
                 continue
             kept.append(d)
         self.downloads = kept
+        if self._peek:
+            self._poll_peek()
 
     def _finish_export(self, gid: str, ih: str, name: str, dir_path: str) -> None:
         self._exports.pop(gid, None)
@@ -1474,6 +1559,8 @@ class App:
                 self._start_folder_prompt(self._variant().uri, self.detail.name, self.detail.size)
             elif k == "e":
                 self.export_torrent(self._variant().uri, self.detail.name)
+            elif k == "f":
+                self.start_peek(self._variant().uri, self.detail.name)
             elif k == "o":
                 page = self._variant().page
                 self.status = ("opened in browser" if page and open_url(page)
@@ -2208,7 +2295,8 @@ def _help_panel(app: App, width: int, height: int) -> list[str]:
                      ("S", "cycle sort (seeders/size/newest)"), ("c", "clear results"),
                      ("← →", "filter category"), ("v", "grab magnet/link from clipboard")]),
         ("Details", [("← →", "cycle duplicate source variants"),
-                     ("d / D / e", "download / to folder / save .torrent")]),
+                     ("d / D / e", "download / to folder / save .torrent"),
+                     ("f", "look inside; tick files, enter downloads just those")]),
         ("Settings", [("enter / space", "edit or toggle the selected row"),
                        ("a", "add Torznab feed"),
                        ("on a feed row", "e endpoint · K separate key · x remove"),
@@ -2267,9 +2355,9 @@ def _footer(app: App, width: int) -> str:
                 hints = [("↑↓", "move"), ("enter/space", "toggle"), ("a", "add"), ("g/esc", "close")]
     elif app.picker is not None:
         hints = [("↑↓", "move"), ("space", "toggle"), ("a", "all/none"),
-                 ("enter", "apply"), ("esc", "cancel")]
+                 ("enter", "download ticked" if app.peek_target else "apply"), ("esc", "cancel")]
     elif app.detail is not None:
-        hints = [("←→", "variant"), ("d", "download"), ("D", "folder"), ("e", ".torrent"),
+        hints = [("←→", "variant"), ("d", "download"), ("D", "folder"), ("e", ".torrent"), ("f", "files"),
                  ("o", "page"), ("y", "copy"), ("p", "poster"), ("esc/q", "back")]
     elif app.show_errors:
         hints = [("esc/E", "close"), ("r", "retry"), ("q", "quit")]

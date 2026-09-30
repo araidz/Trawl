@@ -1218,6 +1218,95 @@ assert added == [str(_tor)] * 3 and apf.status.startswith("grabbing: My Show.tor
 apf.query = "not a file.torrent"
 apf.submit()
 assert added == [str(_tor)] * 3 and apf.search is not None, "a missing path is just a search"
+# peek inside: metadata-only fetch -> file picker -> grab just the ticked files
+_ben2 = lambda x: (b"i%de" % x if isinstance(x, int) else b"%d:%s" % (len(x), x.encode() if isinstance(x, str) else x)
+                   if isinstance(x, (str, bytes)) else b"l" + b"".join(map(_ben2, x)) + b"e" if isinstance(x, list)
+                   else b"d" + b"".join(_ben2(k) + _ben2(v) for k, v in sorted(x.items())) + b"e")
+_pk = _ben2({"info": {"name": "Pack", "piece length": 1, "pieces": b"x" * 20, "files": [
+    {"length": 5 << 30, "path": ["a.mkv"]}, {"length": 2 << 30, "path": ["b.mkv"]}, {"length": 10, "path": ["c.srt"]}]}})
+_pih = "a" * 40
+_pmag = build_magnet(_pih, "Pack")
+ev = []
+class _PeekEng:
+    st = "active"
+    def save_metadata(self, uri, d):
+        ev.append(("meta", uri))
+        self.dir = d
+        return "pg"
+    def status(self, g): return self.st
+    def remove(self, g): ev.append(("remove", g))
+    def add(self, uri, opts=None): ev.append(("add", uri, opts))
+    def download_dir(self): return None
+def _peek_app(res_magnet=_pmag):
+    a = App(eng=_PeekEng())
+    a.view = "search"
+    a.results = [Result(_pih, "Pack", 7 << 30, 9, 1, "yts", res_magnet)]
+    a.search, a.sel = object(), 0
+    a.on_key("enter")
+    assert a.detail is not None
+    return a
+gs["free_space"] = lambda p: 100 << 30
+app_p = _peek_app()
+app_p.on_key("f")
+assert app_p._peek and app_p.status == "reading file list…" and ev[-1][0] == "meta", ev
+app_p.on_key("f")
+assert app_p.status == "still reading a file list…" and sum(1 for e in ev if e[0] == "meta") == 1
+app_p.update_downloads([Download("g", "[METADATA]Pack", "active", 0, 0, 0, 0, None, root="pg")])
+assert not app_p.downloads and app_p.picker is None, "the metadata task never shows as a download row"
+app_p.eng.st = "complete"
+app_p.update_downloads([])
+assert app_p.picker is None and app_p._peek, "complete but .torrent not written yet: keep waiting"
+open(os.path.join(app_p.eng.dir, f"{_pih}.torrent"), "wb").write(_pk)
+app_p.update_downloads([])
+assert app_p.picker is not None and app_p.peek_target and not app_p._peek, "picker opens with the file list"
+assert [f["path"] for f in app_p.picker_files] == ["Pack/a.mkv", "Pack/b.mkv", "Pack/c.srt"]
+assert app_p.picker_on == {1, 2, 3} and app_p.picker_bytes == (7 << 30) + 10
+assert ("remove", "pg") in ev and not os.path.isdir(app_p.eng.dir), "metadata task + temp dir cleaned up"
+scr = [strip_ansi(x) for x in render(app_p, 100, 30)]
+assert any("a.mkv" in x and "5.00 GB" in x for x in scr) and all(dwidth(x) <= 100 for x in scr)
+assert "download ticked" in strip_ansi(_footer(app_p, 100))
+app_p.on_key("down"); app_p.on_key(" ")   # untick b.mkv
+assert app_p.picker_on == {1, 3}
+gs["free_space"] = lambda p: 3 << 30
+app_p.on_key("enter")
+assert app_p.picker is not None and "press again" in app_p.status, "disk guard uses the ticked size"
+gs["free_space"] = lambda p: 100 << 30
+app_p.on_key("enter")
+assert ev[-1] == ("add", _pmag, {"select-file": "1,3"}), ev[-1]
+assert app_p.picker is None and app_p.detail is None and app_p.peek_target is None
+# everything ticked = a plain grab; esc backs out to the details view
+app_p = _peek_app(); app_p.on_key("f"); app_p.eng.st = "complete"
+open(os.path.join(app_p.eng.dir, f"{_pih}.torrent"), "wb").write(_pk)
+app_p.update_downloads([])
+app_p.on_key("esc")
+assert app_p.picker is None and app_p.peek_target is None and app_p.detail is not None
+app_p.on_key("f"); app_p.eng.st = "complete"
+open(os.path.join(app_p.eng.dir, f"{_pih}.torrent"), "wb").write(_pk)
+app_p.update_downloads([]); app_p.on_key("enter")
+assert ev[-1] == ("add", _pmag, None), "all files ticked sends no select-file"
+# failure paths: timeout, engine error, direct links, single file, user left the details view
+app_p = _peek_app(); app_p.on_key("f")
+gid, ih, uri, nm, tmp, t0 = app_p._peek
+app_p._peek = (gid, ih, uri, nm, tmp, t0 - PEEK_TIMEOUT - 1)
+app_p.update_downloads([])
+assert not app_p._peek and "couldn't read" in app_p.status and not os.path.isdir(tmp), app_p.status
+app_p = _peek_app(); app_p.on_key("f"); app_p.eng.st = "error"; app_p.update_downloads([])
+assert not app_p._peek and "couldn't read" in app_p.status
+app_p = _peek_app("https://x.org/book.epub"); app_p.on_key("f")
+assert app_p.status == "no file list for direct links" and not app_p._peek
+app_p = _peek_app(); app_p.on_key("f"); app_p.eng.st = "complete"
+open(os.path.join(app_p.eng.dir, f"{_pih}.torrent"), "wb").write(_ben2({"info": {"name": "one.iso", "length": 3 << 20}}))
+app_p.update_downloads([])
+assert app_p.picker is None and app_p.status.startswith("single file: one.iso"), app_p.status
+app_p = _peek_app(); app_p.on_key("f"); app_p.eng.st = "complete"
+open(os.path.join(app_p.eng.dir, f"{_pih}.torrent"), "wb").write(_pk)
+app_p.on_key("esc"); assert app_p.detail is None
+app_p.update_downloads([])
+assert app_p.picker is None and not app_p._peek, "result arriving after leaving details is dropped"
+app_p = _peek_app(); app_p.on_key("f"); tmp2 = app_p._peek[4]
+app_p.end_peek()
+assert not app_p._peek and not os.path.isdir(tmp2) and ev[-1] == ("remove", "pg"), "quit cleanup"
+gs["free_space"] = o_free
 # update notice: header on results views, splash line, settings toggle persists
 apu = App(eng=None)
 apu.update_tag = "9.9.9"

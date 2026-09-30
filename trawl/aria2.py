@@ -122,6 +122,44 @@ def control_infohash(path: str) -> str | None:
     return head[10:30].hex()
 
 
+def _bdecode(b: bytes, i: int = 0):
+    c = b[i:i + 1]
+    if c == b"i":
+        j = b.index(b"e", i)
+        return int(b[i + 1:j]), j + 1
+    if c in (b"l", b"d"):
+        i += 1
+        out: list | dict = [] if c == b"l" else {}
+        while b[i:i + 1] != b"e":
+            v, i = _bdecode(b, i)
+            if c == b"l":
+                out.append(v)
+            else:
+                out[v], i = _bdecode(b, i)
+        return out, i + 1
+    j = b.index(b":", i)
+    n = int(b[i:j])
+    if n < 0 or j + 1 + n > len(b):
+        raise ValueError("truncated string")
+    return b[j + 1:j + 1 + n], j + 1 + n
+
+
+def torrent_files(blob: bytes) -> list[dict]:
+    """File list of a .torrent in the picker's shape. `index` is aria2's 1-based file
+    number (what select-file takes); BEP 47 padding files keep their number but are
+    hidden. Raises ValueError on anything malformed or truncated."""
+    try:
+        info = _bdecode(blob)[0][b"info"]
+        name = info[b"name"].decode("utf-8", "replace")
+        if b"files" not in info:
+            return [{"index": 1, "path": name, "length": int(info[b"length"]), "selected": True}]
+        return [{"index": n, "path": "/".join([name] + [p.decode("utf-8", "replace") for p in f[b"path"]]),
+                 "length": int(f[b"length"]), "selected": True}
+                for n, f in enumerate(info[b"files"], 1) if b"p" not in f.get(b"attr", b"")]
+    except (IndexError, KeyError, TypeError, AttributeError, RecursionError) as e:
+        raise ValueError("malformed torrent") from e
+
+
 class Aria2:
     TIMEOUT = 5  # seconds per RPC call
 

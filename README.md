@@ -70,6 +70,10 @@ Trawl is a from-scratch Python TUI inspired by
 - **Release badges** — each row shows what the name says it is (`2160p WEB HDR`,
   `1080p BD`, `720p HDTV`); CAM/telesync rips are flagged red. The badge column
   appears on wide terminals; details always show the full format line.
+- **Look inside first** — `f` in a magnet's details view fetches just its
+  metadata (a few seconds, nothing written to your downloads) and lists the files
+  with sizes. Tick the ones you want and `Enter` downloads only those; a season
+  pack no longer has to arrive whole.
 - **Inspect before grabbing** — a details view, open the torrent's page in your
   browser, copy its selected URI/link, or save its `.torrent` file (`e`, metadata
   only). Duplicate results retain source variants; use `←` / `→` in details to
@@ -146,6 +150,15 @@ You can also start straight into a search: `trawl oppenheimer`.
 | `← →` filter category · `c` | clear results |
 | `s` | resume partial downloads found on disk (torrents and direct links) |
 | `g` settings · `?` keys · `q` | quit |
+
+**Details** (`Enter` on a result)
+
+| Key | Action |
+| --- | --- |
+| `d` · `D` · `e` | download · download to a folder · save the `.torrent` |
+| `f` | look inside the torrent: `↑↓` move, `Space` tick, `a` all/none, `Enter` download the ticked files |
+| `← →` | cycle duplicate source variants |
+| `o` · `y` · `p` | open the page · copy the magnet · open the poster |
 
 **Downloads** (`Tab` to switch)
 

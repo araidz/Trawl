@@ -109,6 +109,7 @@ def main(argv: list[str] | None = None) -> int:
         pass
     finally:
         term.leave()
+        app.end_peek()
         eng.stop()
     return 0
 

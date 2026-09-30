@@ -25,6 +25,32 @@ _tm._call = lambda method, params=None, **k: _tc.append((method, params)) or "gi
 assert _tm.add_torrent_file(_tp) == "gid1" and _tm.roots == ["gid1"]
 assert _tc[0][0] == "aria2.addTorrent" and base64.b64decode(_tc[0][1][0]) == b"d4:infod4:name1:xee", _tc
 assert _tc[0][1][1:] == [[], {}], "no web seeds, no options"
+# torrent_files: aria2's own file numbering, padding hidden, junk rejected
+def _ben(x):
+    if isinstance(x, int):
+        return b"i%de" % x
+    if isinstance(x, (bytes, str)):
+        x = x.encode() if isinstance(x, str) else x
+        return b"%d:%s" % (len(x), x)
+    if isinstance(x, list):
+        return b"l" + b"".join(map(_ben, x)) + b"e"
+    return b"d" + b"".join(_ben(k) + _ben(v) for k, v in sorted(x.items())) + b"e"
+_pack = _ben({"info": {"name": "Pack", "piece length": 16384, "pieces": b"x" * 20, "files": [
+    {"length": 100, "path": ["S01", "E01.mkv"]},
+    {"length": 5, "path": [".pad", "5"], "attr": "p"},
+    {"length": 200, "path": ["S01", "E02 é.mkv"]}]}})
+assert torrent_files(_pack) == [
+    {"index": 1, "path": "Pack/S01/E01.mkv", "length": 100, "selected": True},
+    {"index": 3, "path": "Pack/S01/E02 é.mkv", "length": 200, "selected": True}], torrent_files(_pack)
+assert torrent_files(_ben({"info": {"name": "one.iso", "length": 42}})) == [
+    {"index": 1, "path": "one.iso", "length": 42, "selected": True}]
+for junk in (b"", b"garbage", _pack[:-5], b"d4:infoi1ee", _ben({"info": {"name": "x"}}),
+             b"l" * 50000, b"99999999999:x", _ben({"info": {"name": "x", "files": [{"length": 1}]}})):
+    try:
+        torrent_files(junk)
+        raise AssertionError(f"accepted junk: {junk[:20]!r}")
+    except ValueError:
+        pass
 # poll batches via system.multicall: one steady call, root+child on handoff
 mock = Aria2(conf=None)
 mock.roots = ["root"]
