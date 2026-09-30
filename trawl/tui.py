@@ -31,7 +31,7 @@ from functools import cache, lru_cache
 
 from . import __version__, theme as T
 from .aria2 import STATE_DIR, Aria2Error, Download, control_infohash, torrent_files
-from .sources import (SOURCES, LocalQuery, Result, ResultVariant, Search, SourceError, TorznabFeed,
+from .sources import (SOURCES, LocalQuery, Replay, Result, ResultVariant, Search, SourceError, TorznabFeed,
                       build_magnet, dedupe, fetch_json, make_torznab_source, matches_query,
                       parse_magnet, parse_query, parse_release, parse_source, redact, redact_url,
                       result_identity, torznab_label, validate_torznab_url)
@@ -309,6 +309,8 @@ def open_target(path: str, name: str) -> str:
 
 SPACE_MARGIN = 1 << 30  # keep 1 GiB free beyond the torrent itself
 PEEK_TIMEOUT = 45  # seconds to wait for a magnet's file list before giving up
+CACHE_TTL = 600  # a finished search is replayed from memory for 10 minutes
+CACHE_MAX = 20
 
 
 def free_space(path: str) -> int | None:
@@ -624,6 +626,12 @@ class App:
         self._space_warned = ""  # uri whose low-disk warning was shown; pressing again overrides
         self.folder_prompt: tuple[list[tuple[str, str]], str, int] | None = None  # ([(uri, name)], label, bytes) for D
         self.marked: set[str] = set()  # _mkey of results ticked with space for a batch grab
+        self.filtering = False  # typing into the live results filter (f)
+        self.filter_buf = ""
+        self.filter_q: LocalQuery | None = None
+        self._cache: dict[tuple, tuple[float, tuple]] = {}  # (query, source ids) -> (when, updates)
+        self._cache_key: tuple | None = None
+        self._log: list = []  # this search's SourceUpdates, kept to fill the cache
         self.folder_buf = ""
         self.last_dir: str | None = None  # last Shift+D destination, reused as prompt default
         self._exports: dict[str, tuple[str, str, str, float]] = {}  # gid -> (ih, name, dir, started)
@@ -647,7 +655,8 @@ class App:
     def visible_results(self) -> tuple[Result, ...]:
         base = tuple(r for r in self.results
                      if not (self.hide_dead and r.seeders == 0
-                             and self.source_reports_health(r.source)))
+                             and self.source_reports_health(r.source))
+                     and (not self.filter_q or matches_query(r, self.filter_q, self.source_by_id)))
         if self.cat != "all":
             g = CAT_GROUP[self.cat]
             return tuple(r for r in base if self.result_group(r) == g)
@@ -779,7 +788,7 @@ class App:
         return (time.monotonic() - self.start) * 1000 / T.SHEEN_TICK_MS
 
     # -- actions
-    def submit(self) -> None:
+    def submit(self, fresh: bool = False) -> None:
         q = self.query.strip()
         pm = parse_source(q)
         if pm:
@@ -792,17 +801,58 @@ class App:
         srcs = self.enabled_sources()
         if not self.local_query.remote.strip():  # Latest/operator-only: browse-capable built-ins
             srcs = [s for s in srcs if s.browse]
-        self.search = Search(self.local_query.remote, srcs)
+        self._cache_key = (q, tuple(sorted(s.id for s in srcs)))
+        self._log = []
+        hit = None if fresh else self._cache.get(self._cache_key)
+        age = time.monotonic() - hit[0] if hit else CACHE_TTL
+        cached = age < CACHE_TTL
+        self.search = Replay(hit[1], srcs) if cached else Search(self.local_query.remote, srcs)
         self.search_total = getattr(self.search, "total", len(srcs))
         self.results, self.errors, self.search_done, self.sel = [], {}, 0, 0
         self.marked.clear()
+        self._set_filter("")
         self.editing = False
         self.detail = None
         if q:
             self._add_history(q)
         self.status = f'searching "{clean(q)}"' if q else "loading latest"
-        if self.local_query.malformed:
+        if cached:
+            self.status = f"from cache ({int(age // 60)}m {int(age % 60)}s old) — R searches again"
+        elif self.local_query.malformed:
             self.status = f"searching; ignored {len(self.local_query.malformed)} malformed filter(s)"
+
+    def _store_cache(self) -> None:
+        """Remember a search only if every source answered (never cache a failure)."""
+        key, log = self._cache_key, self._log
+        self._cache_key = None
+        if key and log and not isinstance(self.search, Replay) and all(u.results is not None for u in log):
+            self._cache[key] = (time.monotonic(), tuple(log))
+            while len(self._cache) > CACHE_MAX:
+                self._cache.pop(next(iter(self._cache)))
+
+    def _set_filter(self, text: str) -> None:
+        self.filter_buf = text
+        self.filter_q = parse_query(text) if text.strip() else None
+        self.sel = 0
+        if not text:
+            self.filtering = False
+
+    def _filter_key(self, k: str) -> None:
+        """Typing into the live results filter (`f`): same operators as the search box."""
+        if k == "enter":
+            self.filtering = False
+        elif k == "esc":
+            self._set_filter("")
+        elif k == "backspace":
+            self._set_filter(self.filter_buf[:-1])
+            self.filtering = True
+        elif k == "ctrl-u":
+            self._set_filter("")
+            self.filtering = True
+        elif k in ("up", "down", "pageup", "pagedown"):
+            self._move({"up": -1, "down": 1, "pageup": -8, "pagedown": 8}[k])
+        elif len(k) == 1 and k >= " ":
+            self._set_filter(self.filter_buf + k)
 
     def _add_history(self, q: str) -> None:
         if q in self.history:
@@ -827,6 +877,7 @@ class App:
         self.search = None
         self.results, self.errors, self.search_done, self.sel = [], {}, 0, 0
         self.marked.clear()
+        self._set_filter("")
         self.query = ""
         self.cursor = 0
         self.editing = False
@@ -1382,6 +1433,7 @@ class App:
                 break
             self.search_done += 1
             changed = True
+            self._log.append(u)
             if u.results is None:
                 self.errors[u.source] = u.error
             else:
@@ -1396,6 +1448,8 @@ class App:
                              if (result_identity(r) or (r.name, r.magnet)) == selected_id), None)
             self.sel = (restored if restored is not None
                         else min(self.sel, max(0, len(visible) - 1)))
+            if self.search_done >= self.search_total:
+                self._store_cache()
         return changed
 
     def retry_failed_sources(self) -> None:
@@ -1597,6 +1651,9 @@ class App:
                 self.status = ("opened poster" if poster and open_url(poster)
                                else "no poster available")
             return
+        if self.view == "search" and self.filtering:
+            self._filter_key(k)
+            return
         if self.view == "search" and self.editing:
             if k == "enter":
                 self.submit()
@@ -1700,11 +1757,18 @@ class App:
                     self.show_errors = not self.show_errors
                 else:
                     self.status = "all sources answered — nothing to show"
+            elif k == "f":
+                if self.search is not None:
+                    self.filtering = True
+            elif k == "R":
+                self.submit(fresh=True)
             elif k == "esc":
                 if self.show_errors:
                     self.show_errors = False
-                else:
+                elif self.marked:
                     self.marked.clear()
+                else:
+                    self._set_filter("")
             elif k == "c":
                 self.clear()
             elif k == "S":
@@ -2022,6 +2086,9 @@ def _search_panel(app: App, width: int) -> list[str]:
 
 
 def _status_line(app: App, results: Sequence[Result], inner_w: int) -> str:
+    if app.filtering:
+        return cell(f"filter: {clean(app.filter_buf)}▌   {len(results)} of {len(app.results)}"
+                    "  —  enter keeps · esc clears", inner_w, color=T.ALT)
     if marked := app._marked_results():
         return cell(f"{len(marked)} marked · {fmt_bytes(sum(r.size for r in marked))}"
                     "  —  d grabs them · D to a folder · esc clears", inner_w, color=T.GOOD)
@@ -2031,12 +2098,16 @@ def _status_line(app: App, results: Sequence[Result], inner_w: int) -> str:
     if not results:
         if app.search is None:
             return cell("Type to search. Enter runs it; paste a magnet or link to grab it.", inner_w, dim=True)
+        if app.filter_buf and app.results:
+            return cell(f'Nothing matches "{clean(app.filter_buf)}" — esc clears the filter.', inner_w, color=T.WARN)
         if errs >= app.search_total:
             return cell("Couldn't reach any source — they may be down.", inner_w, color=T.WARN)
         q = clean(app.query)
         return cell(f'No results for "{q}".' if q else "Nothing new right now.", inner_w, dim=True)
     note = f"  ({errs} source{'' if errs == 1 else 's'} down)" if errs else ""
     head = "popular now" if not app.query.strip() else f"{len(results)} result{'' if len(results) == 1 else 's'}"
+    if app.filter_buf:
+        head = f'{len(results)} of {len(app.results)} match "{clean(app.filter_buf)}"'
     return cell(head + note, inner_w, dim=True)
 
 
@@ -2326,6 +2397,7 @@ def _help_panel(app: App, width: int, height: int) -> list[str]:
                      ("e", "save .torrent"),
                      ("o", "open page in browser"), ("y", "copy magnet"),
                      ("/  i", "edit query"), ("↑ ↓", "recall past searches"),
+                     ("f  R", "filter results live · search again, skipping the cache"),
                      ("r", "retry failed sources"), ("E", "show why sources failed"),
                      ("z", "hide dead torrents"),
                      ("filters", "seeders: size: age: files: source: group: res: codec:"),
@@ -2399,11 +2471,13 @@ def _footer(app: App, width: int) -> str:
                  ("o", "page"), ("y", "copy"), ("p", "poster"), ("esc/q", "back")]
     elif app.show_errors:
         hints = [("esc/E", "close"), ("r", "retry"), ("q", "quit")]
+    elif app.view == "search" and app.filtering:
+        hints = [("type", "filter"), ("↑↓", "move"), ("enter", "keep"), ("esc", "clear"), ("^c", "quit")]
     elif app.view == "search" and app.editing:
         hints = [("enter", "search"), ("↑↓", "history"), ("esc", "nav"), ("tab", "downloads"), ("^c", "quit")]
     elif app.view == "search":
         n = len(app._marked_results())
-        hints = [("↑↓", "move"), ("enter", "details"), ("space", "mark"),
+        hints = [("↑↓", "move"), ("enter", "details"), ("space", "mark"), ("f", "filter"),
                  ("d", f"grab {n}" if n else "grab"), ("D", "folder"), ("e", ".torrent"),
                  ("o", "page"), ("y", "copy"),
                  ("r", "retry"), ("E", "errors"), ("z", "hide dead"), ("S", "sort"), ("←→", "category"),

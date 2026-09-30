@@ -78,6 +78,9 @@ Trawl is a from-scratch Python TUI inspired by
   browser, copy its selected URI/link, or save its `.torrent` file (`e`, metadata
   only). Duplicate results retain source variants; use `←` / `→` in details to
   cycle them.
+- **Instant repeat searches** — a search where every source answered is kept for
+  ten minutes; searching it again (or coming back to it) replays from memory. A
+  search with a failed source is never cached, and `R` always re-runs.
 - **Batch grab** — `Space` marks results (a ✓ appears and the status line totals
   the size), `d` grabs them all behind a single disk-space check, `D` sends the
   whole batch to one folder. Marks follow the result through re-sorting.
@@ -149,6 +152,8 @@ You can also start straight into a search: `trawl oppenheimer`.
 | `z` | hide/show dead torrents (zero-seeder rows from health-reporting sources) |
 | `o` | open the torrent's page in your browser |
 | `y` copy selected URI/link · `v` | grab a magnet or link from the clipboard |
+| `f` | filter the current results as you type (same operators as the search box: `res:>=1080`, `-cam`, …); `Enter` keeps it, `Esc` clears it |
+| `R` | search again from scratch, skipping the cache |
 | `S` | cycle sort (seeders / size / newest) |
 | `r` | retry failed sources, preserving successful results |
 | `E` | show which sources failed and why |

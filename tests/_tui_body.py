@@ -1218,6 +1218,75 @@ assert added == [str(_tor)] * 3 and apf.status.startswith("grabbing: My Show.tor
 apf.query = "not a file.torrent"
 apf.submit()
 assert added == [str(_tor)] * 3 and apf.search is not None, "a missing path is just a search"
+# live results filter (f) + search cache (replay, expiry, R refresh, never cache failures)
+from .sources import SourceUpdate
+def _cols(a, rows=30):
+    return [strip_ansi(x) for x in render(a, 120, rows)]
+_made = []
+_canned = {"yts": [Result("1" * 40, "Dune.2021.2160p.WEB", 9 << 30, 90, 1, "yts", "m1"),
+                   Result("2" * 40, "Dune Part Two 2024 1080p", 4 << 30, 80, 1, "yts", "m2")],
+           "eztv": [Result("3" * 40, "Dune 1984 720p", 1 << 30, 70, 1, "eztv", "m3")]}
+class _FakeSearch:
+    def __init__(self, q, sources):
+        _made.append(q)
+        self.updates, self.total, self.sources = queue.Queue(), len(sources), {s.id: s for s in sources}
+        for s in sources:
+            self.updates.put(SourceUpdate(s.id, None, "boom") if q == "bad" and s.id == "yts"
+                             else SourceUpdate(s.id, list(_canned.get(s.id, []))))
+    def retry(self, ids): return ()
+_orig_search, _orig_hist = gs["Search"], gs["save_history"]
+gs["Search"], gs["save_history"] = _FakeSearch, lambda h: None
+apc = App(eng=None)
+apc.query = "dune"; apc.submit(); apc.drain_search()
+assert _made == ["dune"] and len(apc.results) == 3 and len(apc._cache) == 1, (_made, len(apc.results))
+apc.submit(); apc.drain_search()
+assert _made == ["dune"] and len(apc.results) == 3 and "from cache" in apc.status, "second search is replayed"
+assert len(apc._cache) == 1 and isinstance(apc.search, Replay)
+apc.on_key("R")
+assert _made == ["dune", "dune"] and "from cache" not in apc.status, "R bypasses the cache"
+apc.drain_search()
+_k = next(iter(apc._cache)); apc._cache[_k] = (time.monotonic() - CACHE_TTL - 1, apc._cache[_k][1])
+apc.submit()
+assert len(_made) == 3, "an expired entry is searched again"
+apc.drain_search()
+apc.query = "bad"; apc.submit(); apc.drain_search()
+assert apc.errors and not any(k[0] == "bad" for k in apc._cache), "a search with a failed source is never cached"
+for i in range(CACHE_MAX + 5):
+    apc.query = f"q{i}"; apc.submit(); apc.drain_search()
+assert len(apc._cache) == CACHE_MAX, "cache is bounded"
+apc.query = "dune"; apc.submit(fresh=True); apc.drain_search()
+apc.on_key("f")
+assert apc.filtering
+for ch in "part":
+    apc.on_key(ch)
+assert [r.name for r in apc.visible_results()] == ["Dune Part Two 2024 1080p"] and apc.sel == 0
+assert any("1 of 3" in x for x in _cols(apc)) and "keep" in strip_ansi(_footer(apc, 120))
+apc.on_key("enter")
+assert not apc.filtering and len(apc.visible_results()) == 1
+assert any('1 of 3 match "part"' in x for x in _cols(apc)), "filter stays visible after enter"
+apc.on_key("esc")
+assert not apc.filter_buf and len(apc.visible_results()) == 3, "esc clears an applied filter"
+apc.on_key("f")
+for ch in "res:>=1080":
+    apc.on_key(ch)
+assert sorted(r.name[:4] for r in apc.visible_results()) == ["Dune", "Dune"], "filter takes search operators"
+apc.on_key("ctrl-u"); assert apc.filtering and len(apc.visible_results()) == 3, "ctrl-u empties but keeps typing"
+for ch in "zzz":
+    apc.on_key(ch)
+assert any("0 of 3" in x for x in _cols(apc)) and all(dwidth(x) <= 120 for x in _cols(apc))
+apc.on_key("enter")
+assert any('Nothing matches "zzz"' in x for x in _cols(apc)), "empty applied filter explains itself"
+apc.on_key("f")
+apc.on_key("backspace"); apc.on_key("backspace"); apc.on_key("backspace")
+assert apc.filtering and not apc.filter_buf
+apc.on_key("down"); assert apc.sel == 1, "arrows move while typing"
+apc.on_key("esc"); assert not apc.filtering
+apc.on_key("f"); apc.on_key("d"); apc.query = "dune"; apc.submit()
+assert not apc.filter_buf and not apc.filtering, "a new search drops the filter"
+apc.results = []; apc.search = None; apc.on_key("f")
+assert not apc.filtering, "no filter on the splash"
+gs["Search"], gs["save_history"] = _orig_search, _orig_hist
+
 # multi-select: mark rows, batch grab, batch to a folder, guards, modal renders
 def _batch_app(fail_on=None):
     a = App(eng=None)

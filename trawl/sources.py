@@ -1505,3 +1505,18 @@ class Search:
         with self._lock:
             self.in_flight.discard(s.id)
             self.updates.put(update)
+
+
+class Replay:
+    """A finished Search served from cache: the same surface (`updates`, `total`,
+    `sources`, `retry`) with nothing in flight, so the UI drains it like a live one."""
+
+    def __init__(self, updates: tuple[SourceUpdate, ...], sources: list[Source]):
+        self.updates: queue.Queue[SourceUpdate] = queue.Queue()
+        for u in updates:
+            self.updates.put(u)
+        self.total = len(updates)
+        self.sources = {s.id: s for s in sources}
+
+    def retry(self, ids) -> tuple[str, ...]:
+        return ()
