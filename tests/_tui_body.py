@@ -1218,6 +1218,66 @@ assert added == [str(_tor)] * 3 and apf.status.startswith("grabbing: My Show.tor
 apf.query = "not a file.torrent"
 apf.submit()
 assert added == [str(_tor)] * 3 and apf.search is not None, "a missing path is just a search"
+# multi-select: mark rows, batch grab, batch to a folder, guards, modal renders
+def _batch_app(fail_on=None):
+    a = App(eng=None)
+    a.view, a.search, a.query = "search", object(), "x"
+    a.results = [Result(f"{i:040x}", f"Show.S01E0{i}.1080p", (i + 1) << 28, 10 - i, 0, "eztv",
+                        build_magnet(f"{i:040x}", f"E{i}")) for i in range(5)]
+    a.calls = []
+    a.grab = lambda m, n, *rest: a.calls.append((n, rest)) or n != fail_on  # type: ignore[method-assign]
+    return a
+def _cols(a, rows=30):
+    return [strip_ansi(x) for x in render(a, 120, rows)]
+apm = _batch_app()
+apm.on_key(" "); apm.on_key(" ")
+assert apm.sel == 2 and [r.name[-9:] for r in apm._marked_results()] == ["E00.1080p", "E01.1080p"], "space marks and steps down"
+scr = _cols(apm)
+assert sum(x.count(T.DONE) for x in scr if "Show.S01" in x) == 2, "two ✓ on result rows"
+assert any("2 marked · 768.00 MB" in x for x in scr) and all(dwidth(x) <= 120 for x in scr)
+assert {dwidth(strip_ansi(x)) for x in _results_panel(apm, 80, 8)} == {80}, "marks don't shift the layout"
+assert "grab 2" in strip_ansi(_footer(apm, 140)) and "mark" in strip_ansi(_footer(apm, 140))
+apm.results = apm.results[::-1]   # a re-sort must not lose marks (keyed by identity)
+assert [r.name[-9:] for r in apm._marked_results()] == ["E01.1080p", "E00.1080p"], "marks survive re-sorting"
+apm.results = apm.results[::-1]
+apm.on_key("d")
+assert [c[0][-9:] for c in apm.calls] == ["E00.1080p", "E01.1080p"] and not apm.marked, apm.calls
+assert apm.status == "grabbing 2 downloads · 768.00 MB", apm.status
+apm.on_key("a"); assert len(apm.marked) == 5
+apm.on_key("a"); assert not apm.marked, "a toggles all/none"
+apm.on_key(" "); apm.on_key("esc"); assert not apm.marked, "esc clears marks"
+apm.on_key(" "); apm.clear(); assert not apm.marked, "clear() drops marks"
+apm = _batch_app(); apm.on_key("d")
+assert len(apm.calls) == 1 and apm.calls[0][1] == (), "no marks: d grabs the selected row as before"
+apm = _batch_app(); apm.on_key(" "); apm.cat = "anime"
+apm.on_key("d")
+assert not apm.calls and apm._marked_results() == [], "marks hidden by a filter are not grabbed"
+apm = _batch_app(fail_on="Show.S01E01.1080p"); apm.on_key(" "); apm.on_key(" "); apm.on_key("d")
+assert apm.status.startswith("grabbing 1 of 2"), apm.status
+gs["free_space"] = lambda p: 1 << 30   # 1 GiB free; the batch needs 768 MiB plus the 1 GiB margin
+apm = _batch_app(); apm.on_key(" "); apm.on_key(" "); apm.on_key("d")
+assert not apm.calls and "press again" in apm.status and len(apm.marked) == 2, "one disk check for the batch"
+apm.on_key("d")
+assert len(apm.calls) == 2 and not apm.marked, "second press overrides"
+gs["free_space"] = o_free
+# D: one folder for the whole batch; the modal renders (regression: it crashed on unpack)
+_bd = tempfile.mkdtemp()
+apm = _batch_app(); apm.on_key(" "); apm.on_key(" "); apm.on_key("D")
+assert apm.folder_prompt and len(apm.folder_prompt[0]) == 2 and apm.folder_prompt[1] == "2 downloads"
+assert any("Download to folder — 2 downloads" in x for x in _cols(apm)), "batch folder modal renders"
+apm.folder_buf = os.path.join(_bd, "TV")
+apm.on_key("enter")
+assert [c[1] for c in apm.calls] == [(os.path.join(_bd, "TV"),)] * 2 and apm.view == "downloads", apm.calls
+assert os.path.isdir(os.path.join(_bd, "TV")) and not apm.marked
+apm = _batch_app(); apm.on_key("D")
+assert apm.folder_prompt[1] == "Show.S01E00.1080p" and any("Download to folder — Show.S01E00" in x for x in _cols(apm))
+apm.on_key("esc"); assert apm.folder_prompt is None
+apd = _batch_app(); apd.on_key("enter"); apd.on_key("D")   # from the details view
+assert apd.folder_prompt and any("Download to folder" in x for x in _cols(apd)), "details D modal renders"
+class _AddEng:
+    def add(self, uri, opts=None): pass
+assert App(eng=None).grab("m", "n") is False and App(eng=_AddEng()).grab("m", "n") is True, "grab reports success"
+
 # peek inside: metadata-only fetch -> file picker -> grab just the ticked files
 _ben2 = lambda x: (b"i%de" % x if isinstance(x, int) else b"%d:%s" % (len(x), x.encode() if isinstance(x, str) else x)
                    if isinstance(x, (str, bytes)) else b"l" + b"".join(map(_ben2, x)) + b"e" if isinstance(x, list)

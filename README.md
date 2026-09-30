@@ -78,6 +78,9 @@ Trawl is a from-scratch Python TUI inspired by
   browser, copy its selected URI/link, or save its `.torrent` file (`e`, metadata
   only). Duplicate results retain source variants; use `←` / `→` in details to
   cycle them.
+- **Batch grab** — `Space` marks results (a ✓ appears and the status line totals
+  the size), `d` grabs them all behind a single disk-space check, `D` sends the
+  whole batch to one folder. Marks follow the result through re-sorting.
 - **Folder download** — `D` grabs to a one-off folder (created on the fly,
   remembered for next time) without changing the default download dir.
 - **Dead-torrent filter** — `z` hides zero-seeder results from sources that
@@ -138,8 +141,10 @@ You can also start straight into a search: `trawl oppenheimer`.
 | `↑ ↓` | recall past searches · `PgUp/PgDn` page · `Home/End` jump |
 | `Ctrl-A/E` caret · `Ctrl-U/W` kill · `Esc` exit the box | edit the query |
 | `Enter` | result details |
-| `d` | download selected |
-| `D` | download selected to a chosen folder (remembered for next time) |
+| `Space` | mark / unmark the selected result and step down (build a batch: a whole season, a run of episodes) |
+| `a` · `Esc` | mark all visible / none · clear marks |
+| `d` | download the marked results, or the selected one if nothing is marked |
+| `D` | the same, into a chosen folder (created on the fly, remembered for next time) |
 | `e` | save the selected torrent's `.torrent` file (metadata only, no download) |
 | `z` | hide/show dead torrents (zero-seeder rows from health-reporting sources) |
 | `o` | open the torrent's page in your browser |

@@ -622,7 +622,8 @@ class App:
         self.update_check = bool(cfg.get("update_check", True))
         self.update_tag = ""  # newer release found by check_update, shown in header/splash
         self._space_warned = ""  # uri whose low-disk warning was shown; pressing again overrides
-        self.folder_prompt: tuple[str, str, int] | None = None  # (uri, name, size) for D download
+        self.folder_prompt: tuple[list[tuple[str, str]], str, int] | None = None  # ([(uri, name)], label, bytes) for D
+        self.marked: set[str] = set()  # _mkey of results ticked with space for a batch grab
         self.folder_buf = ""
         self.last_dir: str | None = None  # last Shift+D destination, reused as prompt default
         self._exports: dict[str, tuple[str, str, str, float]] = {}  # gid -> (ih, name, dir, started)
@@ -794,6 +795,7 @@ class App:
         self.search = Search(self.local_query.remote, srcs)
         self.search_total = getattr(self.search, "total", len(srcs))
         self.results, self.errors, self.search_done, self.sel = [], {}, 0, 0
+        self.marked.clear()
         self.editing = False
         self.detail = None
         if q:
@@ -824,6 +826,7 @@ class App:
         """Drop search results and return to the splash."""
         self.search = None
         self.results, self.errors, self.search_done, self.sel = [], {}, 0, 0
+        self.marked.clear()
         self.query = ""
         self.cursor = 0
         self.editing = False
@@ -833,11 +836,11 @@ class App:
         self.status = ""
 
     def grab(self, magnet: str, name: str, dir_: str | None = None,
-             select: Iterable[int] = ()) -> None:
+             select: Iterable[int] = ()) -> bool:
         secrets = self._all_secrets()
         if not self.eng:
             self.status = redact(f"(no engine) {clean(name)[:48]}", secrets)
-            return
+            return False
         opts = {"dir": dir_} if dir_ else {}
         if select:  # 1-based file numbers; aria2 applies them once a magnet's metadata arrives
             opts["select-file"] = ",".join(map(str, sorted(select)))
@@ -846,8 +849,28 @@ class App:
             uri = magnet if magnet.lower().startswith(("http://", "https://")) else ""
             self._record_pending(uri, dir_)  # http links: remembered for scan_resume
             self.status = redact(f"grabbing: {clean(name)[:48]}", secrets)
+            return True
         except Aria2Error as e:
             self.status = redact(f"error: {e}", secrets)
+            return False
+
+    def _mkey(self, r: Result) -> str:
+        return result_identity(r) or r.magnet
+
+    def _marked_results(self) -> list[Result]:
+        """Marked rows that are currently visible, in list order."""
+        return [r for r in self.visible_results() if self._mkey(r) in self.marked] if self.marked else []
+
+    def _grab_items(self, items: list[tuple[str, str]], size: int, dir_: str | None = None) -> None:
+        """Grab one or several (uri, name) items behind a single disk-space check.
+        Several = the marked rows: marks clear and one summary replaces per-item status."""
+        if not items or not self._space_ok("|".join(u for u, _ in items), size, dir_):
+            return
+        ok = sum(bool(self.grab(uri, name, dir_) if dir_ else self.grab(uri, name)) for uri, name in items)
+        if len(items) > 1:
+            self.status = (f"grabbing {ok} downloads · {fmt_bytes(size)}" if ok == len(items)
+                           else f"grabbing {ok} of {len(items)} — {self.status}")
+            self.marked.clear()
 
     def _record_pending(self, uri: str, dir_: str | None) -> None:
         """Stash direct-http grabs so scan_resume can re-add unfinished ones
@@ -872,12 +895,13 @@ class App:
         self.status = f"only {fmt_bytes(free)} free, needs {fmt_bytes(size)} — press again to grab anyway"
         return False
 
-    def _start_folder_prompt(self, uri: str, name: str, size: int = 0) -> None:
-        self.folder_prompt = (uri, name, size)
+    def _start_folder_prompt(self, items: list[tuple[str, str]], size: int = 0) -> None:
+        label = items[0][1] if len(items) == 1 else f"{len(items)} downloads"
+        self.folder_prompt = (items, label, size)
         self.folder_buf = self.last_dir or self.download_dir or ""
 
     def _commit_folder_prompt(self) -> None:
-        uri, name, size = self.folder_prompt or ("", "", 0)
+        items, _, size = self.folder_prompt or ([], "", 0)
         self.folder_prompt = None
         path = os.path.expanduser(self.folder_buf.strip())
         if not path:
@@ -889,10 +913,8 @@ class App:
             self.status = f"couldn't create folder: {e.strerror or e}"
             return
         self.last_dir = path
-        if not self._space_ok(uri, size, path):
-            return
-        self.grab(uri, name, dir_=path)
-        if self.view == "search":
+        self._grab_items(items, size, path)
+        if self.view == "search" and not self._space_warned:
             self.view = "downloads"
 
     def export_torrent(self, uri: str, name: str) -> None:
@@ -1556,7 +1578,7 @@ class App:
                     self.detail = None
                     self.variant_idx = 0
             elif k == "D":
-                self._start_folder_prompt(self._variant().uri, self.detail.name, self.detail.size)
+                self._start_folder_prompt([(self._variant().uri, self.detail.name)], self.detail.size)
             elif k == "e":
                 self.export_torrent(self._variant().uri, self.detail.name)
             elif k == "f":
@@ -1681,6 +1703,8 @@ class App:
             elif k == "esc":
                 if self.show_errors:
                     self.show_errors = False
+                else:
+                    self.marked.clear()
             elif k == "c":
                 self.clear()
             elif k == "S":
@@ -1692,12 +1716,20 @@ class App:
                                else "showing all torrents")
             elif k == "r":
                 self.retry_failed_sources()
-            elif k == "d":
-                if (r := self._cur()) and self._space_ok(r.magnet, r.size):
-                    self.grab(r.magnet, r.name)
-            elif k == "D":
+            elif k == " ":  # mark/unmark for a batch grab, then step down like a file manager
                 if (r := self._cur()):
-                    self._start_folder_prompt(r.magnet, r.name, r.size)
+                    self.marked ^= {self._mkey(r)}
+                    self._move(1)
+            elif k == "a":  # mark every visible row, or clear when they're all marked
+                keys = {self._mkey(r) for r in self.visible_results()}
+                self.marked = set() if keys <= self.marked else self.marked | keys
+            elif k in ("d", "D"):
+                rs = self._marked_results() or ([r] if (r := self._cur()) else [])
+                items, size = [(r.magnet, r.name) for r in rs], sum(r.size for r in rs)
+                if k == "D" and items:
+                    self._start_folder_prompt(items, size)
+                else:
+                    self._grab_items(items, size)
             elif k == "e":
                 if (r := self._cur()):
                     self.export_torrent(r.magnet, r.name)
@@ -1990,6 +2022,9 @@ def _search_panel(app: App, width: int) -> list[str]:
 
 
 def _status_line(app: App, results: Sequence[Result], inner_w: int) -> str:
+    if marked := app._marked_results():
+        return cell(f"{len(marked)} marked · {fmt_bytes(sum(r.size for r in marked))}"
+                    "  —  d grabs them · D to a folder · esc clears", inner_w, color=T.GOOD)
     if app.search and app.search_done < app.search_total:
         return cell(f"searching… {app.search_done}/{app.search_total} sources", inner_w, dim=True)
     errs = len(app.errors)
@@ -2055,6 +2090,7 @@ def _results_panel(app: App, width: int, height: int) -> list[str]:
             tag, tcolor = app.source_tag(r.source)
             sl = seed_leech(r, app.source_reports_health(r.source))
             rel = parse_release(r.name)
+            mark = cell(T.DONE, 1, color=T.GOOD, bold=True) if app.marked and app._mkey(r) in app.marked else " "
             bcell = ""
             if badge_w:
                 bcolor = T.BAD if rel.bad else T.BRIGHT if (rel.res >= 2160 or rel.hdr) else None
@@ -2062,14 +2098,14 @@ def _results_panel(app: App, width: int, height: int) -> list[str]:
                              bold=here or rel.bad, dim=bcolor is None and not here) + " "
             if here:  # selected row: the whole line lights up in accent
                 inner.append(
-                    cell(T.PTR, 2, color=T.ACCENT) + " "
+                    cell(T.PTR, 1, color=T.ACCENT) + mark + " "
                     + cell(clean(r.name), name_w, color=T.ACCENT, bold=True) + " " + bcell
                     + cell(fmt_bytes(r.size), 9, "right", color=T.ACCENT, bold=True) + " "
                     + cell(sl, 9, "right", color=T.ACCENT, bold=True) + " "
                     + cell(tag, 5, "right", color=T.ACCENT, bold=True))
             else:
                 inner.append(
-                    cell("", 2) + " "
+                    " " + mark + " "
                     + cell(clean(r.name), name_w, color=T.TEXT) + " " + bcell
                     + cell(fmt_bytes(r.size), 9, "right", dim=True) + " "
                     + cell(sl, 9, "right", color=seed_color(r.seeders)) + " "
@@ -2285,7 +2321,9 @@ def _help_panel(app: App, width: int, height: int) -> list[str]:
     inner_w = width - 4
     groups = [
         ("Search", [("type", "search (paste a magnet, infohash or link; drop a .torrent)"), ("enter", "details"),
-                     ("d", "download"), ("D", "download to a folder"), ("e", "save .torrent"),
+                     ("space", "mark a result, step down (a all/none, esc clear)"),
+                     ("d / D", "download / to a folder: all marked, else the selected"),
+                     ("e", "save .torrent"),
                      ("o", "open page in browser"), ("y", "copy magnet"),
                      ("/  i", "edit query"), ("↑ ↓", "recall past searches"),
                      ("r", "retry failed sources"), ("E", "show why sources failed"),
@@ -2364,7 +2402,9 @@ def _footer(app: App, width: int) -> str:
     elif app.view == "search" and app.editing:
         hints = [("enter", "search"), ("↑↓", "history"), ("esc", "nav"), ("tab", "downloads"), ("^c", "quit")]
     elif app.view == "search":
-        hints = [("↑↓", "move"), ("enter", "details"), ("d", "grab"), ("D", "folder"), ("e", ".torrent"),
+        n = len(app._marked_results())
+        hints = [("↑↓", "move"), ("enter", "details"), ("space", "mark"),
+                 ("d", f"grab {n}" if n else "grab"), ("D", "folder"), ("e", ".torrent"),
                  ("o", "page"), ("y", "copy"),
                  ("r", "retry"), ("E", "errors"), ("z", "hide dead"), ("S", "sort"), ("←→", "category"),
                  ("v", "paste"), ("g", "settings"), ("q", "quit")]
@@ -2474,7 +2514,7 @@ def _cancel_box(cols: int) -> list[str]:
 
 
 def _folder_box(cols: int, app: App) -> list[str]:
-    _, name = app.folder_prompt or ("", "")
+    _, name, _ = app.folder_prompt or ([], "", 0)
     label = f"Download to folder — {clean(name)}"
     box_w = min(max(dwidth(label) + 6, 30), cols - 2)
     pre = " " * max(0, (cols - box_w) // 2)
