@@ -115,10 +115,15 @@ RESET = "\x1b[0m"
 _ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 
 
-@lru_cache(maxsize=2048)
+@lru_cache(maxsize=4096)
 def _fg(hexc: str) -> str:
+    if T.COLOR_MODE == "none":
+        return ""
     n = int(hexc[1:], 16)
-    return f"\x1b[38;2;{(n >> 16) & 255};{(n >> 8) & 255};{n & 255}m"
+    r, g, b = (n >> 16) & 255, (n >> 8) & 255, n & 255
+    if T.COLOR_MODE == "256":
+        return f"\x1b[38;5;{T.rgb_to_256(r, g, b)}m"
+    return f"\x1b[38;2;{r};{g};{b}m"
 
 
 def style(text: str, color: str | None = None, bold: bool = False, dim: bool = False) -> str:
@@ -1130,6 +1135,8 @@ class App:
     def _set_theme(self, name: str) -> None:
         self.theme = T.set_theme(name)
         _logo_lines.cache_clear()  # the gradient logo is baked at first render
+        _bar_cells.cache_clear()   # bar gradients read DEEP/BRIGHT, which the cache key omits
+        _static_bar.cache_clear()
 
     def setting_items(self) -> list[tuple[str, object]]:
         return ([('section', 'General'), ('dir', None), ('limit', None), ('provider', None),
@@ -1235,7 +1242,7 @@ class App:
                 self.edit_field = "key"
                 self.edit_buf = self._provider_key() or ""
             elif k in ("enter", " ") and kind == "theme":
-                self._set_theme("light" if self.theme == "violet" else "violet")
+                self._set_theme(T.THEMES[(T.THEMES.index(self.theme) + 1) % len(T.THEMES)])
                 self._save_settings()
             elif k in ("enter", " ") and kind == "updates":
                 self.update_check = not self.update_check

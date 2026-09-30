@@ -9,6 +9,7 @@ currently active palette; `set_theme()` flips it at runtime.
 from __future__ import annotations
 
 import math
+import os
 
 # -- palettes -----------------------------------------------------------------
 # violet: torlink's original. light: tuned for light terminal backgrounds.
@@ -57,7 +58,34 @@ _PALETTES: dict[str, dict[str, str | dict[str, str]]] = {
     },
 }
 
-THEMES = ("violet", "light")
+# Compact dark palettes: (ACCENT, TEXT, ALT, GOOD, WARN, BAD, BRIGHT, RULE, PAUSED, DEEP, SHADE,
+# NET, BLUE, ORANGE, PINK, PEAK). Source colors are derived from these roles.
+_ROLES = {
+    "fitgirl": "ACCENT", "yts": "GOOD", "eztv": "WARN", "nyaa": "BRIGHT", "subsplease": "ALT",
+    "solid": "BLUE", "tpb-movies": "NET_COLOR", "tpb-tv": "NET_COLOR", "tpb-books": "NET_COLOR",
+    "x1337-movies": "ORANGE", "x1337-tv": "ORANGE", "dodi": "WARN", "animetosho": "PINK",
+    "knaben": "BLUE", "torrentgalaxy": "GOOD", "nyaa-books": "BRIGHT", "libgen": "GOOD", "annas": "BAD",
+}
+_DARK = {
+    "catppuccin": ("#cba6f7", "#cdd6f4", "#b4befe", "#a6e3a1", "#f9e2af", "#f38ba8", "#f5c2e7", "#585b70",
+                   "#6c7086", "#8b6fc9", "#45475a", "#94e2d5", "#89b4fa", "#fab387", "#f5c2e7", "#f5e0dc"),
+    "nord": ("#88c0d0", "#eceff4", "#81a1c1", "#a3be8c", "#ebcb8b", "#bf616a", "#8fbcbb", "#4c566a",
+             "#616e88", "#5e81ac", "#3b4252", "#8fbcbb", "#81a1c1", "#d08770", "#b48ead", "#eceff4"),
+    "gruvbox": ("#fabd2f", "#ebdbb2", "#d5c4a1", "#b8bb26", "#fe8019", "#fb4934", "#f9e08c", "#665c54",
+                "#7c6f64", "#d79921", "#504945", "#8ec07c", "#83a598", "#fe8019", "#d3869b", "#fbf1c7"),
+    "dracula": ("#bd93f9", "#f8f8f2", "#caa9fa", "#50fa7b", "#f1fa8c", "#ff5555", "#d6b8ff", "#6272a4",
+                "#6272a4", "#8a5cd6", "#44475a", "#8be9fd", "#8be9fd", "#ffb86c", "#ff79c6", "#f8f8f2"),
+    "tokyo-night": ("#7aa2f7", "#c0caf5", "#9aa5ce", "#9ece6a", "#e0af68", "#f7768e", "#bb9af7", "#414868",
+                    "#565f89", "#3d59a1", "#292e42", "#7dcfff", "#2ac3de", "#ff9e64", "#bb9af7", "#c0caf5"),
+}
+for _name, _v in _DARK.items():
+    _all = dict(zip(("ACCENT", "TEXT", "ALT", "GOOD", "WARN", "BAD", "BRIGHT", "RULE", "PAUSED", "DEEP",
+                     "SHADE", "NET_COLOR", "BLUE", "ORANGE", "PINK", "SHEEN_PEAK"), _v), WHITE="#ffffff")
+    _pal = {k: v for k, v in _all.items() if k not in ("BLUE", "ORANGE", "PINK")}  # roles only feed sources
+    _pal["SOURCE_COLOR"] = {sid: _all[role] for sid, role in _ROLES.items()}
+    _PALETTES[_name] = _pal
+
+THEMES = ("violet", "light", *_DARK)
 ACTIVE = "violet"
 
 
@@ -66,6 +94,41 @@ def set_theme(name: str) -> str:
     if name in _PALETTES:
         ACTIVE = name
     return ACTIVE
+
+
+# -- terminal color capability -------------------------------------------------
+_TRUECOLOR_APPS = {"iTerm.app", "WezTerm", "ghostty", "vscode", "Hyper", "WarpTerminal"}
+
+
+def detect_color_mode(env) -> str:
+    """truecolor | 256 | none. TRAWL_COLOR overrides; NO_COLOR (no-color.org) turns color off;
+    truecolor needs a positive signal, so terminals that lack it (older Terminal.app) get 256."""
+    force = env.get("TRAWL_COLOR", "").lower()
+    if force in ("truecolor", "256", "none"):
+        return force
+    term = env.get("TERM", "")
+    if env.get("NO_COLOR") or term == "dumb":
+        return "none"
+    if (env.get("COLORTERM", "").lower() in ("truecolor", "24bit")
+            or env.get("TERM_PROGRAM") in _TRUECOLOR_APPS
+            or any(t in term for t in ("kitty", "ghostty", "alacritty", "wezterm"))):
+        return "truecolor"
+    return "256"
+
+
+def rgb_to_256(r: int, g: int, b: int) -> int:
+    """Nearest xterm-256 index: the 6x6x6 cube (16-231) or the grey ramp (232-255)."""
+    lvl = lambda v: 0 if v < 48 else 1 if v < 115 else (v - 35) // 40
+    steps = (0, 95, 135, 175, 215, 255)
+    ci = (lvl(r), lvl(g), lvl(b))
+    cube = tuple(steps[i] for i in ci)
+    gi = max(0, min(23, round(((r + g + b) / 3 - 8) / 10)))
+    grey = 8 + 10 * gi
+    d = lambda c: sum((x - y) ** 2 for x, y in zip(c, (r, g, b)))
+    return 232 + gi if d((grey,) * 3) < d(cube) else 16 + 36 * ci[0] + 6 * ci[1] + ci[2]
+
+
+COLOR_MODE = detect_color_mode(os.environ)
 
 
 def __getattr__(name: str):

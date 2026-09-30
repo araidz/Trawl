@@ -81,6 +81,11 @@ Trawl is a from-scratch Python TUI inspired by
 - **Instant repeat searches** — a search where every source answered is kept for
   ten minutes; searching it again (or coming back to it) replays from memory. A
   search with a failed source is never cached, and `R` always re-runs.
+- **Themes and colour safety** — seven palettes (violet, light, Catppuccin, Nord,
+  Gruvbox, Dracula, Tokyo Night), cycled from settings (`g`, "Theme"). Trawl
+  detects the terminal: truecolor where it's advertised (`COLORTERM`, iTerm2,
+  WezTerm, kitty, Ghostty…), a 256-colour fallback otherwise, and plain text
+  under `NO_COLOR`. `TRAWL_COLOR=truecolor|256|none` overrides the detection.
 - **Batch grab** — `Space` marks results (a ✓ appears and the status line totals
   the size), `d` grabs them all behind a single disk-space check, `D` sends the
   whole batch to one folder. Marks follow the result through re-sorting.

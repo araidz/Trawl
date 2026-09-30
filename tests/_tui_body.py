@@ -641,8 +641,12 @@ appg.set_sel = next(i for i, it in enumerate(appg.setting_items()) if it[0] == "
 appg.on_key("enter")
 assert appg.theme == "light" and saved_cfg["theme"] == "light" and T.ACCENT == "#6d4fc9", \
     "theme toggle did not flip palette/persist"
-appg.on_key(" ")
-assert appg.theme == "violet" and T.ACCENT == "#a78bfa", "theme toggle back"
+seen = [appg.theme]
+for _ in range(len(T.THEMES) - 1):   # every palette is reachable, then it wraps to violet
+    appg.on_key(" ")
+    seen.append(appg.theme)
+assert seen == [*T.THEMES[1:], "violet"] and len(set(seen)) == len(T.THEMES) >= 7, seen
+assert appg.theme == "violet" and T.ACCENT == "#a78bfa" and saved_cfg["theme"] == "violet", "theme cycle wraps"
 # key entry writes the active provider's key
 appg.set_sel = next(i for i, it in enumerate(appg.setting_items()) if it[0] == "meta-key")
 appg.tmdb_key = None
@@ -1218,6 +1222,49 @@ assert added == [str(_tor)] * 3 and apf.status.startswith("grabbing: My Show.tor
 apf.query = "not a file.torrent"
 apf.submit()
 assert added == [str(_tor)] * 3 and apf.search is not None, "a missing path is just a search"
+# themes: every palette is complete and renders; color modes degrade cleanly
+import re as _re
+_vio = T._PALETTES["violet"]
+_tb = App(eng=None); _tb.search, _tb.query = object(), "x"
+_tb.results = [Result("a" * 40, "Dune.2021.1080p.WEB", 10 ** 9, 5, 1, "yts", "m")]
+_tb.downloads = [Download("g", "F", "active", 100, 40, 5, 1, 60.0, root="r")]
+for _t in T.THEMES:
+    _p = T._PALETTES[_t]
+    assert set(_p) == set(_vio) and set(_p["SOURCE_COLOR"]) == set(_vio["SOURCE_COLOR"]), f"{_t}: incomplete palette"
+    assert all(_re.fullmatch(r"#[0-9a-f]{6}", v) for k, v in _p.items() if k != "SOURCE_COLOR"), _t
+    assert all(_re.fullmatch(r"#[0-9a-f]{6}", v) for v in _p["SOURCE_COLOR"].values()), _t
+    T.set_theme(_t)
+    for _v in ("search", "downloads"):
+        _tb.view = _v
+        assert all(dwidth(strip_ansi(x)) <= 100 for x in render(_tb, 100, 30)), f"{_t}/{_v} overflow"
+    assert render(App(eng=None), 100, 30), _t
+T.set_theme("violet")
+_tb.view = "search"
+_det = T.detect_color_mode
+assert _det({"COLORTERM": "truecolor"}) == "truecolor" and _det({"COLORTERM": "24bit"}) == "truecolor"
+assert _det({"TERM_PROGRAM": "iTerm.app"}) == "truecolor" and _det({"TERM": "xterm-kitty"}) == "truecolor"
+assert _det({"TERM": "xterm-256color", "TERM_PROGRAM": "Apple_Terminal"}) == "256", "no positive signal: 256"
+assert _det({}) == "256" and _det({"TERM": "dumb"}) == "none"
+assert _det({"COLORTERM": "truecolor", "NO_COLOR": "1"}) == "none" and _det({"NO_COLOR": ""}) == "256"
+assert _det({"NO_COLOR": "1", "TRAWL_COLOR": "256"}) == "256" and _det({"TRAWL_COLOR": "bogus"}) == "256"
+assert T.rgb_to_256(0, 0, 0) == 16 and T.rgb_to_256(255, 255, 255) == 231
+assert T.rgb_to_256(255, 0, 0) == 196 and T.rgb_to_256(0, 255, 0) == 46 and T.rgb_to_256(95, 135, 175) == 67
+assert T.rgb_to_256(128, 128, 128) == 244, "greys use the grey ramp"
+assert all(16 <= T.rgb_to_256(r, g, b) <= 255 for r in range(0, 256, 51) for g in range(0, 256, 51) for b in range(0, 256, 51))
+_om = T.COLOR_MODE
+try:
+    for _mode, _has, _not in (("truecolor", "38;2;", "38;5;"), ("256", "38;5;", "38;2;"), ("none", "\x1b[1m", "38;")):
+        T.COLOR_MODE = _mode
+        for _c in (_fg, _logo_lines, _bar_cells, _static_bar):
+            _c.cache_clear()
+        _raw = "\n".join(render(_tb, 100, 30))
+        assert _has in _raw and _not not in _raw, f"{_mode}: expected {_has!r}, never {_not!r}"
+    assert _fg("#a78bfa") == "" and style("x", "#a78bfa") == "x", "no color: plain text"
+finally:
+    T.COLOR_MODE = _om
+    for _c in (_fg, _logo_lines, _bar_cells, _static_bar):
+        _c.cache_clear()
+
 # live results filter (f) + search cache (replay, expiry, R refresh, never cache failures)
 from .sources import SourceUpdate
 def _cols(a, rows=30):
