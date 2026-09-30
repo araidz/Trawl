@@ -32,7 +32,7 @@ from . import theme as T
 from .aria2 import STATE_DIR, Aria2Error, Download, control_infohash
 from .sources import (SOURCES, LocalQuery, Result, ResultVariant, Search, TorznabFeed,
                       build_magnet, dedupe, make_torznab_source, matches_query,
-                      parse_magnet, parse_query, parse_source, redact, redact_url,
+                      parse_magnet, parse_query, parse_release, parse_source, redact, redact_url,
                       result_identity, torznab_label, validate_torznab_url)
 from .meta import Meta, kind_for, lookup
 
@@ -1613,6 +1613,9 @@ def _detail_panel(app: App, r: Result, width: int, height: int) -> list[str]:
         inner.append(cell("", inner_w))
     inner.append(field("Source", app.source_label(variant.source)))
     inner.append(field("Size", fmt_bytes(r.size)))
+    rel = parse_release(r.name)
+    if rel.detail():
+        inner.append(field("Format", rel.detail(), T.BAD if rel.bad else None))
     if variant.seeders or variant.leechers:
         ratio = min(1.0, (variant.seeders or 0) / 1000)
         filled = round(ratio * 10)
@@ -1832,14 +1835,20 @@ def seed_leech(r: Result, reports_health: bool = True) -> str:
     return "-"
 
 
+_BADGE_W = 15      # "2160p REMUX HDR"
+_BADGE_MIN_W = 88  # inner columns needed before the badge column appears
+
+
 def _results_panel(app: App, width: int, height: int) -> list[str]:
     inner_w = width - 4
     results = app.visible_results()
     app.sel = min(app.sel, max(0, len(results) - 1))
-    name_w = max(8, inner_w - 28)  # ptr2 + name + 9 + 9 + 5 + 3 seps
+    badge_w = _BADGE_W + 1 if inner_w >= _BADGE_MIN_W else 0  # narrow panels keep the old layout
+    name_w = max(8, inner_w - 28 - badge_w)  # ptr2 + name + 9 + 9 + 5 + 3 seps
     inner: list[str] = [_status_line(app, results, inner_w)]
     if results:
         header = (cell("", 2) + " " + cell("Name", name_w, dim=True, bold=True) + " "
+                  + (cell("Release", _BADGE_W, dim=True, bold=True) + " " if badge_w else "")
                   + cell("Size", 9, "right", dim=True, bold=True) + " "
                   + cell("Seed", 9, "right", dim=True, bold=True) + " "
                   + cell("Src", 5, "right", dim=True, bold=True))
@@ -1851,17 +1860,23 @@ def _results_panel(app: App, width: int, height: int) -> list[str]:
             here = idx == app.sel
             tag, tcolor = app.source_tag(r.source)
             sl = seed_leech(r, app.source_reports_health(r.source))
+            rel = parse_release(r.name)
+            bcell = ""
+            if badge_w:
+                bcolor = T.BAD if rel.bad else T.BRIGHT if (rel.res >= 2160 or rel.hdr) else None
+                bcell = cell(rel.badge(), _BADGE_W, color=bcolor or (T.ACCENT if here else None),
+                             bold=here or rel.bad, dim=bcolor is None and not here) + " "
             if here:  # selected row: the whole line lights up in accent
                 inner.append(
                     cell(T.PTR, 2, color=T.ACCENT) + " "
-                    + cell(clean(r.name), name_w, color=T.ACCENT, bold=True) + " "
+                    + cell(clean(r.name), name_w, color=T.ACCENT, bold=True) + " " + bcell
                     + cell(fmt_bytes(r.size), 9, "right", color=T.ACCENT, bold=True) + " "
                     + cell(sl, 9, "right", color=T.ACCENT, bold=True) + " "
                     + cell(tag, 5, "right", color=T.ACCENT, bold=True))
             else:
                 inner.append(
                     cell("", 2) + " "
-                    + cell(clean(r.name), name_w, color=T.TEXT) + " "
+                    + cell(clean(r.name), name_w, color=T.TEXT) + " " + bcell
                     + cell(fmt_bytes(r.size), 9, "right", dim=True) + " "
                     + cell(sl, 9, "right", color=seed_color(r.seeders)) + " "
                     + cell(tag, 5, "right", color=tcolor))
@@ -2077,7 +2092,7 @@ def _help_panel(app: App, width: int, height: int) -> list[str]:
                      ("/  i", "edit query"), ("↑ ↓", "recall past searches"),
                      ("r", "retry failed sources"), ("E", "show why sources failed"),
                      ("z", "hide dead torrents"),
-                     ("filters", "seeders: size: age: files: source: group:"),
+                     ("filters", "seeders: size: age: files: source: group: res: codec:"),
                      ("examples", 'matrix -cam size:>1GiB group:movies'),
                      ("S", "cycle sort (seeders/size/newest)"), ("c", "clear results"),
                      ("← →", "filter category"), ("v", "grab magnet/link from clipboard")]),

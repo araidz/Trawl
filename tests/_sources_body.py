@@ -226,7 +226,7 @@ except FrozenInstanceError:
     pass
 # browse flag: only search-only sources are excluded from empty-query Latest
 assert {s.id for s in SOURCES if not s.browse} == \
-    {"libgen", "annas", "knaben", "torrentgalaxy", "torrents-csv"}, \
+    {"libgen", "annas", "knaben", "torrentgalaxy", "torrents-csv", "audiobookbay"}, \
     [s.id for s in SOURCES if not s.browse]
 # tracker-list parse: keeps only announce urls, junk lines dropped
 tl = _parse_trackers("udp://a:1/announce\n\n# comment\nhttps://b/announce\nnot a url\n")
@@ -325,8 +325,74 @@ try:
     assert tc[0].seeders == 1234 and tc[0].leechers == 56 and tc[0].size == 1_500_000_000, tc
     assert tc[0].added == 1700000000 and tc[0].magnet.startswith("magnet:?"), tc
     assert _torrentscsv("") == [], "torrents-csv search-only"
+    # LimeTorrents: RSS with byte sizes, swarm in description, hash in enclosure
+    _g["fetch"] = lambda *a, **k: (
+        '<rss><channel><item><title>Oppenheimer 2023 1080p</title>'
+        '<pubDate>14 Aug 2026 11:15:12 +0200</pubDate>'
+        '<link>https://www.limetorrents.fun/Oppenheimer-torrent-19886478.html</link>'
+        '<category>Movies</category><size>2510928092</size>'
+        '<description>Seeds: 24 , Leechers 6</description>'
+        '<enclosure url="https://itorrents.net/torrent/'
+        + h40.upper() + '.torrent?title=x" /></item>'
+        '<item><title>Some Show S01E01</title><category>TV shows</category>'
+        '<size>100</size><description>Seeds: 1 , Leechers 0</description>'
+        '<enclosure url="https://itorrents.net/torrent/' + h40.upper() + '.torrent" />'
+        '</item></channel></rss>')
+    lm = _lime("oppenheimer", "Movies", "lime-movies")
+    assert len(lm) == 1 and lm[0].source == "lime-movies", lm
+    assert lm[0].name == "Oppenheimer 2023 1080p" and lm[0].info_hash == h40, lm
+    assert lm[0].size == 2510928092 and lm[0].seeders == 24 and lm[0].leechers == 6, lm
+    assert lm[0].page.endswith("-19886478.html") and lm[0].added, lm
+    lt = _lime("some show", "TV", "lime-tv")
+    assert len(lt) == 1 and lt[0].name == "Some Show S01E01" and lt[0].source == "lime-tv", lt
+    # TokyoTosho: base32 magnet, size and details page inside the description
+    _g["fetch"] = lambda *a, **k: (
+        '<rss><channel><item><category>Anime</category>'
+        '<title>[Grp] Show - 01 [1080p].mkv</title>'
+        '<description><![CDATA[<a href="https://nyaa.si/download/1.torrent">Torrent Link</a><br />'
+        '<a href="magnet:?xt=urn:btih:' + b32 + '&tr=http://t/announce">Magnet Link</a><br />'
+        '<a href="https://www.tokyotosho.info/details.php?id=2106821">Tokyo Tosho</a><br />'
+        'Size: 1.26GB<br />]]></description>'
+        '<pubDate>Mon, 31 Aug 2026 08:17:10 GMT</pubDate></item></channel></rss>')
+    tt = _tokyotosho("show")
+    assert len(tt) == 1 and tt[0].source == "tokyotosho" and tt[0].info_hash == h40, tt
+    assert tt[0].name == "[Grp] Show - 01 [1080p].mkv" and tt[0].size == 1_260_000_000, tt
+    assert tt[0].page == "https://www.tokyotosho.info/details.php?id=2106821", tt[0].page
+    assert tt[0].added and tt[0].magnet.startswith("magnet:?xt=urn:btih:"), tt
+    # AudiobookBay: two-step — search page lists posts, hash + size on the post
+    _g["fetch"] = lambda url, *a, **k: (
+        '<div class="postTitle"><h2><a href="/abss/dune-frank-herbert/" '
+        'rel="bookmark">Dune - Frank Herbert</a></h2></div>'
+        if "?s=" in url else
+        "<tr><td>Info Hash:</td>\n<td>" + h40.upper() + "</td></tr>"
+        "<tr><td>File Size:</td>\n<td><span style='color:#00f;'>1.12</span> GBs</td></tr>")
+    ab = _audiobookbay("Dune")
+    assert len(ab) == 1 and ab[0].source == "audiobookbay" and ab[0].info_hash == h40, ab
+    assert ab[0].name == "Dune - Frank Herbert" and ab[0].size == 1_120_000_000, ab
+    assert ab[0].page == "https://audiobookbay.lu/abss/dune-frank-herbert/", ab[0].page
+    assert ab[0].magnet.startswith("magnet:?xt=urn:btih:"), ab
 finally:
     _g["fetch"] = _of
+# release parser + res:/codec: operators
+_pr = parse_release
+assert _pr("Dune.Part.Two.2024.2160p.WEB-DL.DDP5.1.Atmos.DV.HDR.H.265-GRP") == \
+    Release(2160, "WEB", "x265", "DV", ("Atmos", "DD+")), _pr("Dune.Part.Two.2024.2160p.WEB-DL.DDP5.1.Atmos.DV.HDR.H.265-GRP")
+assert _pr("Oppenheimer.2023.1080p.BluRay.x264-YIFY").badge() == "1080p BD"
+assert _pr("Movie.2023.2160p.UHD.BluRay.REMUX.HDR.HEVC").badge() == "2160p REMUX HDR"
+assert _pr("Show.S01E01.720p.HDTV.x264").badge() == "720p HDTV"
+assert _pr("New.Movie.2024.HDCAM.x264").bad and _pr("New.Movie.2024.HDTS").kind == "TS"
+assert _pr("Cam.2018.1080p.WEB-DL").kind == "WEB" and not _pr("Cam.2018.1080p.WEB-DL").bad, "title 'Cam' is not a CAM rip"
+assert _pr("Some Book.epub") == Release() and _pr("Some Book.epub").badge() == ""
+assert _pr("Movie 4K HDR10+ x265").res == 2160 and _pr("Movie 4K HDR10+ x265").hdr == "HDR"
+assert _pr("Movie.1080p.AVC").codec == "x264" and _pr("Movie.Extended.Cut.1080p").extras == ("Extended",)
+_rq = [Result("", n, 1, 5, 0, "s", "m") for n in (
+    "A.2160p.WEB-DL.x265", "B.1080p.BluRay.x264", "C.720p.HDTV.x264", "D.no.tags")]
+def _names(q): return [r.name[0] for r in _rq if matches_query(r, q)]
+assert _names("res:>=1080") == ["A", "B"] and _names("res:1080") == ["B"] and _names("res:4k") == ["A"]
+assert _names("res:<=720p") == ["C"] and _names("res:<1080") == ["C"], "unknown res never matches"
+assert _names("codec:hevc") == ["A"] and _names("codec:h264") == ["B", "C"] and _names("codec:x264 res:720") == ["C"]
+assert parse_query("codec:nope").malformed == ("codec:nope",) and parse_query("res:big").malformed == ("res:big",)
+assert parse_query("codec:>x265").malformed and parse_query("res:1080 dune").remote == "dune"
 print("pure logic ok")
 
 # live — best-effort; proves the pipeline + real parsing without requiring

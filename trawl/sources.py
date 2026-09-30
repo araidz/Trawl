@@ -26,6 +26,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError, dataclass, field
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+from functools import lru_cache
 from typing import Callable
 
 from .aria2 import STATE_DIR
@@ -516,6 +517,57 @@ def parse_size(s: str) -> int:
         return 0
 
 
+@dataclass(frozen=True)
+class Release:
+    res: int = 0       # vertical lines (2160, 1080, ...); 0 = unknown
+    kind: str = ""     # CAM TS SCR REMUX BD WEB HDTV DVD
+    codec: str = ""    # x265 x264 av1 xvid (aliases folded)
+    hdr: str = ""      # DV | HDR
+    extras: tuple[str, ...] = ()  # audio + edition tags, display only
+
+    @property
+    def bad(self) -> bool:
+        return self.kind in ("CAM", "TS", "SCR")
+
+    def badge(self) -> str:
+        return " ".join(x for x in (f"{self.res}p" if self.res else "", self.kind, self.hdr) if x)
+
+    def detail(self) -> str:
+        return " · ".join(x for x in (f"{self.res}p" if self.res else "", self.kind, self.codec,
+                                      self.hdr, *self.extras) if x)
+
+
+# ponytail: regex table, not a full release parser — resolution, rip type, codec,
+# HDR, a few audio/edition tags. Upgrade trigger: wanting language/group/platform filters.
+_RES_RE = re.compile(r"\b(?:(2160|1440|1080|720|576|480)p|(4k|uhd))\b", re.I)
+_KINDS = ((r"hd-?cam|cam-?rip", "CAM"), (r"tele-?sync|hd-?ts", "TS"), (r"dvd-?scr|screener", "SCR"),
+          (r"remux", "REMUX"), (r"blu-?ray|bd-?rip|br-?rip|bdr", "BD"),
+          (r"web-?dl|web-?rip|web", "WEB"), (r"hdtv|pdtv", "HDTV"), (r"dvd(?:-?rip)?", "DVD"),
+          (r"cam", "CAM"))  # bare "cam" last: a title can be "Cam"
+_KIND_RES = [(re.compile(rf"\b(?:{p})\b", re.I), k) for p, k in _KINDS]
+CODEC_ALIASES = {"x265": "x265", "h265": "x265", "hevc": "x265", "x264": "x264",
+                 "h264": "x264", "avc": "x264", "av1": "av1", "xvid": "xvid", "divx": "xvid"}
+_CODEC_RE = re.compile(r"\b(x\.?26[45]|h\.?26[45]|hevc|avc|av1|xvid|divx)\b", re.I)
+_DV_RE = re.compile(r"\b(?:dolby[ .-]?vision|dovi|dv)\b", re.I)
+_HDR_RE = re.compile(r"\bhdr(?:10\+?)?\b", re.I)
+_EXTRAS = tuple((re.compile(rf"\b(?:{p})\b", re.I), label) for p, label in (
+    (r"atmos", "Atmos"), (r"truehd", "TrueHD"), (r"dts(?:-?hd|-?x)?", "DTS"),
+    (r"ddp5\.?1|dd\+|eac3", "DD+"), (r"dd5\.?1|ac3", "DD5.1"), (r"aac", "AAC"),
+    (r"extended", "Extended"), (r"unrated", "Unrated"), (r"remastered", "Remastered"),
+    (r"imax", "IMAX"), (r"director'?s[ .-]?cut", "Director's Cut"), (r"repack|proper", "Repack")))
+
+
+@lru_cache(maxsize=4096)
+def parse_release(name: str) -> Release:
+    rm = _RES_RE.search(name)
+    res = (int(rm.group(1)) if rm.group(1) else 2160) if rm else 0
+    kind = next((k for rx, k in _KIND_RES if rx.search(name)), "")
+    cm = _CODEC_RE.search(name)
+    codec = CODEC_ALIASES[cm.group(1).lower().replace(".", "")] if cm else ""
+    hdr = "DV" if _DV_RE.search(name) else "HDR" if _HDR_RE.search(name) else ""
+    return Release(res, kind, codec, hdr, tuple(label for rx, label in _EXTRAS if rx.search(name)))
+
+
 def _int(s) -> int:
     try:
         return int(s)
@@ -765,6 +817,56 @@ def _nyaa(query: str, cat: str = "0_0", source: str = "nyaa") -> list[Result]:
     return out
 
 
+def _lime(query: str, cat: str, source: str) -> list[Result]:
+    """LimeTorrents search RSS: size in bytes, swarm counts in the description,
+    and the info hash inside the .torrent enclosure URL."""
+    q = query.strip()
+    base = "https://www.limetorrents.fun"
+    url = (f"{base}/searchrss/{urllib.parse.quote(q)}/" if q
+           else f"{base}/rss/{'movies' if cat == 'Movies' else 'tv'}/")
+    want = "movies" if cat == "Movies" else "tv shows"
+    out = []
+    for item in _rss_items(fetch(url)):
+        if _tag(item, "category").lower() != want:
+            continue
+        hm = re.search(r'<enclosure url="[^"]*/torrent/([a-fA-F0-9]{40})\.torrent', item)
+        name = html.unescape(_tag(item, "title"))
+        if not hm or not name:
+            continue
+        h = hm.group(1).lower()
+        sl = re.search(r"Seeds:\s*(\d+)\s*,\s*Leechers\s*(\d+)", _tag(item, "description"))
+        out.append(Result(h, name, _int(_tag(item, "size")),
+                          _int(sl.group(1)) if sl else 0, _int(sl.group(2)) if sl else 0,
+                          source, build_magnet(h, name), _rfc822_unix(_tag(item, "pubDate")),
+                          page=_tag(item, "link") or None))
+    return out
+
+
+def _tokyotosho(query: str) -> list[Result]:
+    """TokyoTosho anime RSS: magnet, size, and details page live in the
+    description HTML. No swarm counts."""
+    q = query.strip()
+    url = f"https://www.tokyotosho.info/rss.php?filter=1&terms={urllib.parse.quote_plus(q)}"
+    out = []
+    for item in _rss_items(fetch(url)):
+        desc = _tag(item, "description")
+        m = re.search(r'href="(magnet:\?xt=urn:btih:[^"]+)"', desc, re.I)
+        name = html.unescape(_tag(item, "title"))
+        if not m or not name:
+            continue
+        magnet = html.unescape(m.group(1))
+        hm = _MAGNET_RE.search(magnet)
+        if not hm:
+            continue
+        sm = re.search(r"Size:\s*([\d.]+\s*[KMGT]?i?B)", desc, re.I)
+        pm = re.search(r'href="(https://www\.tokyotosho\.info/details\.php\?id=\d+)"', desc)
+        out.append(Result(normalize_info_hash(hm.group(1)), name,
+                          parse_size(sm.group(1)) if sm else 0, 0, 0, "tokyotosho",
+                          magnet, _rfc822_unix(_tag(item, "pubDate")),
+                          page=pm.group(1) if pm else None))
+    return out
+
+
 # -- sources: HTML (1337x, two-step) -----------------------------------------
 
 _X_HOSTS = ["1337x.to", "1337x.st", "x1337x.ws", "1337xx.to"]
@@ -840,6 +942,46 @@ def _x1337(query: str, cat: str, source: str) -> list[Result]:
             continue
         out.append(Result(hm.group(1).lower(), r["name"], r["size"], r["seeders"],
                           r["leechers"], source, magnet, page=base + r["path"]))
+    return out
+
+
+# -- sources: AudiobookBay (two-step) ----------------------------------------
+
+_ABB_BASE = "https://audiobookbay.lu"
+_ABB_MAX = 8
+
+
+def _abb_post(path: str) -> tuple[str, int] | None:
+    try:
+        page = fetch(f"{_ABB_BASE}{path}", retries=1)
+    except SourceError:
+        return None
+    hm = re.search(r"Info Hash:</td>\s*<td[^>]*>\s*([a-fA-F0-9]{40})", page, re.I)
+    if not hm:
+        return None
+    sm = re.search(r"File Size:</td>\s*<td[^>]*>(.*?)</td>", page, re.I | re.S)
+    size = parse_size(_strip_tags(sm.group(1))) if sm else 0
+    return hm.group(1).lower(), size
+
+
+def _audiobookbay(query: str) -> list[Result]:
+    """AudiobookBay: search page lists posts; info hash and size are on each
+    post page (fetched in parallel, capped)."""
+    q = query.strip().lower()  # ABB search is case-sensitive to lowercase
+    page = fetch(f"{_ABB_BASE}/?s={urllib.parse.quote_plus(q)}")
+    rows = [(p, html.unescape(t).strip()) for p, t in
+            re.findall(r'<h2><a href="(/abss/[^"]+)"[^>]*>([^<]+)</a>', page)][:_ABB_MAX]
+    if not rows:
+        return []
+    with ThreadPoolExecutor(max_workers=len(rows)) as ex:
+        details = list(ex.map(lambda r: _abb_post(r[0]), rows))
+    out = []
+    for (path, name), det in zip(rows, details):
+        if not det:
+            continue
+        h, size = det
+        out.append(Result(h, name, size, 0, 0, "audiobookbay",
+                          build_magnet(h, name), page=_ABB_BASE + path))
     return out
 
 
@@ -1060,17 +1202,21 @@ SOURCES: list[Source] = [
     Source("yts", "YTS", "Movies", _yts),
     Source("tpb-movies", "TPB", "Movies", _tpb_movies),
     Source("x1337-movies", "1337x", "Movies", lambda q: _x1337(q, "Movies", "x1337-movies")),
+    Source("lime-movies", "Lime", "Movies", lambda q: _lime(q, "Movies", "lime-movies")),
     Source("eztv", "EZTV", "TV", _eztv),
     Source("solid", "Solid", "TV", _solid),
     Source("tpb-tv", "TPB", "TV", _tpb_tv),
     Source("x1337-tv", "1337x", "TV", lambda q: _x1337(q, "TV", "x1337-tv")),
+    Source("lime-tv", "Lime", "TV", lambda q: _lime(q, "TV", "lime-tv")),
     Source("nyaa", "Nyaa", "Anime", _nyaa),
+    Source("tokyotosho", "TokyoTosho", "Anime", _tokyotosho, reports_health=False),
     Source("subsplease", "SubsPlease", "Anime", _subsplease, reports_health=False),
     Source("animetosho", "AnimeTosho", "Anime", _animetosho),
     Source("tpb-books", "TPB", "Books", _tpb_books),
     Source("nyaa-books", "Nyaa", "Books", lambda q: _nyaa(q, "3_1", "nyaa-books")),
     Source("libgen", "LibGen", "Books", _libgen, browse=False, reports_health=False),
     Source("annas", "Anna's", "Books", _annas, browse=False, reports_health=False),
+    Source("audiobookbay", "ABB", "Books", _audiobookbay, browse=False, reports_health=False),
     Source("knaben", "Knaben", "Other", _knaben, browse=False),
     Source("torrentgalaxy", "TGx", "Other", _tgx, browse=False),
     Source("torrents-csv", "TorrCSV", "Other", _torrentscsv, browse=False),
@@ -1151,7 +1297,7 @@ def dedupe(results: list[Result]) -> list[Result]:
 
 # -- local query language ----------------------------------------------------
 
-_QUERY_FIELDS = {"seeders", "size", "source", "group", "age", "files"}
+_QUERY_FIELDS = {"seeders", "size", "source", "group", "age", "files", "res", "codec"}
 _QUERY_TOKEN = re.compile(r'-?"[^"\n]*"|\S+')
 
 
@@ -1192,6 +1338,17 @@ def parse_query(text: str, now: float | None = None) -> LocalQuery:
                         raise ValueError
                     parsed: int | float | str = raw.lower()
                     op = "="
+                elif field == "codec":
+                    parsed = CODEC_ALIASES.get(raw.lower().replace(".", ""), "")
+                    if op not in {None, "="} or not parsed:
+                        raise ValueError
+                    op = "="
+                elif field == "res":
+                    n = raw.lower().removesuffix("p")
+                    parsed = 2160 if n in {"4k", "uhd"} else int(n) if re.fullmatch(r"\d{3,4}", n) else 0
+                    if not parsed:
+                        raise ValueError
+                    op = op or "="
                 elif field == "size":
                     if not re.fullmatch(r"\d+(?:\.\d+)?\s*[KMGT]?I?B", raw, re.I):
                         raise ValueError
@@ -1252,9 +1409,14 @@ def matches_query(result: Result, query: LocalQuery | str,
         elif flt.field == "group":
             if (result.group or (source_map.get(result.source).group if source_map.get(result.source) else "")).lower() != flt.value:
                 return False
+        elif flt.field == "codec":
+            if parse_release(result.name).codec != flt.value:
+                return False
         else:
             actual = {"seeders": result.seeders, "size": result.size,
                       "files": result.num_files}.get(flt.field)
+            if flt.field == "res":
+                actual = parse_release(result.name).res or None
             if flt.field == "age":
                 actual = None if result.added is None else query.now - result.added
             if actual is None or not _compare(actual, flt.comparator, flt.value):

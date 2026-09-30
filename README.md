@@ -67,6 +67,9 @@ Trawl is a from-scratch Python TUI inspired by
 - **Downloads pane** — live progress (animated bar), speed, ETA, peers;
   pause / resume / cancel / retry; pick individual files from multi-file
   torrents; reveal in Finder; a persistent *Recently downloaded* list.
+- **Release badges** — each row shows what the name says it is (`2160p WEB HDR`,
+  `1080p BD`, `720p HDTV`); CAM/telesync rips are flagged red. The badge column
+  appears on wide terminals; details always show the full format line.
 - **Inspect before grabbing** — a details view, open the torrent's page in your
   browser, copy its selected URI/link, or save its `.torrent` file (`e`, metadata
   only). Duplicate results retain source variants; use `←` / `→` in details to
@@ -75,7 +78,8 @@ Trawl is a from-scratch Python TUI inspired by
   remembered for next time) without changing the default download dir.
 - **Dead-torrent filter** — `z` hides zero-seeder results from sources that
   report swarm counts; library/RSS sources with no swarm data (FitGirl,
-  SubsPlease, LibGen, Anna's) always show their health as `—`.
+  SubsPlease, TokyoTosho, LibGen, Anna's, AudiobookBay) always show their
+  health as `—`.
 - **Resume** — unfinished downloads resume automatically on the next launch;
   `s` additionally scans the download folder for stray partial `*.aria2` files
   (torrents and remembered direct-http grabs).
@@ -155,10 +159,10 @@ You can also start straight into a search: `trawl oppenheimer`.
 | Category | Sources |
 | --- | --- |
 | Games | FitGirl |
-| Movies | YTS · The Pirate Bay · 1337x |
-| TV | EZTV · SolidTorrents · The Pirate Bay · 1337x |
-| Anime | Nyaa · SubsPlease · AnimeTosho |
-| Books | The Pirate Bay · Nyaa (literature) · Library Genesis · Anna's Archive |
+| Movies | YTS · The Pirate Bay · 1337x · LimeTorrents |
+| TV | EZTV · SolidTorrents · The Pirate Bay · 1337x · LimeTorrents |
+| Anime | Nyaa · SubsPlease · AnimeTosho · TokyoTosho |
+| Books | The Pirate Bay · Nyaa (literature) · Library Genesis · Anna's Archive · AudiobookBay |
 | All | Knaben (meta-aggregator) · TorrentGalaxy · Torrents-CSV |
 
 Toggle any source on or off in the settings overlay (`g`). If a source is down,
@@ -175,9 +179,11 @@ them. Feed availability and contents depend on the endpoint.
 ### Local query operators
 
 Trawl sends only the remaining search text to sources, then applies these
-filters locally: `seeders:`, `size:`, `source:`, `group:`, `age:`, and `files:`.
-Use `-term` to exclude a word and quotes for an exact phrase, for example
-`"special edition" -cam seeders:>10 size:<4GiB group:movies`. Unknown operators
+filters locally: `seeders:`, `size:`, `source:`, `group:`, `age:`, `files:`, `res:`, and `codec:`.
+`res:` reads the resolution from the release name (`res:>=1080`, `res:4k`; a bare
+value is an exact match) and `codec:` folds aliases (`hevc`/`h265` = `x265`,
+`avc`/`h264` = `x264`). Use `-term` to exclude a word and quotes for an exact
+phrase, for example `"special edition" -cam seeders:>10 size:<4GiB group:movies`. Unknown operators
 are treated as literal search text.
 
 ## How it works
