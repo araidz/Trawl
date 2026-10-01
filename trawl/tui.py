@@ -26,7 +26,7 @@ import tty
 import unicodedata
 import urllib.parse
 import uuid
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from functools import cache, lru_cache
 
 from . import __version__, theme as T
@@ -301,6 +301,21 @@ def open_url(url: str) -> bool:
         return False
 
 
+def fuzzy_score(query: str, text: str) -> int | None:
+    """Lower is better; None if the query's letters don't appear in order in `text`.
+    Spans that start early and stay tight win, and a match on a word start gets a bonus."""
+    q, t, pos, last = query.lower().replace(" ", ""), text.lower(), [], -1
+    for ch in q:
+        last = t.find(ch, last + 1)
+        if last < 0:
+            return None
+        pos.append(last)
+    if not pos:
+        return 0
+    starts = sum(1 for i in pos if i == 0 or t[i - 1] in " :-/")
+    return (pos[-1] - pos[0]) * 2 + pos[0] - starts * 3
+
+
 def open_target(path: str, name: str) -> str:
     """What `enter` opens for a finished download: the torrent's own top-level
     folder for multi-file torrents (the ancestor named like the torrent), else the file."""
@@ -316,6 +331,7 @@ SPACE_MARGIN = 1 << 30  # keep 1 GiB free beyond the torrent itself
 PEEK_TIMEOUT = 45  # seconds to wait for a magnet's file list before giving up
 CACHE_TTL = 600  # a finished search is replayed from memory for 10 minutes
 CACHE_MAX = 20
+PALETTE_ROWS = 9  # command-palette list height
 QUARANTINE_AFTER = 3  # searches in a row a source may fail before it's paused for the session
 
 
@@ -421,7 +437,7 @@ def render_bar(progress: float, width: int, tick: float, animate: bool,
 _ARROWS = {b"A": "up", b"B": "down", b"C": "right", b"D": "left"}
 _TILDE = {b"[5~": "pageup", b"[6~": "pagedown", b"[1~": "home", b"[4~": "end",
           b"[7~": "home", b"[8~": "end"}
-_CTRL = {0x01: "ctrl-a", 0x05: "ctrl-e", 0x15: "ctrl-u", 0x17: "ctrl-w"}
+_CTRL = {0x01: "ctrl-a", 0x05: "ctrl-e", 0x0b: "ctrl-k", 0x15: "ctrl-u", 0x17: "ctrl-w"}
 
 
 def parse_keys(data: bytes) -> list[str]:
@@ -632,6 +648,9 @@ class App:
         self._space_warned = ""  # uri whose low-disk warning was shown; pressing again overrides
         self.folder_prompt: tuple[list[tuple[str, str]], str, int] | None = None  # ([(uri, name)], label, bytes) for D
         self.marked: set[str] = set()  # _mkey of results ticked with space for a batch grab
+        self.palette = False  # command palette open (ctrl-k, or : from a results/downloads view)
+        self.pal_buf = ""
+        self.pal_sel = 0
         self.filtering = False  # typing into the live results filter (f)
         self.filter_buf = ""
         self.filter_q: LocalQuery | None = None
@@ -1573,6 +1592,81 @@ class App:
             n = len(self.visible_results())
             self.sel = max(0, min(self.sel + d, n - 1)) if n else 0
 
+    def resume_partial(self) -> None:
+        n = self.scan_resume()
+        self.status = (f"resumed {n} download{'' if n == 1 else 's'}" if n
+                       else "nothing to resume on disk")
+        if n:
+            self.view = "downloads"
+
+    def palette_actions(self) -> list[tuple[str, str, Callable[[], object]]]:
+        """(label, key hint, run) for what makes sense right now. Context-sensitive actions
+        replay the same keys a person would press, so the palette can never drift from them."""
+        keys = lambda *ks: (lambda: [self.on_key(k) for k in ks])
+        out: list[tuple[str, str, Callable[[], object]]] = []
+        if self.detail is not None:
+            out += [("Download", "d", keys("d")), ("Download to a folder", "D", keys("D")),
+                    ("Look inside the torrent", "f", keys("f")), ("Save the .torrent file", "e", keys("e")),
+                    ("Open the page in a browser", "o", keys("o")), ("Copy the magnet", "y", keys("y")),
+                    ("Back to results", "esc", keys("esc"))]
+        elif self.view == "search" and self.search is not None:
+            out += [("Show details", "enter", keys("enter")),
+                    ("Look inside the torrent", "enter f", keys("enter", "f")),
+                    ("Download selected (or all marked)", "d", keys("d")),
+                    ("Download to a folder", "D", keys("D")), ("Save the .torrent file", "e", keys("e")),
+                    ("Open the page in a browser", "o", keys("o")), ("Copy the magnet", "y", keys("y")),
+                    ("Mark / unmark and step down", "space", keys(" ")), ("Mark all / none", "a", keys("a")),
+                    ("Filter these results", "f", keys("f")), ("Search again, skipping the cache", "R", keys("R")),
+                    ("Retry failed sources", "r", keys("r")), ("Source health", "E", keys("E")),
+                    ("Cycle sort order", "S", keys("S")), ("Hide / show dead torrents", "z", keys("z")),
+                    ("Edit the query", "/", keys("/")), ("Clear results", "c", keys("c"))]
+            out += [(f"Category: {label}", "← →", lambda k=key: (setattr(self, "cat", k), setattr(self, "sel", 0)))
+                    for key, label in CATS]
+        elif self.view == "downloads":
+            out += [("Open finished download", "enter", keys("enter")), ("Pause / resume", "p", keys("p")),
+                    ("Cancel download", "x", keys("x")), ("Retry failed download", "r", keys("r")),
+                    ("Choose files", "f", keys("f")), ("Reveal in Finder", "o", keys("o"))]
+        if self.detail is None:
+            out.append(("Show downloads" if self.view == "search" else "Show search", "tab", keys("tab")))
+        out += [("Paste magnet or link from clipboard", "v",
+                 lambda: (setattr(self, "view", "search"), self.on_key("v"))),
+                ("Resume partial downloads on disk", "s", self.resume_partial),
+                ("Settings", "g", lambda: (setattr(self, "settings", True),
+                                            setattr(self, "set_sel", self._snap_setting(0)))),
+                ("Keyboard help", "?", lambda: setattr(self, "help", True)),
+                ("Quit", "q", self._quit)]
+        out += [(f"Theme: {t}", "", lambda t=t: (self._set_theme(t), self._save_settings()))
+                for t in T.THEMES if t != self.theme]
+        return out
+
+    def palette_items(self) -> list[tuple[str, str, Callable[[], object]]]:
+        acts = self.palette_actions()
+        if not self.pal_buf.strip():
+            return acts
+        scored = [(sc, i, a) for i, a in enumerate(acts) if (sc := fuzzy_score(self.pal_buf, a[0])) is not None]
+        return [a for _, _, a in sorted(scored, key=lambda x: (x[0], x[1]))]
+
+    def _palette_key(self, k: str) -> None:
+        items = self.palette_items()
+        if k in ("esc", "ctrl-k"):
+            self.palette = False
+        elif k == "enter":
+            self.palette = False
+            if items:
+                items[min(self.pal_sel, len(items) - 1)][2]()
+        elif k in ("up", "down", "pageup", "pagedown"):
+            step = {"up": -1, "down": 1, "pageup": -PALETTE_ROWS, "pagedown": PALETTE_ROWS}[k]
+            self.pal_sel = max(0, min(self.pal_sel + step, len(items) - 1)) if items else 0
+        elif k == "backspace":
+            self.pal_buf, self.pal_sel = self.pal_buf[:-1], 0
+        elif k == "ctrl-u":
+            self.pal_buf, self.pal_sel = "", 0
+        elif len(k) == 1 and k >= " ":
+            self.pal_buf, self.pal_sel = self.pal_buf + k, 0
+
+    def open_palette(self) -> None:
+        self.palette, self.pal_buf, self.pal_sel = True, "", 0
+
     def _cycle_cat(self, d: int) -> None:
         i = next((k for k, (key, _) in enumerate(CATS) if key == self.cat), 0)
         self.cat = CATS[(i + d) % len(CATS)][0]
@@ -1602,6 +1696,13 @@ class App:
                 self.running = False
             elif k == "esc":
                 self.confirm_quit = False
+            return
+        if self.palette:
+            self._palette_key(k)
+            return
+        if k == "ctrl-k" and not (self.torrent_prompt or self.cancel_prompt or self.folder_prompt
+                                  or self.edit_field or self.picker or self.settings):
+            self.open_palette()
             return
         if self.torrent_prompt is not None:
             pm = self.torrent_prompt
@@ -1744,11 +1845,9 @@ class App:
             self.variant_idx = 0
             self.show_errors = False
         elif k == "s":
-            n = self.scan_resume()
-            self.status = (f"resumed {n} download{'' if n == 1 else 's'}" if n
-                           else "nothing to resume on disk")
-            if n:
-                self.view = "downloads"
+            self.resume_partial()
+        elif k == ":":
+            self.open_palette()
         elif k == "v":
             pm = parse_source(paste_clipboard())
             if pm:
@@ -2452,7 +2551,8 @@ def _help_panel(app: App, width: int, height: int) -> list[str]:
                        ("a", "add Torznab feed"),
                        ("on a feed row", "e endpoint · K separate key · x remove"),
                        ("g / esc", "close")]),
-        ("Navigate", [("↑ ↓  j k", "move selection / scroll wheel"),
+        ("Navigate", [("ctrl-k  :", "command palette: every action, searchable"),
+                      ("↑ ↓  j k", "move selection / scroll wheel"),
                       ("tab", "switch search / downloads")]),
         ("Downloads", [("enter", "open a finished download"),
                        ("p", "pause / resume"), ("x", "cancel (ask: delete or keep files)"),
@@ -2477,7 +2577,9 @@ def _help_panel(app: App, width: int, height: int) -> list[str]:
 
 
 def _footer(app: App, width: int) -> str:
-    if app.cancel_prompt is not None:
+    if app.palette:
+        hints = [("type", "to find"), ("↑↓", "move"), ("↵", "run"), ("esc", "close"), ("^c", "quit")]
+    elif app.cancel_prompt is not None:
         hints = [("d", "delete files"), ("k", "keep files"), ("esc", "abort")]
     elif app.folder_prompt is not None:
         hints = [("type", "path"), ("enter", "download"), ("esc", "cancel")]
@@ -2522,10 +2624,10 @@ def _footer(app: App, width: int) -> str:
                  ("d", f"grab {n}" if n else "grab"), ("D", "folder"), ("e", ".torrent"),
                  ("o", "page"), ("y", "copy"),
                  ("r", "retry"), ("E", "errors"), ("z", "hide dead"), ("S", "sort"), ("←→", "category"),
-                 ("v", "paste"), ("g", "settings"), ("q", "quit")]
+                 ("v", "paste"), (":", "commands"), ("g", "settings"), ("q", "quit")]
     else:
         hints = [("↑↓", "move"), ("↵", "open"), ("p", "pause/resume"), ("x", "cancel"), ("r", "retry"),
-                 ("f", "files"), ("o", "reveal"), ("s", "resume"), ("g", "settings"),
+                 ("f", "files"), ("o", "reveal"), ("s", "resume"), (":", "commands"), ("g", "settings"),
                  ("tab", "search"), ("q", "quit")]
     out, used = "", 0
     if app.status:
@@ -2652,7 +2754,39 @@ def _folder_box(cols: int, app: App) -> list[str]:
     ]
 
 
+def _palette_box(app: App, cols: int, rows: int) -> list[str]:
+    items = app.palette_items()
+    app.pal_sel = sel = min(app.pal_sel, max(0, len(items) - 1))
+    box_w = min(max(64, cols // 2), cols - 4)
+    inner_w = box_w - 4
+    pre = " " * ((cols - box_w) // 2)
+    n = min(PALETTE_ROWS, max(3, rows - 10))
+    start = _window(sel, len(items), n)
+    c = T.ACCENT
+    edge = lambda body: pre + style("│", c) + " " + body + " " + style("│", c)
+    head = "╭─ Commands "
+    out = [pre + style(head, c, bold=True) + style("─" * (box_w - dwidth(head) - 1) + "╮", c),
+           edge(cell("› " + clean(app.pal_buf) + "▌", inner_w, color=T.TEXT)),
+           edge(style("─" * inner_w, T.RULE))]
+    for i in range(start, start + n):
+        if i < len(items):
+            label, hint, _ = items[i]
+            here = i == sel
+            out.append(edge(cell(T.PTR if here else "", 2, color=c)
+                            + cell(label, inner_w - 14, color=c if here else None, bold=here)
+                            + cell(hint, 12, "right", dim=True)))
+        else:
+            out.append(edge(cell("No matching command" if not items and i == start else "", inner_w, dim=True)))
+    out.append(pre + style("╰" + "─" * (box_w - 2) + "╯", c))
+    return out
+
+
 def _overlay(lines: list[str], app: App, cols: int, rows: int) -> list[str]:
+    if app.palette:
+        for j, b in enumerate(_palette_box(app, cols, rows)):
+            if 2 + j < len(lines):
+                lines[2 + j] = b
+        return lines
     box = (_confirm(cols) if app.confirm_quit
            else _torrent_box(cols) if app.torrent_prompt
            else _cancel_box(cols) if app.cancel_prompt

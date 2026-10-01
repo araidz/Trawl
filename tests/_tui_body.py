@@ -1433,6 +1433,101 @@ class _AddEng:
     def add(self, uri, opts=None): pass
 assert App(eng=None).grab("m", "n") is False and App(eng=_AddEng()).grab("m", "n") is True, "grab reports success"
 
+# command palette: ctrl-k anywhere, : from nav views, fuzzy find, runs the real actions
+assert parse_keys(b"\x0b") == ["ctrl-k"]
+assert fuzzy_score("dl", "Download selected") is not None and fuzzy_score("zz", "Download") is None
+assert fuzzy_score("", "anything") == 0 and fuzzy_score("DOWN", "download") is not None, "case-insensitive"
+assert fuzzy_score("sort", "Cycle sort order") < fuzzy_score("sort", "Hide / show dead torrents, then sort"), "tighter span wins"
+apk = _batch_app()
+apk.on_key("ctrl-k")
+assert apk.palette and apk.pal_buf == ""
+_labels = [a[0] for a in apk.palette_items()]
+assert "Download selected (or all marked)" in _labels and "Pause / resume" not in _labels, "results context"
+assert "Theme: nord" in _labels and f"Theme: {apk.theme}" not in _labels, "the current theme isn't offered"
+apk.on_key("q")
+assert apk.running and apk.palette and apk.pal_buf == "q", "typing never leaks to normal keys"
+apk.on_key("ctrl-u")
+for ch in "sort":
+    apk.on_key(ch)
+assert apk.palette_items()[0][0] == "Cycle sort order"
+scr = _cols(apk)
+assert any("Commands" in x for x in scr) and any("› sort▌" in x for x in scr) and any("Cycle sort order" in x for x in scr)
+apk.on_key("enter")
+assert not apk.palette and apk.sort == "size", "enter runs the action"
+apk.on_key(":"); assert apk.palette
+apk.on_key("esc"); assert not apk.palette
+apk.on_key(":")
+for ch in "zzzq":
+    apk.on_key(ch)
+assert apk.palette_items() == [] and any("No matching command" in x for x in _cols(apk))
+apk.on_key("enter"); assert not apk.palette, "enter on no match just closes"
+for sc in ((100, 30), (140, 40)):
+    apk.on_key("ctrl-k")
+    assert all(dwidth(strip_ansi(x)) <= sc[0] for x in render(apk, *sc)), f"palette overflow at {sc}"
+    apk.on_key("esc")
+apk.on_key("ctrl-k")
+for sc in ((60, 14), (45, 12), (40, 12)):   # the box itself must fit; the view beneath has its own narrow limit
+    assert all(dwidth(strip_ansi(x)) <= sc[0] for x in _palette_box(apk, *sc)), f"palette box overflow at {sc}"
+apk.on_key("esc")
+apk.on_key("ctrl-k")
+for _ in range(80):
+    apk.on_key("down")
+assert apk.pal_sel == len(apk.palette_items()) - 1, "down clamps at the end"
+assert any("Quit" in x for x in _cols(apk)), "the list scrolls to keep the selection visible"
+for _ in range(80):
+    apk.on_key("up")
+assert apk.pal_sel == 0
+apk.on_key("pagedown"); assert apk.pal_sel == PALETTE_ROWS
+apk.on_key("esc")
+# actions do what the keys do
+apk = _batch_app(); apk.on_key(":")
+for ch in "folder":
+    apk.on_key(ch)
+apk.on_key("enter"); assert apk.folder_prompt is not None and apk.folder_prompt[1] == "Show.S01E00.1080p"
+apk.on_key("ctrl-k"); assert not apk.palette, "ctrl-k is ignored inside a prompt"
+apk.on_key("esc")
+apk = _batch_app(); apk.on_key(":")
+for ch in "movies":
+    apk.on_key(ch)
+apk.on_key("enter"); assert apk.cat == "movies" and apk.sel == 0
+apk.on_key(":")
+for ch in "theme nord":
+    apk.on_key(ch)
+_sv = {}; _osv = gs["save_config"]; gs["save_config"] = lambda c: _sv.update(c)
+apk.on_key("enter")
+assert apk.theme == "nord" and T.ACCENT == "#88c0d0" and _sv["theme"] == "nord", "theme action persists"
+gs["save_config"] = _osv; apk._set_theme("violet")
+for word, attr in (("settings", "settings"), ("keyboard help", "help")):
+    apk = _batch_app(); apk.on_key(":")
+    for ch in word:
+        apk.on_key(ch)
+    apk.on_key("enter"); assert getattr(apk, attr), word
+apk = _batch_app(); apk.on_key(":")
+for ch in "quit":
+    apk.on_key(ch)
+apk.on_key("enter"); assert not apk.running, "quit from the palette (idle)"
+# other contexts
+apd2 = App(eng=None); apd2.view = "downloads"
+apd2.on_key(":")
+_dl = [a[0] for a in apd2.palette_items()]
+assert "Pause / resume" in _dl and "Download selected (or all marked)" not in _dl and "Show search" in _dl, _dl
+apd2.on_key("esc")
+aps2 = App(eng=None)           # splash: ":" is just text, ctrl-k opens the palette
+aps2.on_key(":"); assert not aps2.palette and aps2.editing and aps2.query == ":"
+aps2 = App(eng=None); aps2.on_key("ctrl-k")
+assert aps2.palette and any("Commands" in x for x in _cols(aps2)), "palette over the splash"
+aps2.on_key("esc"); assert not aps2.palette
+aps2.on_key("/"); aps2.on_key("d"); aps2.on_key("ctrl-k")
+assert aps2.palette; aps2.on_key("esc")
+assert aps2.editing and aps2.query == "d", "ctrl-k mid-typing keeps the query"
+apk = _batch_app(); apk.on_key("enter"); apk.on_key("ctrl-k")
+_dc = [a[0] for a in apk.palette_items()]
+assert "Look inside the torrent" in _dc and "Back to results" in _dc and "Show downloads" not in _dc, _dc
+for ch in "back":
+    apk.on_key(ch)
+apk.on_key("enter"); assert apk.detail is None, "details context: back to results"
+assert "ctrl-k" in "\n".join(strip_ansi(l) for l in _help_panel(apk, 140, 70)), "help documents the palette"
+
 # peek inside: metadata-only fetch -> file picker -> grab just the ticked files
 _ben2 = lambda x: (b"i%de" % x if isinstance(x, int) else b"%d:%s" % (len(x), x.encode() if isinstance(x, str) else x)
                    if isinstance(x, (str, bytes)) else b"l" + b"".join(map(_ben2, x)) + b"e" if isinstance(x, list)

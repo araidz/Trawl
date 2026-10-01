@@ -81,6 +81,11 @@ Trawl is a from-scratch Python TUI inspired by
 - **Instant repeat searches** — a search where every source answered is kept for
   ten minutes; searching it again (or coming back to it) replays from memory. A
   search with a failed source is never cached, and `R` always re-runs.
+- **Command palette** — `Ctrl-K` anywhere (or `:` from the results and downloads
+  views) opens a searchable list of every action that makes sense right now:
+  type a few letters (`fold`, `sort`, `theme nord`), `↑↓`, `Enter`. It replays the
+  same keys you'd press, so nothing in it can drift out of date. Nobody has to
+  memorise the keys.
 - **Honest errors** — a Cloudflare browser check is called what it is instead of
   "HTTP 403", DNS failures, resets, TLS and timeouts read as plain sentences, and
   `E` lists every source with its response time, slowest first. A source that fails
