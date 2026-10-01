@@ -77,7 +77,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         while app.running:
             cols, rows = term.size()
-            dirty = bool(keys := term.read_keys(0.04 if app.animating(rows) else 0.2))
+            busy = bool(app.activity())  # the spinner needs a steady ~10 fps while something runs
+            dirty = bool(keys := term.read_keys(0.04 if app.animating(rows) else 0.1 if busy else 0.2))
             for k in keys:
                 app.on_key(k)
                 dirty = True  # also covers keys that open/close views without state change
@@ -98,8 +99,8 @@ def main(argv: list[str] | None = None) -> int:
                 app.start_check()  # no-op unless a followed show is due
                 dirty = True
                 app.check_clipboard()
-            if app.animating(rows):
-                dirty = True  # the sheen needs the animation frame rate
+            if busy or app.animating(rows):
+                dirty = True  # spinner / sheen animation frames
             if dirty or term.size() != (cols, rows):
                 cols, rows = term.size()
                 term.write(render(app, cols, rows), (cols, rows))

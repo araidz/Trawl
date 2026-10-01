@@ -1487,6 +1487,69 @@ assert apt.status == 'Torrentio knows no releases of "Nothing"' and apt.detail i
 apt.on_key("t"); assert apt._other_busy, "a failed lookup can be retried"; _tr_wait(apt)
 gs["torrentio_releases"] = _otr
 
+# status area: top-right, live (spinner + current process), fading, tone-coloured; footer is all shortcuts
+def _stat_app():
+    a = App(eng=None); a.view, a.search, a.query = "search", Replay((), []), "x"
+    a.results = [Result("a" * 40, "Dune.2021.1080p", 10 ** 9, 5, 1, "yts", "m")]
+    a.search_done = a.search_total = 0
+    return a
+_sa = _stat_app()
+assert _sa.status_live() is None and _sa.activity() == [], "idle and silent"
+for msg, color in (("grabbing: Dune", T.GOOD), ("only 3 GB free — press again to grab anyway", T.WARN),
+                   ("error: boom", T.BAD), ("couldn't read the file list", T.BAD), ("Torrentio: blocked", T.WARN),
+                   ("sorted by size", T.ALT), ("no results to show", T.WARN)):
+    _sa.status = msg
+    assert _sa.status_live() == (msg, color), (msg, _sa.status_live())
+_sa.status = "sorted by size"; _sa._status_at -= STATUS_TTL + 1
+assert _sa.status_live() is None and _sa.status == "sorted by size", "a plain message fades but stays readable as state"
+_sa.status = "error: boom"; _sa._status_at -= STATUS_TTL + 1
+assert _sa.status_live() is not None, "errors outlive plain messages"
+_sa._status_at -= STATUS_TTL_WARN
+assert _sa.status_live() is None
+# what's running
+_sa.search, _sa.search_done, _sa.search_total = Search.__new__(Search), 7, 22
+assert _sa.activity() == ["searching 7/22"]
+_sa.search_done = 22; assert _sa.activity() == []
+_sa._peek, _sa._other_busy, _sa._sub_busy = (1,), True, True
+_sa.downloads = [Download("g", "m1", "metadata", 0, 0, 0, 0, None, root="a"), Download("h", "m2", "metadata", 0, 0, 0, 0, None, root="b"),
+                 Download("i", "x", "active", 1, 0, 0, 0, None, root="c")]
+_sa._exports = {"e": 1}
+assert _sa.activity() == ["reading file list", "asking Torrentio", "checking followed shows",
+                          "fetching metadata ×2", "saving .torrent"], _sa.activity()
+# rendering: top-right bar carries it, the footer carries only shortcuts
+_sb = _stat_app(); _sb.status = "grabbing: Dune"
+_sb.search, _sb.search_done, _sb.search_total = Search.__new__(Search), 7, 22
+_sb.down_speed, _sb.num_active = 3_500_000, 2
+for cols in (150, 120, 100, 70, 55):
+    fr = [strip_ansi(x) for x in render(_sb, cols, 24)]
+    head, foot = fr[2], fr[-1] if fr[-1].strip() else next(x for x in reversed(fr) if x.strip())
+    assert "grabbing: Dune" in head and "searching 7/22" in head and head.rstrip().endswith("─"), (cols, head)
+    assert dwidth(head) <= cols and "grabbing" not in foot and "q quit" in foot, (cols, foot)
+    assert ("3.3 MB/s" in head) == (cols >= 70), f"the speed is the first thing dropped when tight ({cols})"
+_sb.status = "only 3.00 GB free, needs 14.00 GB — press again to grab anyway"
+for cols in (150, 90, 70, 55):
+    assert "press again" in strip_ansi(render(_sb, cols, 24)[2]) or cols == 55, f"a warning survives at {cols} cols"
+    assert dwidth(strip_ansi(render(_sb, cols, 24)[2])) <= max(40, cols)
+for budget in (0, 1, 5, 14, 30, 60):
+    bar, bw = _status_bar(_sb, budget)
+    assert bw <= budget and dwidth(strip_ansi(bar)) == bw, (budget, bw)
+_sb.search_done = 22; _sb.down_speed = _sb.num_active = 0; _sb._status_at -= STATUS_TTL_WARN + 1
+assert strip_ansi(render(_sb, 100, 24)[2]).strip(" ─") == "", "idle and faded: just the rule"
+# the spinner moves
+_sc = _stat_app(); _sc._sub_busy = True
+_f1 = strip_ansi(_status_bar(_sc, 80)[0]); time.sleep(0.2); _f2 = strip_ansi(_status_bar(_sc, 80)[0])
+assert _f1 != _f2 and _f1[1:] == _f2[1:], "only the spinner glyph changes"
+# secrets never reach the screen
+_sd = _stat_app(); _sd.source_secrets = {"x": ("SECRETSENTINEL9",)}; _sd.status = "error: SECRETSENTINEL9 rejected"
+assert "SECRETSENTINEL9" not in "\n".join(strip_ansi(x) for x in render(_sd, 100, 24)) and "error:" in strip_ansi(render(_sd, 100, 24)[2])
+# splash: same corner, said once; palette leaves the corner visible
+_se = App(eng=None); _se.status = "from cache (1m 3s old) — R searches again"; _se.down_speed, _se.num_active = 2_000_000, 1
+_sp = [strip_ansi(x) for x in render(_se, 110, 28)]
+assert "from cache" in _sp[0] and "MB/s" in _sp[0] and sum("from cache" in x for x in _sp) == 1, _sp[0]
+assert dwidth(_sp[0]) <= 110 and render(_se, 90, 12), "tiny splash can't crash"
+_sf = _stat_app(); _sf.status = "grabbing: Dune"; _sf.on_key("ctrl-k")
+assert "grabbing: Dune" in strip_ansi(render(_sf, 110, 30)[2]) and any("Commands" in strip_ansi(x) for x in render(_sf, 110, 30))
+
 # following shows: w, background checks, the Following overlay (W), auto-grab, guards
 from .follow import make_sub
 _saved, _toasts, _checks = [], [], []
@@ -1804,6 +1867,7 @@ saved_u = {}
 o_save = gs["save_config"]
 gs["save_config"] = lambda c: saved_u.update(c)
 apu.settings = True
+apu.update_check = True  # the real config may say otherwise; the toggle starts from "on"
 apu.set_sel = [k for k, _ in apu.setting_items()].index("updates")
 apu._settings_key("enter")
 assert apu.update_check is False and saved_u["update_check"] is False, saved_u

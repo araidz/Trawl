@@ -335,6 +335,8 @@ PEEK_TIMEOUT = 45  # seconds to wait for a magnet's file list before giving up
 CACHE_TTL = 600  # a finished search is replayed from memory for 10 minutes
 CACHE_MAX = 20
 PALETTE_ROWS = 9  # command-palette list height
+STATUS_TTL = 10.0       # seconds a plain status message stays in the top-right corner
+STATUS_TTL_WARN = 30.0  # warnings and errors linger longer
 SUB_RETRY = 600  # seconds before an unanswered follow check is tried again
 QUARANTINE_AFTER = 3  # searches in a row a source may fail before it's paused for the session
 
@@ -829,6 +831,50 @@ class App:
     def enabled_sources(self) -> list:
         paused = self.paused_sources()
         return [s for s in self.sources if s.id not in self.disabled_sources and s.id not in paused]
+
+    @property
+    def status(self) -> str:
+        return self._status
+
+    @status.setter
+    def status(self, value: str) -> None:
+        self._status, self._status_at = value, time.monotonic()
+
+    def status_live(self) -> tuple[str, str] | None:
+        """(message, colour) while the last status message is still fresh, else None.
+        Warnings and errors (needing a second key press, a failure, no disk space) linger."""
+        msg = self._status
+        if not msg:
+            return None
+        low = msg.lower()
+        if low.startswith(("error", "couldn't", "(no engine)")) or "failed" in low:
+            color, ttl = T.BAD, STATUS_TTL_WARN
+        elif "press " in low or low.startswith(("not enough", "only ", "nothing", "no ", "torrentio:")) or "paused" in low:
+            color, ttl = T.WARN, STATUS_TTL_WARN
+        elif low.startswith(("grabbing", "following", "saved", "opened", "resumed", "revealed", "unfollowed",
+                             "marked", "new episodes", "downloading")) or "copied" in low:
+            color, ttl = T.GOOD, STATUS_TTL
+        else:
+            color, ttl = T.ALT, STATUS_TTL
+        return (msg, color) if time.monotonic() - self._status_at < ttl else None
+
+    def activity(self) -> list[str]:
+        """What the app is doing right now, for the live indicator (empty = idle)."""
+        out = []
+        if self.search is not None and self.search_done < self.search_total:
+            out.append(f"searching {self.search_done}/{self.search_total}")
+        if self._peek:
+            out.append("reading file list")
+        if self._other_busy:
+            out.append("asking Torrentio")
+        if self._sub_busy:
+            out.append("checking followed shows")
+        meta = sum(1 for d in self.downloads if d.status == "metadata")
+        if meta:
+            out.append(f"fetching metadata ×{meta}" if meta > 1 else "fetching metadata")
+        if self._exports:
+            out.append("saving .torrent")
+        return out
 
     @property
     def tick(self) -> float:
@@ -2882,10 +2928,6 @@ def _footer(app: App, width: int) -> str:
                  ("f", "files"), ("o", "reveal"), ("s", "resume"), (":", "commands"), ("g", "settings"),
                  ("tab", "search"), ("q", "quit")]
     out, used = "", 0
-    if app.status:
-        st = dtrunc(redact(clean(app.status), app._all_secrets()), max(10, width // 2))
-        out = style(st, T.ALT) + "   "
-        used = dwidth(st) + 3
     sep = "  " + T.DOT + "  "
     sep_w = dwidth(sep)
     last = hints[-1]  # the quit hint must always survive truncation
@@ -2939,17 +2981,15 @@ def _splash(app: App, cols: int, rows: int) -> list[str]:
         parts.append(style(k, T.ALT) + style(" " + v, dim=True))
         plain += dwidth(k) + 1 + dwidth(v)
     block += ["", _center("".join(parts), plain, cols)]
-    if app.down_speed > 0 or app.num_active > 0:
-        stat = f"{T.DOWN} {fmt_speed(app.down_speed)}  {T.DOT}  {app.num_active} active"
-        block += ["", _center(style(stat, T.ALT), dwidth(stat), cols)]
     if app.update_tag:
         note = dtrunc(_update_note(app), cols - 4)
         block += ["", _center(style(note, T.WARN), dwidth(note), cols)]
-    if app.status:
-        st = dtrunc(redact(clean(app.status), app._all_secrets()), cols - 4)
-        block += ["", _center(style(st, T.ALT), dwidth(st), cols)]
     top = max(0, (rows - len(block)) // 2)
-    return ([""] * top + block + [""] * rows)[:rows]
+    lines = ([""] * top + block + [""] * rows)[:rows]
+    bar, bar_w = _status_bar(app, cols - 2 * MARGIN)
+    if bar and not lines[0].strip():  # top-right corner, same place as every other screen
+        lines[0] = " " * (cols - MARGIN - bar_w) + bar
+    return lines
 
 def _modal_box(cols: int, label: str, hints: list[tuple[str, str]], color: str) -> list[str]:
     plain = "  " + label + "   " + "  ·  ".join(f"{k} {v}" for k, v in hints) + "  "
@@ -3036,8 +3076,8 @@ def _palette_box(app: App, cols: int, rows: int) -> list[str]:
 def _overlay(lines: list[str], app: App, cols: int, rows: int) -> list[str]:
     if app.palette:
         for j, b in enumerate(_palette_box(app, cols, rows)):
-            if 2 + j < len(lines):
-                lines[2 + j] = b
+            if 3 + j < len(lines):  # row 2 is the rule with the status bar: keep it visible
+                lines[3 + j] = b
         return lines
     box = (_confirm(cols) if app.confirm_quit
            else _torrent_box(cols) if app.torrent_prompt
@@ -3092,6 +3132,43 @@ def _redact_frame(lines: list[str], app: App) -> list[str]:
     return [redact_line(line) for line in lines]
 
 
+def _status_bar(app: App, budget: int) -> tuple[str, int]:
+    """The top-right indicator: [fading message]  [spinner + what's running]  [download speed].
+    Returns (styled text, display width) squeezed into `budget` columns. The message matters
+    most (it may be a warning that needs a key press), so the speed is dropped first, then the
+    activity text is shortened, and only then does the message give way."""
+    sep = "   "
+    live = app.status_live()
+    act = app.activity()
+    spin = T.SPIN[int(time.monotonic() * 12) % len(T.SPIN)]
+    item = {"msg": dtrunc(redact(clean(live[0]), app._all_secrets()), 200) if live else "",
+            "act": f"{spin} " + " · ".join(act) if act else "",
+            "stat": f"{T.DOWN} {fmt_speed(app.down_speed)} · {app.num_active} active"
+            if app.down_speed > 0 or app.num_active > 0 else ""}
+
+    def width() -> int:
+        shown = [v for v in item.values() if v]
+        return sum(dwidth(v) for v in shown) + len(sep) * max(0, len(shown) - 1)
+
+    while width() > budget:
+        over = width() - budget
+        if item["stat"]:
+            item["stat"] = ""
+        elif dwidth(item["act"]) > 4:  # shrink toward just the spinner; the message is worth more
+            item["act"] = dtrunc(item["act"], max(4, dwidth(item["act"]) - over))
+        elif dwidth(item["msg"]) > 12:
+            item["msg"] = dtrunc(item["msg"], max(12, dwidth(item["msg"]) - over))
+        elif item["msg"]:
+            item["msg"] = ""
+        elif item["act"]:
+            item["act"] = dtrunc(item["act"], budget)
+        else:
+            break
+    color = {"msg": live[1] if live else T.ALT, "act": T.ACCENT, "stat": T.ALT}
+    parts = [style(v, color[k], bold=k == "act") for k, v in item.items() if v]
+    return sep.join(parts), width() if parts else 0
+
+
 def _update_note(app: App) -> str:
     return f"trawl {app.update_tag} available · brew upgrade trawl"
 
@@ -3105,15 +3182,14 @@ def render(app: App, cols: int, rows: int) -> list[str]:
     for L in _logo_lines():
         lines.append(" " * MARGIN + L)
     rule_w = max(0, cols - 2 * MARGIN)
-    stat = f" {T.DOWN} {fmt_speed(app.down_speed)}  {app.num_active} active " \
-        if app.down_speed > 0 or app.num_active > 0 else ""
     notes = ([f"{app.new_count()} new episode(s) — W"] if app.new_count() else []) \
         + ([_update_note(app)] if app.update_tag else [])
     note = f" {'  ·  '.join(notes)} " if notes else ""
-    if stat or note:
-        dashes = max(0, rule_w - dwidth(stat) - dwidth(note) - 2)
-        lines.append(" " * MARGIN + style("─", T.RULE) + style(note, T.WARN)
-                     + style("─" * dashes, T.RULE) + style(stat, T.ALT) + style("─", T.RULE))
+    bar, bar_w = _status_bar(app, max(0, rule_w - dwidth(note) - 8))
+    if bar or note:
+        dashes = max(0, rule_w - dwidth(note) - (bar_w + 2 if bar else 0) - 2)
+        lines.append(" " * MARGIN + style("─", T.RULE) + style(note, T.WARN) + style("─" * dashes, T.RULE)
+                     + (" " + bar + " " if bar else "") + style("─", T.RULE))
     else:
         lines.append(" " * MARGIN + style("─" * rule_w, T.RULE))
 

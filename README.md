@@ -93,6 +93,12 @@ Trawl is a from-scratch Python TUI inspired by
   release per episode), `g` grabs them, `m` marks them seen, `a` switches on
   **auto-grab** (new episodes download by themselves, still behind the disk-space
   guard), `x` unfollows. Season packs and batches are never treated as an episode.
+- **Live status corner** — the top-right of every screen shows what Trawl is
+  doing right now: a spinner with the running process (`searching 7/22`, `reading
+  file list`, `asking Torrentio`, `fetching metadata ×2`, `checking followed
+  shows`), the download speed, and the latest message, which fades after ten
+  seconds (warnings and errors stay for thirty, coloured accordingly). The bottom
+  line is left entirely to shortcuts.
 - **Command palette** — `Ctrl-K` anywhere (or `:` from the results and downloads
   views) opens a searchable list of every action that makes sense right now:
   type a few letters (`fold`, `sort`, `theme nord`), `↑↓`, `Enter`. It replays the

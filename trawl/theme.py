@@ -148,6 +148,7 @@ PAUSE = "⏸"
 DOT = "·"
 BLOCK = "█"
 TRACK = "░"
+SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"  # busy spinner frames
 
 # trawl wordmark + a trawling-net mesh (gradient on the word, aqua on the net)
 LOGO_LINES: list[str] = [
