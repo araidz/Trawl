@@ -69,7 +69,7 @@ Trawl is a from-scratch Python TUI inspired by
   torrents; reveal in Finder; a persistent *Recently downloaded* list.
 - **Release badges** — each row shows what the name says it is (`2160p WEB HDR`,
   `1080p BD`, `720p HDTV`); CAM/telesync rips are flagged red. The badge column
-  appears on wide terminals; details always show the full format line.
+  appears on terminals about 103 columns or wider; details always show the full format line.
 - **Look inside first** — `f` in a magnet's details view fetches just its
   metadata (a few seconds, nothing written to your downloads) and lists the files
   with sizes. Tick the ones you want and `Enter` downloads only those; a season
@@ -128,7 +128,7 @@ Trawl is a from-scratch Python TUI inspired by
 - **Quality of life** — persistent search history, completion notifications,
   clipboard magnet auto-detect (new magnets/links are offered as they appear),
   mouse-wheel scrolling, a settings overlay (toggle sources, set the download
-  dir and an optional speed cap), and confirm-on-quit.
+  dir and an optional speed cap), and quit confirmation while a download is running.
 - **Single file** — ships as one stdlib zipapp executable on your `PATH`.
 
 ## Requirements
