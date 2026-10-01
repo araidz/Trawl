@@ -85,6 +85,14 @@ Trawl is a from-scratch Python TUI inspired by
   Cinemeta for its IMDb id and Torrentio for every torrent it knows (often 50–100,
   across ~20 trackers), and swaps the list for them: sort, filter, mark and batch
   grab as usual. Only runs when you press it; movies and single episodes (`SxxEyy`).
+- **Follow shows** — `w` on a TV or anime episode follows its show (at that
+  quality; the episode you picked is the baseline). Trawl checks followed shows in
+  the background when it starts and every few hours it stays open, and tells you in
+  the header and with a desktop notification when something newer than your last
+  episode appears. `W` opens the list: `Enter` shows the new releases (one best
+  release per episode), `g` grabs them, `m` marks them seen, `a` switches on
+  **auto-grab** (new episodes download by themselves, still behind the disk-space
+  guard), `x` unfollows. Season packs and batches are never treated as an episode.
 - **Command palette** — `Ctrl-K` anywhere (or `:` from the results and downloads
   views) opens a searchable list of every action that makes sense right now:
   type a few letters (`fold`, `sort`, `theme nord`), `↑↓`, `Enter`. It replays the
@@ -164,6 +172,7 @@ You can also start straight into a search: `trawl oppenheimer`.
 | `↑ ↓` | recall past searches · `PgUp/PgDn` page · `Home/End` jump |
 | `Ctrl-A/E` caret · `Ctrl-U/W` kill · `Esc` exit the box | edit the query |
 | `Enter` | result details |
+| `w` · `W` | follow the selected show (TV/anime episode) · list followed shows and their new episodes |
 | `Space` | mark / unmark the selected result and step down (build a batch: a whole season, a run of episodes) |
 | `a` · `Esc` | mark all visible / none · clear marks |
 | `d` | download the marked results, or the selected one if nothing is marked |
@@ -244,7 +253,7 @@ uses a private session file so it never touches your own aria2 state.
 
 State lives in `~/Library/Application Support/Trawl/`:
 `history.txt` (searches), `downloads.jsonl` (completed), `config.json` (settings),
-`update.json` (last update check),
+`update.json` (last update check), `subscriptions.json` (followed shows),
 `pending.jsonl` (direct-link grabs, for resuming), `aria2-session.txt` (private session).
 
 Torznab endpoint keys are masked in the UI and errors, as are metadata keys.

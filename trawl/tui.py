@@ -35,6 +35,7 @@ from .sources import (SOURCES, LocalQuery, Source, Replay, Result, ResultVariant
                       build_magnet, dedupe, fetch_json, make_torznab_source, matches_query, torrentio_releases,
                       parse_magnet, parse_query, parse_release, parse_source, redact, redact_url,
                       result_identity, torznab_label, validate_torznab_url)
+from .follow import CHECK_EVERY, check_sub, episode_of, fmt_ep, load_subs, make_sub, save_subs
 from .meta import Meta, clean_title, kind_for, lookup
 
 CATS = [("all", "All"), ("games", "Games"), ("movies", "Movies"),
@@ -334,6 +335,7 @@ PEEK_TIMEOUT = 45  # seconds to wait for a magnet's file list before giving up
 CACHE_TTL = 600  # a finished search is replayed from memory for 10 minutes
 CACHE_MAX = 20
 PALETTE_ROWS = 9  # command-palette list height
+SUB_RETRY = 600  # seconds before an unanswered follow check is tried again
 QUARANTINE_AFTER = 3  # searches in a row a source may fail before it's paused for the session
 
 
@@ -659,6 +661,14 @@ class App:
         self._cache: dict[tuple, tuple[float, tuple]] = {}  # (query, source ids) -> (when, updates)
         self._cache_key: tuple | None = None
         self._log: list = []  # this search's SourceUpdates, kept to fill the cache
+        self.subs: list[dict] = load_subs()  # followed shows
+        self.sub_new: dict[str, list[Result]] = {}  # show id -> releases newer than its last episode
+        self.following = False  # the Following overlay (W)
+        self.follow_sel = 0
+        self._unfollow = ""  # show id waiting for a second x to confirm
+        self._sub_busy = False
+        self._sub_tried = 0.0  # when a check last started: a failing one isn't retried for SUB_RETRY
+        self._sub_done: list = []  # (show id, new releases, sources answered) from the check thread; None = finished
         self._other: tuple | None = None  # (title, results, error) handed back by the Torrentio thread
         self._other_busy = False
         self.last_update: dict[str, SourceUpdate] = {}  # newest answer per source, for the health view
@@ -1468,6 +1478,8 @@ class App:
         search state changed (caller may then skip a redundant render)."""
         if self._other:
             self._take_releases()
+        if self._sub_done:
+            self._take_subs()
         if not self.search:
             return False
         changed = False
@@ -1632,14 +1644,148 @@ class App:
         if err or not rs:
             self.status = f"Torrentio: {err}" if err else f'Torrentio knows no releases of "{clean(title)}"'
             return
+        self._show_results(title, rs)
+        self.status = f'{len(rs)} releases of "{clean(title)}" from Torrentio'
+
+    def _show_results(self, query: str, rs: list[Result], source: str = "torrentio") -> None:
+        """Replace the results list with `rs` (already-found releases), as if searched."""
         self.detail, self.variant_idx = None, 0
-        self.local_query, self.query = LocalQuery(""), title
-        self.search, self.search_total = Replay((SourceUpdate("torrentio", rs),), []), 1
+        self.local_query, self.query = LocalQuery(""), query
+        self.search, self.search_total = Replay((SourceUpdate(source, rs),), []), 1
         self.results, self.errors, self.search_done, self.sel = [], {}, 0, 0
         self.marked.clear()
         self._set_filter("")
         self._cache_key, self._log, self.last_update = None, [], {}
-        self.status = f'{len(rs)} releases of "{clean(title)}" from Torrentio'
+        self.view = "search"
+
+    # -- following shows
+    def follow_current(self) -> None:
+        r = self.detail or self._cur()
+        sub = make_sub(r.name, self.result_group(r) or "") if r else None
+        if not sub:
+            self.status = "open a TV or anime episode result (SxxEyy, or 'Show - 12') to follow its show"
+            return
+        old = next((x for x in self.subs if x["id"] == sub["id"]), None)
+        if old:
+            old.update(res=sub["res"], last=sub["last"], group=sub["group"])
+            self.sub_new.pop(old["id"], None)
+        else:
+            self.subs.append(sub)
+        save_subs(self.subs)
+        q = f" ({sub['res']}p)" if sub["res"] else ""
+        self.status = f"following {sub['title']}{q} — new episodes after {fmt_ep(sub['last'])} appear under W"
+
+    def new_count(self) -> int:
+        return sum(len(v) for v in self.sub_new.values())
+
+    def start_check(self, force: bool = False) -> None:
+        """Look for new episodes of followed shows (each at most every CHECK_EVERY seconds)."""
+        due = [x for x in self.subs if force or time.time() - x["checked"] > CHECK_EVERY]
+        if self._sub_busy or not due or (not force and time.time() - self._sub_tried < SUB_RETRY):
+            return
+        self._sub_busy, self._sub_tried = True, time.time()
+        threading.Thread(target=self._check_subs, args=(due, self.enabled_sources()), daemon=True).start()
+
+    def _check_subs(self, due: list[dict], sources: list) -> None:
+        for sub in due:
+            try:
+                new, answered = check_sub(sub, [s for s in sources if s.group in (sub["group"], "Other")])
+            except Exception:  # one show's failure must not stop the rest
+                new, answered = [], 0
+            self._sub_done.append((sub["id"], new, answered))
+        self._sub_done.append(None)
+
+    def _take_subs(self) -> None:
+        found = []
+        while self._sub_done:
+            item = self._sub_done.pop(0)
+            if item is None:
+                self._sub_busy = False
+                continue
+            sid, new, answered = item
+            sub = next((x for x in self.subs if x["id"] == sid), None)
+            if not sub or not answered:
+                continue
+            sub["checked"] = time.time()
+            self.sub_new[sid] = new
+            if new and sub["auto"]:
+                self._grab_new(sub)
+            elif new:
+                found.append((sub, new))
+        save_subs(self.subs)
+        if found:
+            names = ", ".join(f"{x['title']} {fmt_ep(episode_of(n[-1].name))}" for x, n in found[:3])
+            self.status = f"new episodes: {names}{' …' if len(found) > 3 else ''} — W"
+            notify("trawl — new episodes", names)
+
+    def _grab_new(self, sub: dict) -> bool:
+        """Download the best release of every new episode of `sub`, then move its baseline."""
+        new = self.sub_new.get(sub["id"]) or []
+        size = sum(r.size for r in new)
+        free = free_space(self.download_dir or (self.eng.download_dir() if self.eng else "") or "")
+        if not new:
+            return False
+        if size and free is not None and size + SPACE_MARGIN > free:
+            self.status = f"not enough disk space for {len(new)} new episode(s) of {sub['title']}"
+            return False
+        if not sum(bool(self.grab(r.magnet, r.name)) for r in new):
+            return False
+        sub["last"] = list(episode_of(new[-1].name))
+        self.sub_new[sub["id"]] = []
+        save_subs(self.subs)
+        self.status = f"grabbing {len(new)} new episode(s) of {sub['title']} (now at {fmt_ep(sub['last'])})"
+        notify("trawl — grabbing new episodes", f"{sub['title']} · {len(new)}")
+        return True
+
+    def open_following(self) -> None:
+        self.following, self.follow_sel, self._unfollow = True, 0, ""
+
+    def _following_key(self, k: str) -> None:
+        n = len(self.subs)
+        if k in ("esc", "W", "q"):
+            self.following = False
+        elif k in ("up", "k", "down", "j") and n:
+            self.follow_sel = (self.follow_sel + (-1 if k in ("up", "k") else 1)) % n
+            self._unfollow = ""
+        elif k == "c":
+            self.start_check(force=True)
+            self.status = "checking followed shows…" if self.subs else "not following anything yet"
+        elif n:
+            self.follow_sel = min(self.follow_sel, n - 1)
+            sub = self.subs[self.follow_sel]
+            new = self.sub_new.get(sub["id"]) or []
+            if k != "x":
+                self._unfollow = ""
+            if k == "enter":
+                if new:
+                    self._show_results(sub["title"], new, "follow")
+                    self.following = False
+                    self.status = f"{len(new)} new episode(s) of {sub['title']}"
+                else:
+                    self.status = f"no new episodes of {sub['title']}"
+            elif k == "g":
+                if not self._grab_new(sub) and not new:
+                    self.status = f"no new episodes of {sub['title']}"
+            elif k == "m" and new:
+                sub["last"] = list(episode_of(new[-1].name))
+                self.sub_new[sub["id"]] = []
+                save_subs(self.subs)
+                self.status = f"{sub['title']}: marked seen up to {fmt_ep(sub['last'])}"
+            elif k == "a":
+                sub["auto"] = not sub["auto"]
+                save_subs(self.subs)
+                self.status = (f"{sub['title']}: new episodes will download automatically" if sub["auto"]
+                               else f"{sub['title']}: auto-grab off")
+            elif k == "x":
+                if self._unfollow == sub["id"]:
+                    self.subs.remove(sub)
+                    self.sub_new.pop(sub["id"], None)
+                    self._unfollow, self.follow_sel = "", max(0, self.follow_sel - 1)
+                    save_subs(self.subs)
+                    self.status = f"unfollowed {sub['title']}"
+                else:
+                    self._unfollow = sub["id"]
+                    self.status = f"press x again to unfollow {sub['title']}"
 
     def resume_partial(self) -> None:
         n = self.scan_resume()
@@ -1657,6 +1803,7 @@ class App:
             out += [("Download", "d", keys("d")), ("Download to a folder", "D", keys("D")),
                     ("Look inside the torrent", "f", keys("f")),
                     ("All releases of this title (Torrentio)", "t", keys("t")),
+                    ("Follow this show", "w", keys("w")),
                     ("Save the .torrent file", "e", keys("e")),
                     ("Open the page in a browser", "o", keys("o")), ("Copy the magnet", "y", keys("y")),
                     ("Back to results", "esc", keys("esc"))]
@@ -1667,7 +1814,7 @@ class App:
                     ("Download to a folder", "D", keys("D")), ("Save the .torrent file", "e", keys("e")),
                     ("Open the page in a browser", "o", keys("o")), ("Copy the magnet", "y", keys("y")),
                     ("Mark / unmark and step down", "space", keys(" ")), ("Mark all / none", "a", keys("a")),
-                    ("Filter these results", "f", keys("f")), ("Search again, skipping the cache", "R", keys("R")),
+                    ("Follow this show", "w", keys("w")), ("Filter these results", "f", keys("f")), ("Search again, skipping the cache", "R", keys("R")),
                     ("Retry failed sources", "r", keys("r")), ("Source health", "E", keys("E")),
                     ("Cycle sort order", "S", keys("S")), ("Hide / show dead torrents", "z", keys("z")),
                     ("Edit the query", "/", keys("/")), ("Clear results", "c", keys("c"))]
@@ -1684,8 +1831,11 @@ class App:
                 ("Resume partial downloads on disk", "s", self.resume_partial),
                 ("Settings", "g", lambda: (setattr(self, "settings", True),
                                             setattr(self, "set_sel", self._snap_setting(0)))),
+                ("Followed shows", "W", self.open_following),
                 ("Keyboard help", "?", lambda: setattr(self, "help", True)),
                 ("Quit", "q", self._quit)]
+        if self.subs:
+            out.append(("Check followed shows now", "", lambda: self.start_check(True)))
         out += [(f"Theme: {t}", "", lambda t=t: (self._set_theme(t), self._save_settings()))
                 for t in T.THEMES if t != self.theme]
         return out
@@ -1752,7 +1902,7 @@ class App:
             self._palette_key(k)
             return
         if k == "ctrl-k" and not (self.torrent_prompt or self.cancel_prompt or self.folder_prompt
-                                  or self.edit_field or self.picker or self.settings):
+                                  or self.edit_field or self.picker or self.settings or self.following):
             self.open_palette()
             return
         if self.torrent_prompt is not None:
@@ -1789,6 +1939,9 @@ class App:
             elif len(k) == 1 and k >= " ":
                 self.folder_buf += k
             return
+        if self.following:
+            self._following_key(k)
+            return
         if self.settings:
             self._settings_key(k)
             return
@@ -1816,6 +1969,8 @@ class App:
                 self.start_peek(self._variant().uri, self.detail.name)
             elif k == "t":
                 self.start_releases()
+            elif k == "w":
+                self.follow_current()
             elif k == "o":
                 page = self._variant().page
                 self.status = ("opened in browser" if page and open_url(page)
@@ -1901,6 +2056,8 @@ class App:
             self.resume_partial()
         elif k == ":":
             self.open_palette()
+        elif k == "W":
+            self.open_following()
         elif k == "v":
             pm = parse_source(paste_clipboard())
             if pm:
@@ -1934,6 +2091,8 @@ class App:
                     self.show_errors = not self.show_errors
                 else:
                     self.status = "no search yet — nothing to show"
+            elif k == "w":
+                self.follow_current()
             elif k == "f":
                 if self.search is not None:
                     self.filtering = True
@@ -2270,6 +2429,40 @@ def _errors_panel(app: App, width: int, height: int) -> list[str]:
     return _wrap_panel("Sources", inner, width, height, True, n)
 
 
+def _following_panel(app: App, width: int, height: int) -> list[str]:
+    inner_w = width - 4
+    inner = [cell("checked every 4 hours · c checks now · a = auto-grab: download new episodes without asking",
+                  inner_w, dim=True), cell("", inner_w)]
+    if not app.subs:
+        inner += [cell("Not following anything yet.", inner_w, color=T.ALT),
+                  cell("Open a TV or anime episode and press w to follow its show.", inner_w, dim=True)]
+    name_w = max(8, inner_w - 37)
+    for i, sub in enumerate(app.subs):
+        here = i == app.follow_sel
+        new = app.sub_new.get(sub["id"]) or []
+        ago = fmt_rel(sub["checked"]) if sub["checked"] else "unchecked"
+        inner.append(cell(T.PTR if here else "", 2, color=T.ACCENT) + " "
+                     + cell(sub["title"] + (f" {sub['res']}p" if sub["res"] else ""), name_w,
+                            color=T.ACCENT if here else T.TEXT, bold=here) + " "
+                     + cell(fmt_ep(sub["last"]), 7, dim=True) + " "
+                     + cell(f"{len(new)} new" if new else "—", 8, "right",
+                            color=T.GOOD if new else None, bold=bool(new), dim=not new) + " "
+                     + cell("auto" if sub["auto"] else "", 6, color=T.WARN) + " "
+                     + cell(ago, 9, "right", dim=True))
+    sel = app.subs[app.follow_sel] if 0 <= app.follow_sel < len(app.subs) else None
+    new = (app.sub_new.get(sel["id"]) or []) if sel else []
+    if new:
+        inner += [cell("", inner_w),
+                  cell(f"New for {sel['title']} — enter shows them · g grabs them · m marks them seen",
+                       inner_w, color=T.ALT, bold=True)]
+        for r in new[:6]:
+            tag, tcolor = app.source_tag(r.source)
+            inner.append(cell(f"  {fmt_ep(episode_of(r.name))}  {clean(r.name)}", inner_w - 15, color=T.GOOD)
+                         + cell(fmt_bytes(r.size), 10, "right", dim=True)
+                         + cell(tag, 5, "right", color=tcolor))
+    return _wrap_panel("Following", inner, width, height, True, f"({len(app.subs)})" if app.subs else None)
+
+
 def _search_panel(app: App, width: int) -> list[str]:
     editing = app.view == "search" and app.editing
     return _wrap_panel("Search", [_search_line(app, width - 4)], width, 3, editing)
@@ -2600,7 +2793,8 @@ def _help_panel(app: App, width: int, height: int) -> list[str]:
         ("Details", [("← →", "cycle duplicate source variants"),
                      ("d / D / e", "download / to folder / save .torrent"),
                      ("f", "look inside; tick files, enter downloads just those"),
-                     ("t", "every known release of this title (asks Torrentio)")]),
+                     ("t", "every known release of this title (asks Torrentio)"),
+                     ("w", "follow this show (TV/anime); W lists followed shows")]),
         ("Settings", [("enter / space", "edit or toggle the selected row"),
                        ("a", "add Torznab feed"),
                        ("on a feed row", "e endpoint · K separate key · x remove"),
@@ -2641,6 +2835,9 @@ def _footer(app: App, width: int) -> str:
         hints = [("t", "contents"), ("f", ".torrent file"), ("esc", "cancel")]
     elif app.help:
         hints = [("↑↓", "scroll"), ("any key", "close")]
+    elif app.following:
+        hints = [("↑↓", "move"), ("↵", "new episodes"), ("g", "grab new"), ("m", "mark seen"),
+                 ("a", "auto-grab"), ("c", "check now"), ("x", "unfollow"), ("esc", "back")]
     elif app.settings:
         if app.edit_field:
             hints = [("type", "value"), ("enter", "save"), ("esc", "cancel")]
@@ -2902,7 +3099,7 @@ def _update_note(app: App) -> str:
 def render(app: App, cols: int, rows: int) -> list[str]:
     cols = max(40, cols)
     rows = max(12, rows)
-    if app.view == "search" and app.search is None and not app.help and not app.settings:
+    if app.view == "search" and app.search is None and not app.help and not app.settings and not app.following:
         return _redact_frame(_overlay(_splash(app, cols, rows), app, cols, rows), app)
     lines: list[str] = []
     for L in _logo_lines():
@@ -2910,7 +3107,9 @@ def render(app: App, cols: int, rows: int) -> list[str]:
     rule_w = max(0, cols - 2 * MARGIN)
     stat = f" {T.DOWN} {fmt_speed(app.down_speed)}  {app.num_active} active " \
         if app.down_speed > 0 or app.num_active > 0 else ""
-    note = f" {_update_note(app)} " if app.update_tag else ""
+    notes = ([f"{app.new_count()} new episode(s) — W"] if app.new_count() else []) \
+        + ([_update_note(app)] if app.update_tag else [])
+    note = f" {'  ·  '.join(notes)} " if notes else ""
     if stat or note:
         dashes = max(0, rule_w - dwidth(stat) - dwidth(note) - 2)
         lines.append(" " * MARGIN + style("─", T.RULE) + style(note, T.WARN)
@@ -2920,13 +3119,15 @@ def render(app: App, cols: int, rows: int) -> list[str]:
 
     body_h, panel_h = _main_heights(rows)
     use_rail = app.view in ("search", "downloads") and app.detail is None and not app.help \
-        and not app.settings and app.picker is None
+        and not app.settings and not app.following and app.picker is None
     content_w = cols - MARGIN - RAIL_W - GAP - 1 if use_rail else cols - MARGIN - 1
 
     if app.help:
         content = _help_panel(app, content_w, body_h)
     elif app.settings:
         content = _settings_panel(app, content_w, body_h)
+    elif app.following:
+        content = _following_panel(app, content_w, body_h)
     elif app.picker is not None:
         content = _picker_panel(app, content_w, body_h)
     else:

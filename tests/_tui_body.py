@@ -1487,6 +1487,122 @@ assert apt.status == 'Torrentio knows no releases of "Nothing"' and apt.detail i
 apt.on_key("t"); assert apt._other_busy, "a failed lookup can be retried"; _tr_wait(apt)
 gs["torrentio_releases"] = _otr
 
+# following shows: w, background checks, the Following overlay (W), auto-grab, guards
+from .follow import make_sub
+_saved, _toasts, _checks = [], [], []
+_og = {k: gs[k] for k in ("save_subs", "check_sub", "notify", "free_space")}
+gs["save_subs"] = lambda subs: _saved.append(json.loads(json.dumps(subs)))
+gs["notify"] = lambda title, msg: _toasts.append((title, msg))
+gs["free_space"] = lambda p: 500 << 30
+_fr = lambda n, src="eztv", seeds=10: Result(f"{n:040x}", f"Severance.S02E{n:02d}.1080p.WEB", (n % 5 + 1) << 29, seeds, 0, src, f"m{n}")
+def _fake_check(sub, sources, timeout=45.0):
+    _checks.append((sub["id"], sorted({s.group for s in sources}), tuple(sub["last"])))
+    return ([_fr(6), _fr(7)], 2) if sub["id"] == "severance" else ([], 0)
+gs["check_sub"] = _fake_check
+def _fol_app(name="Severance.S02E05.1080p.WEB-DL", source="eztv"):
+    a = App(eng=None); a.subs = []
+    a.view, a.search, a.query = "search", Replay((), []), "severance"
+    a.results = [Result("a" * 40, name, 10 ** 9, 5, 1, source, "m")]
+    return a
+def _fol_wait(a):
+    for _ in range(300):
+        a.drain_search()
+        if not a._sub_busy:
+            return
+        time.sleep(0.01)
+    raise AssertionError("follow check never finished")
+apf = _fol_app()
+apf.on_key("w")
+assert [s["id"] for s in apf.subs] == ["severance"] and apf.subs[0]["last"] == [2, 5] and apf.subs[0]["res"] == 1080
+assert "following Severance (1080p)" in apf.status and "after S02E05" in apf.status and _saved[-1][0]["id"] == "severance"
+apf.results = [Result("b" * 40, "Severance.S02E08.720p.HDTV", 10 ** 9, 5, 1, "eztv", "m")]
+apf.on_key("w")
+assert len(apf.subs) == 1 and apf.subs[0]["last"] == [2, 8] and apf.subs[0]["res"] == 720, "following again moves the baseline"
+for name, src, msg in (("Dune.2021.1080p.WEB-DL", "yts", "open a TV or anime episode"),
+                       ("Severance.S02E05.1080p", "yts", "open a TV or anime episode"),
+                       ("Cyberpunk [FitGirl Repack]", "fitgirl", "open a TV or anime episode")):
+    a2 = _fol_app(name, src); a2.on_key("w")
+    assert not a2.subs and msg in a2.status, (name, a2.status)
+a3 = _fol_app(); a3.on_key("enter"); a3.on_key("w")
+assert len(a3.subs) == 1 and a3.detail is not None, "w works from the details view too"
+# background check: found episodes notify once, the header says so, nothing hammers the sources
+apf = _fol_app(); apf.on_key("w"); apf.subs[0]["last"] = [2, 5]
+_checks.clear(); _toasts.clear()
+apf.start_check(); _fol_wait(apf)
+assert _checks == [("severance", ["Other", "TV"], (2, 5))], _checks
+assert [r.name[-13:] for r in apf.sub_new["severance"]] == ["E06.1080p.WEB", "E07.1080p.WEB"]
+assert apf.subs[0]["checked"] > 0 and apf.new_count() == 2
+assert "new episodes: Severance S02E07" in apf.status and _toasts == [("trawl — new episodes", "Severance S02E07")], (apf.status, _toasts)
+assert any("2 new episode(s) — W" in x for x in _cols(apf)), "header notice"
+apf.start_check(); assert len(_checks) == 1, "not due again for hours"
+apf.subs[0]["checked"] = 0.0; apf.start_check(); assert len(_checks) == 1, "retry floor stops back-to-back sweeps"
+apf.start_check(force=True); _fol_wait(apf); assert len(_checks) == 2, "force bypasses both"
+apf.subs.append({**make_sub("Nothing.S01E01.1080p", "TV")})
+apf.start_check(force=True); _fol_wait(apf)
+assert [c for c in _checks if c[0] == "nothing"] and apf.subs[1]["checked"] == 0.0, "no source answered: not marked checked"
+apf.subs.pop()
+# the overlay
+apf.on_key("W"); assert apf.following
+scr = _cols(apf)
+assert any("Following" in x and "(1)" in x for x in scr) and any("Severance 1080p" in x and "S02E05" in x and "2 new" in x for x in scr), scr
+assert any("S02E06" in x and "Severance.S02E06.1080p.WEB" in x for x in scr), "new releases listed under the show"
+assert all(dwidth(x) <= 120 for x in scr) and "auto-grab" in strip_ansi(_footer(apf, 140))
+apf.on_key("ctrl-k"); assert not apf.palette, "palette stays closed inside the overlay"
+apf.on_key("down"); apf.on_key("up")
+apf.on_key("esc"); assert not apf.following
+apf.on_key("W"); apf.on_key("W"); assert not apf.following, "W toggles"
+apf.on_key("W"); apf.on_key("enter")
+assert not apf.following and apf.view == "search" and apf.query == "Severance" and apf.detail is None
+apf.drain_search()
+assert [r.name[-13:] for r in apf.results] == ["E06.1080p.WEB", "E07.1080p.WEB"] or len(apf.results) == 2, apf.results
+assert "2 new episode(s) of Severance" in apf.status
+# grab new: downloads each, baseline moves, list clears
+got = []
+apf.grab = lambda m, n, *a: got.append(n) or True
+apf.on_key("W"); apf.on_key("g")
+assert got == ["Severance.S02E06.1080p.WEB", "Severance.S02E07.1080p.WEB"], got
+assert apf.subs[0]["last"] == [2, 7] and apf.sub_new["severance"] == [] and "now at S02E07" in apf.status
+assert _toasts[-1][0] == "trawl — grabbing new episodes" and _saved[-1][0]["last"] == [2, 7]
+apf.on_key("g"); assert "no new episodes" in apf.status and len(got) == 2, "nothing to grab twice"
+apf.on_key("enter"); assert "no new episodes" in apf.status and apf.following
+# mark seen / auto / unfollow (needs a second x)
+apf.sub_new["severance"] = [_fr(9)]
+apf.on_key("m")
+assert apf.subs[0]["last"] == [2, 9] and not apf.sub_new["severance"] and "marked seen up to S02E09" in apf.status
+apf.on_key("a"); assert apf.subs[0]["auto"] is True and _saved[-1][0]["auto"] is True and "automatically" in apf.status
+assert any("auto" in x for x in _cols(apf))
+apf.on_key("a"); assert apf.subs[0]["auto"] is False
+apf.on_key("x"); assert apf.subs and "press x again" in apf.status
+apf.on_key("down"); apf.on_key("up"); apf.on_key("x"); assert apf.subs, "moving cancels the confirmation"
+apf.on_key("x"); assert not apf.subs and "unfollowed Severance" in apf.status and _saved[-1] == []
+assert any("Not following anything yet" in x for x in _cols(apf)) and apf.follow_sel == 0
+apf.on_key("c"); assert "not following" in apf.status
+apf.on_key("esc")
+# auto-grab: a check that finds episodes downloads them without asking
+apf = _fol_app(); apf.on_key("w"); apf.subs[0]["auto"] = True; apf.subs[0]["last"] = [2, 5]
+got.clear(); apf.grab = lambda m, n, *a: got.append(n) or True; _toasts.clear()
+apf.start_check(); _fol_wait(apf)
+assert len(got) == 2 and apf.subs[0]["last"] == [2, 7] and apf.new_count() == 0, (got, apf.subs[0])
+assert [t[0] for t in _toasts] == ["trawl — grabbing new episodes"], "auto-grab doesn't also announce 'found'"
+# ... but never past the disk-space guard
+apf = _fol_app(); apf.on_key("w"); apf.subs[0]["auto"] = True; apf.subs[0]["last"] = [2, 5]
+got.clear(); apf.grab = lambda m, n, *a: got.append(n) or True
+gs["free_space"] = lambda p: 1 << 30
+apf.start_check(); _fol_wait(apf)
+assert not got and "not enough disk space" in apf.status and apf.subs[0]["last"] == [2, 5] and apf.new_count() == 2
+gs["free_space"] = lambda p: 500 << 30
+# the palette knows about it
+apf = _fol_app(); apf.on_key("ctrl-k")
+_pl = [a[0] for a in apf.palette_items()]
+assert "Follow this show" in _pl and "Followed shows" in _pl and "Check followed shows now" not in _pl
+apf.on_key("esc"); apf.subs = [make_sub("Severance.S02E05.1080p", "TV")]; apf.on_key("ctrl-k")
+assert "Check followed shows now" in [a[0] for a in apf.palette_items()]
+for ch in "followed":
+    apf.on_key(ch)
+apf.on_key("enter"); assert apf.following, "palette opens the overlay"
+for k, v in _og.items():
+    gs[k] = v
+
 # command palette: ctrl-k anywhere, : from nav views, fuzzy find, runs the real actions
 assert parse_keys(b"\x0b") == ["ctrl-k"]
 assert fuzzy_score("dl", "Download selected") is not None and fuzzy_score("zz", "Download") is None

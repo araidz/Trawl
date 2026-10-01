@@ -51,6 +51,7 @@ def main(argv: list[str] | None = None) -> int:
 
     app = App(eng)
     threading.Thread(target=app.check_update, daemon=True).start()
+    app.start_check()  # followed shows: look for new episodes in the background
     if app.download_dir:
         eng.set_dir(app.download_dir)
     if app.speed_limit:
@@ -94,6 +95,7 @@ def main(argv: list[str] | None = None) -> int:
                 except Aria2Error:
                     pass
                 last_poll = now
+                app.start_check()  # no-op unless a followed show is due
                 dirty = True
                 app.check_clipboard()
             if app.animating(rows):

@@ -8,4 +8,5 @@ python3 tests/test_meta.py
 python3 tests/test_sources.py
 python3 tests/test_tui.py
 python3 tests/test_canary.py
+python3 tests/test_follow.py
 echo "all trawl tests passed"
