@@ -21,7 +21,7 @@ _SOURCE_ABBR = {
     "tpb-books": "TPB", "x1337-movies": "1337", "x1337-tv": "1337",
     "dodi": "DODI", "animetosho": "ATSH", "knaben": "KNB",
     "torrentgalaxy": "TGx", "nyaa-books": "NYAA", "libgen": "LGEN",
-    "annas": "ANNA",
+    "annas": "ANNA", "torrentio": "TRNT",
 }
 _PALETTES: dict[str, dict[str, str | dict[str, str]]] = {
     "violet": {

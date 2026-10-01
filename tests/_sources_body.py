@@ -386,6 +386,47 @@ try:
     assert ab[0].magnet.startswith("magnet:?xt=urn:btih:"), ab
 finally:
     _g["fetch"] = _of
+# Torrentio: stream parsing and the Cinemeta -> IMDb id -> streams URLs
+_ts = {"streams": [
+    {"name": "Torrentio\n4k HDR", "infoHash": "2849211F150E966EF7924F43AEC22727A644E10D",
+     "title": "Inception 2010 PROPER Bluray 2160p AV1 HDR10\n👤 284 💾 8.91 GB ⚙️ 1337x\n🇬🇧 / 🇮🇹"},
+    {"title": "No Stats Release", "infoHash": h40},
+    {"title": "bad hash", "infoHash": "xyz"}, {"title": "no hash"},
+    {"infoHash": "b" * 40, "behaviorHints": {"filename": "fallback.mkv"}}]}
+_tr = parse_torrentio(_ts, "Movies")
+assert [r.info_hash for r in _tr] == ["2849211f150e966ef7924f43aec22727a644e10d", h40, "b" * 40], "bad rows are skipped"
+assert (_tr[0].name, _tr[0].seeders, _tr[0].size, _tr[0].source, _tr[0].group) == (
+    "Inception 2010 PROPER Bluray 2160p AV1 HDR10", 284, 8_910_000_000, "torrentio", "Movies"), _tr[0]
+assert _tr[1].seeders == 0 and _tr[1].size == 0 and _tr[2].name == "fallback.mkv"
+assert parse_magnet(_tr[0].magnet).info_hash == _tr[0].info_hash and parse_torrentio({}, "TV") == []
+_gj, _urls = globals(), []
+_ofj = _gj["fetch_json"]
+def _fj(url, **kw):
+    _urls.append(url)
+    if "cinemeta" in url:
+        return {"metas": _fj.metas}
+    return _ts
+try:
+    _gj["fetch_json"] = _fj
+    _fj.metas = [{"id": "tt0087182", "releaseInfo": "1984"}, {"id": "tt1160419", "releaseInfo": "2021"}]
+    assert len(torrentio_releases("Dune Part Two", "2021")) == 3
+    assert _urls == ["https://v3-cinemeta.strem.io/catalog/movie/top/search=Dune%20Part%20Two.json",
+                     "https://torrentio.strem.fun/stream/movie/tt1160419.json"], _urls
+    _urls.clear(); torrentio_releases("Dune", None)
+    assert _urls[1].endswith("/movie/tt0087182.json"), "no year: the first match"
+    _urls.clear(); _sr = torrentio_releases("Severance", None, "series", 2, 5)
+    assert _urls == ["https://v3-cinemeta.strem.io/catalog/series/top/search=Severance.json",
+                     "https://torrentio.strem.fun/stream/series/tt0087182:2:5.json"], _urls
+    assert {r.group for r in _sr} == {"TV"}
+    for bad in ([], [{"id": "kitsu:12"}]):
+        _fj.metas = bad
+        try:
+            torrentio_releases("Nope"); raise AssertionError("accepted")
+        except SourceError as e:
+            assert 'no IMDb match for "Nope"' in str(e)
+finally:
+    _gj["fetch_json"] = _ofj
+
 # honest errors: Cloudflare interstitials, readable network failures, per-source timing
 _cf = cloudflare_challenge
 assert _cf(403, {"cf-mitigated": "challenge"}, "anything")

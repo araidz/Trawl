@@ -1106,7 +1106,7 @@ for glyph in CAT_GLYPH.values():
 assert f"  {len(app2.results)} " in rl, "rail 'all' count missing"
 # help: scrollable, key column wide enough to avoid truncation
 app2.help, app2.help_scroll = True, 0
-hp = "\n".join(strip_ansi(x) for x in render(app2, 140, 60))  # tall enough for all groups
+hp = "\n".join(strip_ansi(x) for x in render(app2, 140, 72))  # tall enough for all groups (help scrolls, so it keeps growing)
 assert "enter / space" in hp and "on a feed row" in hp, "help keys truncated"
 assert "Downloads" in hp and "ctrl-c" in hp, "help last groups not visible at tall size"
 app2.on_key("down"); app2.on_key("down"); app2.on_key("down")
@@ -1432,6 +1432,60 @@ assert apd.folder_prompt and any("Download to folder" in x for x in _cols(apd)),
 class _AddEng:
     def add(self, uri, opts=None): pass
 assert App(eng=None).grab("m", "n") is False and App(eng=_AddEng()).grab("m", "n") is True, "grab reports success"
+
+assert fmt_bytes(1070_000_000) == "1020.4 MB" and len(fmt_bytes(1070_000_000)) <= 9, "just under 1 GiB fits the column"
+assert fmt_bytes(953 * 1024 ** 2) == "953.00 MB" and fmt_bytes(1 << 30) == "1.00 GB", "other sizes keep two decimals"
+# Torrentio: t in details swaps the list for every known release of the title
+_trc = []
+def _fake_tr(title, year, kind, sn, en):
+    _trc.append((title, year, kind, sn, en))
+    if title == "Nothing":
+        return []
+    if title == "Boom":
+        raise SourceError("blocked by Cloudflare's browser check")
+    return [Result(f"{i:040x}", f"{title}.{i}.1080p.WEB-DL", (i + 1) << 30, 50 - i, 0, "torrentio", "m", group="Movies")
+            for i in range(4)]
+_otr = gs["torrentio_releases"]; gs["torrentio_releases"] = _fake_tr
+def _tr_app(name, source):
+    a = App(eng=None); a.view, a.search, a.query = "search", Replay((), []), "x"
+    a.results = [Result("a" * 40, name, 10 ** 9, 5, 1, source, "m")]
+    a.on_key("enter"); assert a.detail is not None
+    return a
+def _tr_wait(a):
+    for _ in range(200):
+        a.drain_search()
+        if not a._other_busy:
+            return
+        time.sleep(0.01)
+    raise AssertionError("Torrentio thread never answered")
+apt = _tr_app("Dune.Part.Two.2024.1080p.WEB-DL", "yts")
+apt.on_key("t")
+assert apt._other_busy and 'asking Torrentio about "Dune Part Two"' in apt.status
+apt.on_key("t"); assert apt.status == "still asking Torrentio…"
+_tr_wait(apt)
+assert _trc == [("Dune Part Two", "2024", "movie", None, None)], _trc
+assert apt.detail is None and apt.query == "Dune Part Two" and not apt._other_busy
+assert len(apt.results) == 4 and {r.source for r in apt.results} == {"torrentio"}, apt.results
+assert apt.status == '4 releases of "Dune Part Two" from Torrentio' and apt.search_done == apt.search_total == 1
+scr = _cols(apt)
+assert any("TRNT" in x for x in scr) and any("4 results" in x for x in scr) and all(dwidth(x) <= 120 for x in scr)
+assert apt._cache_key is None and not apt.marked and not apt.filter_buf
+apt.on_key("f"); apt.on_key("w"); apt.on_key("enter")
+assert len(apt.visible_results()) == 4, "the live filter works on the releases list"
+apt = _tr_app("Severance.S02E05.1080p.WEB.H264-GRP", "eztv"); apt.on_key("t"); _tr_wait(apt)
+assert _trc[-1] == ("Severance", None, "series", 2, 5), _trc[-1]
+n_before = len(_trc)
+for name, src, msg in (("Severance.S02.COMPLETE.1080p", "eztv", "per episode"),
+                       ("[Grp] Frieren - 12 [1080p].mkv", "nyaa", "no release lookup for anime"),
+                       ("Cyberpunk 2077 [FitGirl Repack]", "fitgirl", "no release lookup for games")):
+    apt = _tr_app(name, src); apt.on_key("t")
+    assert msg in apt.status and not apt._other_busy and len(_trc) == n_before, (name, apt.status)
+apt = _tr_app("Boom.2020.1080p", "yts"); apt.on_key("t"); _tr_wait(apt)
+assert apt.status == "Torrentio: blocked by Cloudflare's browser check" and apt.detail is not None, apt.status
+apt = _tr_app("Nothing.2020.1080p", "yts"); apt.on_key("t"); _tr_wait(apt)
+assert apt.status == 'Torrentio knows no releases of "Nothing"' and apt.detail is not None
+apt.on_key("t"); assert apt._other_busy, "a failed lookup can be retried"; _tr_wait(apt)
+gs["torrentio_releases"] = _otr
 
 # command palette: ctrl-k anywhere, : from nav views, fuzzy find, runs the real actions
 assert parse_keys(b"\x0b") == ["ctrl-k"]

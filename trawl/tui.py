@@ -31,11 +31,11 @@ from functools import cache, lru_cache
 
 from . import __version__, theme as T
 from .aria2 import STATE_DIR, Aria2Error, Download, control_infohash, torrent_files
-from .sources import (SOURCES, LocalQuery, Replay, Result, ResultVariant, Search, SourceError, SourceUpdate, TorznabFeed,
-                      build_magnet, dedupe, fetch_json, make_torznab_source, matches_query,
+from .sources import (SOURCES, LocalQuery, Source, Replay, Result, ResultVariant, Search, SourceError, SourceUpdate, TorznabFeed,
+                      build_magnet, dedupe, fetch_json, make_torznab_source, matches_query, torrentio_releases,
                       parse_magnet, parse_query, parse_release, parse_source, redact, redact_url,
                       result_identity, torznab_label, validate_torznab_url)
-from .meta import Meta, kind_for, lookup
+from .meta import Meta, clean_title, kind_for, lookup
 
 CATS = [("all", "All"), ("games", "Games"), ("movies", "Movies"),
         ("tv", "TV"), ("anime", "Anime"), ("books", "Books")]
@@ -191,6 +191,8 @@ def fmt_bytes(n: float | None) -> str:
     while n >= 1024 and i < len(units) - 1:
         n /= 1024
         i += 1
+    if i and n >= 1000:  # 1000-1023.99 would print 10 chars; the size column is 9 wide
+        return f"{n:.1f} {units[i]}"
     return f"{n:.0f} {units[i]}" if i == 0 else f"{n:.2f} {units[i]}"
 
 
@@ -657,6 +659,8 @@ class App:
         self._cache: dict[tuple, tuple[float, tuple]] = {}  # (query, source ids) -> (when, updates)
         self._cache_key: tuple | None = None
         self._log: list = []  # this search's SourceUpdates, kept to fill the cache
+        self._other: tuple | None = None  # (title, results, error) handed back by the Torrentio thread
+        self._other_busy = False
         self.last_update: dict[str, SourceUpdate] = {}  # newest answer per source, for the health view
         self.fail_streak: dict[str, int] = {}  # source id -> consecutive failed searches
         self.folder_buf = ""
@@ -716,6 +720,7 @@ class App:
                 pass
         self.sources = [*SOURCES, *configured]
         self.source_by_id = {s.id: s for s in self.sources}
+        self.source_by_id["torrentio"] = Source("torrentio", "Torrentio", "Other", lambda q: [], browse=False)
         for source in self.sources:
             self.source_secrets[source.id] = tuple(dict.fromkeys(
                 (*self.source_secrets.get(source.id, ()), *source.secrets)))
@@ -740,7 +745,7 @@ class App:
         return result.group or (src.group if src else None)
 
     def source_tag(self, source_id: str) -> tuple[str, str]:
-        if source_id in {s.id for s in SOURCES}:
+        if source_id in {s.id for s in SOURCES} or source_id == "torrentio":
             return T.source_style(source_id)
         return dtrunc(self.source_label(source_id), 5), T.ALT
 
@@ -1461,6 +1466,8 @@ class App:
     def drain_search(self) -> bool:
         """Drain finished source updates into the result list. True if the
         search state changed (caller may then skip a redundant render)."""
+        if self._other:
+            self._take_releases()
         if not self.search:
             return False
         changed = False
@@ -1592,6 +1599,48 @@ class App:
             n = len(self.visible_results())
             self.sel = max(0, min(self.sel + d, n - 1)) if n else 0
 
+    def start_releases(self) -> None:
+        """Details `t`: every known release of this title (Cinemeta -> IMDb id -> Torrentio)."""
+        r = self.detail
+        if self._other_busy:
+            self.status = "still asking Torrentio…"
+            return
+        group = self.result_group(r) if r else None
+        title, year = clean_title(r.name) if r else ("", None)
+        ep = re.search(r"\bS(\d{1,2})[ ._-]?E(\d{1,3})\b", r.name, re.I) if r else None
+        if group in ("Games", "Books", "Anime") or not title:
+            self.status = f"no release lookup for {(group or 'this').lower()} results"
+        elif (group == "TV" or ep) and not ep:
+            self.status = "Torrentio lists releases per episode — open an SxxEyy result"
+        else:
+            kind, sn, en = ("series", int(ep.group(1)), int(ep.group(2))) if ep else ("movie", None, None)
+            self._other_busy = True
+            self.status = f'asking Torrentio about "{clean(title)}"…'
+            threading.Thread(target=self._fetch_releases, args=(title, year, kind, sn, en), daemon=True).start()
+
+    def _fetch_releases(self, title: str, year: str | None, kind: str, sn: int | None, en: int | None) -> None:
+        try:
+            self._other = (title, torrentio_releases(title, year, kind, sn, en), "")
+        except SourceError as e:
+            self._other = (title, [], str(e))
+        except Exception as e:  # a thread must never die silently
+            self._other = (title, [], str(e) or type(e).__name__)
+
+    def _take_releases(self) -> None:
+        title, rs, err = self._other
+        self._other, self._other_busy = None, False
+        if err or not rs:
+            self.status = f"Torrentio: {err}" if err else f'Torrentio knows no releases of "{clean(title)}"'
+            return
+        self.detail, self.variant_idx = None, 0
+        self.local_query, self.query = LocalQuery(""), title
+        self.search, self.search_total = Replay((SourceUpdate("torrentio", rs),), []), 1
+        self.results, self.errors, self.search_done, self.sel = [], {}, 0, 0
+        self.marked.clear()
+        self._set_filter("")
+        self._cache_key, self._log, self.last_update = None, [], {}
+        self.status = f'{len(rs)} releases of "{clean(title)}" from Torrentio'
+
     def resume_partial(self) -> None:
         n = self.scan_resume()
         self.status = (f"resumed {n} download{'' if n == 1 else 's'}" if n
@@ -1606,7 +1655,9 @@ class App:
         out: list[tuple[str, str, Callable[[], object]]] = []
         if self.detail is not None:
             out += [("Download", "d", keys("d")), ("Download to a folder", "D", keys("D")),
-                    ("Look inside the torrent", "f", keys("f")), ("Save the .torrent file", "e", keys("e")),
+                    ("Look inside the torrent", "f", keys("f")),
+                    ("All releases of this title (Torrentio)", "t", keys("t")),
+                    ("Save the .torrent file", "e", keys("e")),
                     ("Open the page in a browser", "o", keys("o")), ("Copy the magnet", "y", keys("y")),
                     ("Back to results", "esc", keys("esc"))]
         elif self.view == "search" and self.search is not None:
@@ -1763,6 +1814,8 @@ class App:
                 self.export_torrent(self._variant().uri, self.detail.name)
             elif k == "f":
                 self.start_peek(self._variant().uri, self.detail.name)
+            elif k == "t":
+                self.start_releases()
             elif k == "o":
                 page = self._variant().page
                 self.status = ("opened in browser" if page and open_url(page)
@@ -2546,7 +2599,8 @@ def _help_panel(app: App, width: int, height: int) -> list[str]:
                      ("← →", "filter category"), ("v", "grab magnet/link from clipboard")]),
         ("Details", [("← →", "cycle duplicate source variants"),
                      ("d / D / e", "download / to folder / save .torrent"),
-                     ("f", "look inside; tick files, enter downloads just those")]),
+                     ("f", "look inside; tick files, enter downloads just those"),
+                     ("t", "every known release of this title (asks Torrentio)")]),
         ("Settings", [("enter / space", "edit or toggle the selected row"),
                        ("a", "add Torznab feed"),
                        ("on a feed row", "e endpoint · K separate key · x remove"),
@@ -2611,6 +2665,7 @@ def _footer(app: App, width: int) -> str:
                  ("enter", "download ticked" if app.peek_target else "apply"), ("esc", "cancel")]
     elif app.detail is not None:
         hints = [("←→", "variant"), ("d", "download"), ("D", "folder"), ("e", ".torrent"), ("f", "files"),
+                 ("t", "releases"),
                  ("o", "page"), ("y", "copy"), ("p", "poster"), ("esc/q", "back")]
     elif app.show_errors:
         hints = [("esc/E", "close"), ("r", "retry failed"), ("R", "search again"), ("q", "quit")]

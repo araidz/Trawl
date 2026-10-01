@@ -81,6 +81,10 @@ Trawl is a from-scratch Python TUI inspired by
 - **Instant repeat searches** — a search where every source answered is kept for
   ten minutes; searching it again (or coming back to it) replays from memory. A
   search with a failed source is never cached, and `R` always re-runs.
+- **Every release of a title** — `t` in a movie or episode's details asks
+  Cinemeta for its IMDb id and Torrentio for every torrent it knows (often 50–100,
+  across ~20 trackers), and swaps the list for them: sort, filter, mark and batch
+  grab as usual. Only runs when you press it; movies and single episodes (`SxxEyy`).
 - **Command palette** — `Ctrl-K` anywhere (or `:` from the results and downloads
   views) opens a searchable list of every action that makes sense right now:
   type a few letters (`fold`, `sort`, `theme nord`), `↑↓`, `Enter`. It replays the
@@ -251,8 +255,9 @@ other local credential store.
 
 Your files stay on your disk; nothing routes through a central server. Trawl
 talks to the sources you search, the torrent network via aria2, and GitHub: a
-weekly tracker-list refresh and, at most once a day, the public releases API to
-tell you when a newer Trawl exists. The update check sends nothing but the
+weekly tracker-list refresh, at most once a day the public releases API to
+tell you when a newer Trawl exists, and, only when you press `t`, Cinemeta and
+Torrentio (the title you asked about is sent to them). The update check sends nothing but the
 request itself and can be switched off in settings (`g`, "Update check").
 
 ## Credits

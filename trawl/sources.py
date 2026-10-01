@@ -1358,6 +1358,44 @@ def dedupe(results: list[Result]) -> list[Result]:
     return merged
 
 
+# -- Torrentio ---------------------------------------------------------------
+# Every known release of one title, on demand (details `t`): Cinemeta turns a name into an
+# IMDb id, Torrentio (the Stremio addon) lists the torrents it knows for that id.
+CINEMETA = "https://v3-cinemeta.strem.io/catalog"
+TORRENTIO = "https://torrentio.strem.fun/stream"
+
+
+def parse_torrentio(data: dict, group: str) -> list[Result]:
+    """Torrentio streams -> Results. Its `title` is 'release name\\n👤 seeders 💾 size ⚙️ tracker'."""
+    out = []
+    for st in data.get("streams") or []:
+        ih = str(st.get("infoHash") or "").lower()
+        if not re.fullmatch(r"[0-9a-f]{40}", ih):
+            continue
+        lines = str(st.get("title") or "").split("\n")
+        name = lines[0].strip() or str((st.get("behaviorHints") or {}).get("filename") or ih)
+        meta = lines[1] if len(lines) > 1 else ""
+        seeds = re.search(r"👤\s*(\d+)", meta)
+        size = re.search(r"💾\s*([\d.]+\s*[KMGT]?i?B)", meta, re.I)
+        out.append(Result(ih, name, parse_size(size.group(1)) if size else 0,
+                          int(seeds.group(1)) if seeds else 0, 0, "torrentio",
+                          build_magnet(ih, name), group=group))
+    return out
+
+
+def torrentio_releases(title: str, year: str | None = None, kind: str = "movie",
+                       season: int | None = None, episode: int | None = None) -> list[Result]:
+    metas = fetch_json(f"{CINEMETA}/{kind}/top/search={urllib.parse.quote(title)}.json",
+                       timeout=15).get("metas") or []
+    pick = next((m for m in metas if year and str(m.get("releaseInfo") or "").startswith(year)),
+                metas[0] if metas else None)
+    if not pick or not str(pick.get("id", "")).startswith("tt"):
+        raise SourceError(f'no IMDb match for "{title}"')
+    vid = pick["id"] + (f":{season}:{episode}" if kind == "series" else "")
+    return parse_torrentio(fetch_json(f"{TORRENTIO}/{kind}/{vid}.json", timeout=20),
+                           "TV" if kind == "series" else "Movies")
+
+
 # -- local query language ----------------------------------------------------
 
 _QUERY_FIELDS = {"seeders", "size", "source", "group", "age", "files", "res", "codec"}
