@@ -1,0 +1,48 @@
+name: scraper canary
+
+# Weekly: search every source with a known query. A broken scraper opens (or updates) one
+# issue; when everything is healthy again the issue is closed. Run it by hand from the
+# Actions tab with "Run workflow".
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  canary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Search every source
+        id: canary
+        continue-on-error: true
+        run: python3 scripts/canary.py
+      - name: Open or update the tracking issue
+        if: steps.canary.outcome == 'failure'
+        run: |
+          gh label create scraper-canary --color B60205 --description "A source scraper looks broken" --force
+          body="$(cat canary.md)"$'\n\n'"Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          n="$(gh issue list --label scraper-canary --state open --json number --jq '.[0].number // empty')"
+          if [ -n "$n" ]; then
+            gh issue comment "$n" --body "$body"
+          else
+            gh issue create --label scraper-canary --title "Scraper canary: sources look broken" --body "$body"
+          fi
+      - name: Close the tracking issue once healthy
+        if: steps.canary.outcome == 'success'
+        run: |
+          n="$(gh issue list --label scraper-canary --state open --json number --jq '.[0].number // empty')"
+          [ -z "$n" ] || gh issue close "$n" --comment "All sources answered again. $(head -1 canary.md)"
+      - name: Fail the run if sources are broken
+        if: steps.canary.outcome == 'failure'
+        run: exit 1

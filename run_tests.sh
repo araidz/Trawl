@@ -7,4 +7,5 @@ python3 tests/test_aria2.py
 python3 tests/test_meta.py
 python3 tests/test_sources.py
 python3 tests/test_tui.py
+python3 tests/test_canary.py
 echo "all trawl tests passed"

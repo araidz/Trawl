@@ -251,6 +251,16 @@ Torznab endpoint keys are masked in the UI and errors, as are metadata keys.
 They are stored as plaintext in `config.json`, so protect that file like any
 other local credential store.
 
+## Keeping sources alive
+
+Scrapers rot when a site changes its markup. A weekly GitHub Action
+(`.github/workflows/canary.yml`, run by hand any time from the Actions tab)
+searches every built-in source with a query that should always have hits and
+opens one tracking issue when a source looks broken, closing it again once
+everything answers. Sites that merely refuse the CI runner (Cloudflare, 403,
+DNS) are listed but never counted as broken. Run it locally with
+`python3 scripts/canary.py`.
+
 ## Privacy
 
 Your files stay on your disk; nothing routes through a central server. Trawl
