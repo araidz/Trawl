@@ -9,6 +9,8 @@ Run:  python3 tests/test_sources.py   (from the repo root, or via run_tests.sh)
 import pathlib
 import sys
 
+import _hermetic  # noqa: F401  (HOME -> temp dir before trawl loads)
+
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 import trawl.sources as _mod

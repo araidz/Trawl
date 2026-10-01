@@ -9,6 +9,8 @@ import sys
 import tempfile
 import time
 
+import _hermetic  # noqa: F401  (HOME -> temp dir before trawl loads)
+
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 import trawl.follow as F
 from trawl.sources import Result, Source, SourceError

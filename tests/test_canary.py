@@ -8,6 +8,8 @@ import pathlib
 import sys
 
 root = pathlib.Path(__file__).resolve().parent.parent
+import _hermetic  # noqa: F401  (HOME -> temp dir before trawl loads)
+
 sys.path.insert(0, str(root))
 spec = importlib.util.spec_from_file_location("canary", root / "scripts" / "canary.py")
 canary = importlib.util.module_from_spec(spec)
