@@ -81,6 +81,12 @@ Trawl is a from-scratch Python TUI inspired by
 - **Instant repeat searches** — a search where every source answered is kept for
   ten minutes; searching it again (or coming back to it) replays from memory. A
   search with a failed source is never cached, and `R` always re-runs.
+- **Honest errors** — a Cloudflare browser check is called what it is instead of
+  "HTTP 403", DNS failures, resets, TLS and timeouts read as plain sentences, and
+  `E` lists every source with its response time, slowest first. A source that fails
+  three searches in a row is paused for the session so searches stay fast (`R`
+  gives it another chance); a search where *everything* failed counts as being
+  offline and pauses nothing.
 - **Themes and colour safety** — seven palettes (violet, light, Catppuccin, Nord,
   Gruvbox, Dracula, Tokyo Night), cycled from settings (`g`, "Theme"). Trawl
   detects the terminal: truecolor where it's advertised (`COLORTERM`, iTerm2,
@@ -161,7 +167,7 @@ You can also start straight into a search: `trawl oppenheimer`.
 | `R` | search again from scratch, skipping the cache |
 | `S` | cycle sort (seeders / size / newest) |
 | `r` | retry failed sources, preserving successful results |
-| `E` | show which sources failed and why |
+| `E` | source health: how fast each source answered, which failed and why, which are paused |
 | `← →` filter category · `c` | clear results |
 | `s` | resume partial downloads found on disk (torrents and direct links) |
 | `g` settings · `?` keys · `q` | quit |

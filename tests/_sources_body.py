@@ -386,6 +386,75 @@ try:
     assert ab[0].magnet.startswith("magnet:?xt=urn:btih:"), ab
 finally:
     _g["fetch"] = _of
+# honest errors: Cloudflare interstitials, readable network failures, per-source timing
+_cf = cloudflare_challenge
+assert _cf(403, {"cf-mitigated": "challenge"}, "anything")
+assert _cf(503, {}, "<title>Just a moment...</title><script>window._cf_chl_opt={}</script>")
+assert _cf(403, {}, '<script src="/cdn-cgi/challenge-platform/h/b/orchestrate"></script>')
+assert not _cf(403, {}, "<h1>Forbidden</h1>") and not _cf(404, {}, "_cf_chl_ everywhere")
+assert _cf(200, {}, "<title>Just a moment...</title>_cf_chl_opt"), "small 200 challenge page"
+assert not _cf(200, {}, "A torrent called Just a moment... 1080p"), "no markers: real content"
+assert not _cf(200, {}, "x" * 200_000 + "_cf_chl_ Just a moment"), "huge pages are never scanned"
+import ssl as _ssl
+assert "DNS lookup failed" in _why(socket.gaierror(8, "nodename nor servname"))
+assert "refused or reset" in _why(ConnectionResetError()) and "refused or reset" in _why(ConnectionRefusedError())
+assert _why(urllib.error.URLError(socket.gaierror(8, "x"))).startswith("DNS lookup failed"), "URLError is unwrapped"
+assert _why(TimeoutError("timed out")) == "timed out" and _why(OSError("The read operation timed out")) == "timed out"
+assert "TLS error" in _why(_ssl.SSLError(1, "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed"))
+assert _why(OSError("odd")) == "odd"
+import http.server as _hs
+_hits = []
+class _CfH(_hs.BaseHTTPRequestHandler):
+    def do_GET(self):
+        _hits.append(self.path)
+        code, hdr, body = {
+            "/hdr": (403, {"cf-mitigated": "challenge"}, b"blocked"),
+            "/503": (503, {}, b"<title>Just a moment...</title>_cf_chl_opt"),
+            "/200": (200, {}, b"<title>Just a moment...</title>_cf_chl_opt"),
+            "/403": (403, {}, b"<h1>Forbidden</h1>"),
+            "/ok": (200, {}, b"real page"),
+        }[self.path]
+        self.send_response(code)
+        for k, v in hdr.items():
+            self.send_header(k, v)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *a): pass
+_srv = _hs.ThreadingHTTPServer(("127.0.0.1", 0), _CfH)
+threading.Thread(target=_srv.serve_forever, daemon=True).start()
+_base = f"http://127.0.0.1:{_srv.server_address[1]}"
+try:
+    for path in ("/hdr", "/503", "/200"):
+        _hits.clear()
+        try:
+            fetch(_base + path, retries=2)
+            raise AssertionError(f"{path}: challenge accepted as content")
+        except SourceError as e:
+            assert str(e) == CLOUDFLARE_MSG, (path, e)
+        assert len(_hits) == 1, f"{path}: a challenge must not be retried ({len(_hits)} requests)"
+    _hits.clear()
+    try:
+        fetch(_base + "/403", retries=2); raise AssertionError("403 accepted")
+    except SourceError as e:
+        assert str(e) == "HTTP 403", e
+    assert fetch(_base + "/ok") == "real page"
+finally:
+    _srv.shutdown()
+    _srv.server_close()
+try:
+    fetch(_base + "/ok", retries=0, timeout=2)
+    raise AssertionError("server is down; fetch should fail")
+except SourceError as e:
+    assert "refused or reset" in str(e), e
+_slow = Search("", [Source("slow", "Slow", "Other", lambda q: (time.sleep(0.15), [])[1]),
+                    Source("boom", "Boom", "Other", lambda q: (_ for _ in ()).throw(SourceError("x")))])
+_got = {}
+while len(_got) < 2:
+    u = _slow.updates.get(timeout=3); _got[u.source] = u
+assert _got["slow"].elapsed >= 0.14 and _got["boom"].elapsed < 0.14, {k: v.elapsed for k, v in _got.items()}
+assert SourceUpdate("a", []).elapsed == 0.0, "elapsed is optional"
+
 # release parser + res:/codec: operators
 _pr = parse_release
 assert _pr("Dune.Part.Two.2024.2160p.WEB-DL.DDP5.1.Atmos.DV.HDR.H.265-GRP") == \

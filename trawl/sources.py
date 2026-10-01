@@ -17,6 +17,8 @@ import os
 import queue
 import re
 import shlex
+import socket
+import ssl
 import sys
 import threading
 import time
@@ -157,9 +159,38 @@ class SourceUpdate:
     source: str
     results: list[Result] | None  # None => failed
     error: str = ""
+    elapsed: float = 0.0  # seconds the source took to answer (or fail)
 
 
 # -- HTTP --------------------------------------------------------------------
+
+
+CLOUDFLARE_MSG = "blocked by Cloudflare's browser check — try again later or open the site in a browser"
+_CF_MARKERS = ("_cf_chl_", "cf-browser-verification", "challenge-platform")
+
+
+def cloudflare_challenge(status: int, headers, body: str) -> bool:
+    """True for a Cloudflare interstitial rather than real content: the cf-mitigated header,
+    or challenge markup on the 403/503 it answers with (or a small 200 page carrying it)."""
+    if str(headers.get("cf-mitigated", "")).lower() == "challenge":
+        return True
+    if status not in (200, 403, 503) or len(body) > 100_000:
+        return False
+    return any(m in body for m in _CF_MARKERS) and (status != 200 or "Just a moment" in body)
+
+
+def _why(e: BaseException) -> str:
+    """A network failure in words a person can act on."""
+    r = getattr(e, "reason", e)
+    if isinstance(r, socket.gaierror):
+        return "DNS lookup failed — site blocked or you're offline"
+    if isinstance(r, (ConnectionResetError, ConnectionRefusedError)):
+        return "connection refused or reset — site down or blocked"
+    if isinstance(r, ssl.SSLError):
+        return f"TLS error ({getattr(r, 'reason', None) or 'handshake failed'}) — site or network interfering"
+    if isinstance(r, TimeoutError) or "timed out" in str(r):
+        return "timed out"
+    return str(r)
 
 
 def fetch(url: str, retries: int = 1, timeout: float = 15.0,
@@ -173,9 +204,19 @@ def fetch(url: str, retries: int = 1, timeout: float = 15.0,
             with urllib.request.urlopen(
                 urllib.request.Request(url, headers=h, data=data), timeout=timeout
             ) as resp:
-                return resp.read().decode("utf-8", "replace")
+                body = resp.read().decode("utf-8", "replace")
+                if cloudflare_challenge(resp.status, resp.headers, body):
+                    raise SourceError(CLOUDFLARE_MSG)
+                return body
         except urllib.error.HTTPError as e:
             last = f"HTTP {e.code}"
+            if e.code in (403, 503):  # Cloudflare's interstitial: retrying can't pass it
+                try:
+                    page = e.read(65536).decode("utf-8", "replace")
+                except OSError:
+                    page = ""
+                if cloudflare_challenge(e.code, e.headers, page):
+                    raise SourceError(CLOUDFLARE_MSG) from e
             if e.code in RETRY_STATUS and attempt < retries:
                 time.sleep(0.5 * 2 ** attempt)
                 continue
@@ -183,7 +224,7 @@ def fetch(url: str, retries: int = 1, timeout: float = 15.0,
         except http.client.InvalidURL:
             raise SourceError("invalid URL") from None
         except (urllib.error.URLError, OSError) as e:
-            last = str(getattr(e, "reason", e))
+            last = _why(e)
             if attempt < retries:
                 time.sleep(0.5 * 2 ** attempt)
                 continue
@@ -1496,12 +1537,14 @@ class Search:
         return tuple(scheduled)
 
     def _run(self, s: Source) -> None:
+        t0 = time.monotonic()
         try:
             results = [r for r in s.fn(self.query.remote)
                        if matches_query(r, self.query, self.sources)]
             update = SourceUpdate(s.id, results)
         except Exception as e:  # one source's failure never sinks the search
             update = SourceUpdate(s.id, None, redact(str(e) or type(e).__name__, s.secrets)[:300])
+        update.elapsed = time.monotonic() - t0
         with self._lock:
             self.in_flight.discard(s.id)
             self.updates.put(update)

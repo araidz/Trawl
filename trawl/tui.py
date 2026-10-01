@@ -31,7 +31,7 @@ from functools import cache, lru_cache
 
 from . import __version__, theme as T
 from .aria2 import STATE_DIR, Aria2Error, Download, control_infohash, torrent_files
-from .sources import (SOURCES, LocalQuery, Replay, Result, ResultVariant, Search, SourceError, TorznabFeed,
+from .sources import (SOURCES, LocalQuery, Replay, Result, ResultVariant, Search, SourceError, SourceUpdate, TorznabFeed,
                       build_magnet, dedupe, fetch_json, make_torznab_source, matches_query,
                       parse_magnet, parse_query, parse_release, parse_source, redact, redact_url,
                       result_identity, torznab_label, validate_torznab_url)
@@ -316,6 +316,7 @@ SPACE_MARGIN = 1 << 30  # keep 1 GiB free beyond the torrent itself
 PEEK_TIMEOUT = 45  # seconds to wait for a magnet's file list before giving up
 CACHE_TTL = 600  # a finished search is replayed from memory for 10 minutes
 CACHE_MAX = 20
+QUARANTINE_AFTER = 3  # searches in a row a source may fail before it's paused for the session
 
 
 def free_space(path: str) -> int | None:
@@ -637,6 +638,8 @@ class App:
         self._cache: dict[tuple, tuple[float, tuple]] = {}  # (query, source ids) -> (when, updates)
         self._cache_key: tuple | None = None
         self._log: list = []  # this search's SourceUpdates, kept to fill the cache
+        self.last_update: dict[str, SourceUpdate] = {}  # newest answer per source, for the health view
+        self.fail_streak: dict[str, int] = {}  # source id -> consecutive failed searches
         self.folder_buf = ""
         self.last_dir: str | None = None  # last Shift+D destination, reused as prompt default
         self._exports: dict[str, tuple[str, str, str, float]] = {}  # gid -> (ih, name, dir, started)
@@ -785,8 +788,13 @@ class App:
         return any(self.downloads[idx].status in ("active", "metadata")
                    for idx, _ in _visible_download_rows(self, rows))
 
+    def paused_sources(self) -> set[str]:
+        """Sources skipped after failing QUARANTINE_AFTER searches in a row (R lifts it)."""
+        return {sid for sid, n in self.fail_streak.items() if n >= QUARANTINE_AFTER}
+
     def enabled_sources(self) -> list:
-        return [s for s in self.sources if s.id not in self.disabled_sources]
+        paused = self.paused_sources()
+        return [s for s in self.sources if s.id not in self.disabled_sources and s.id not in paused]
 
     @property
     def tick(self) -> float:
@@ -808,6 +816,7 @@ class App:
             srcs = [s for s in srcs if s.browse]
         self._cache_key = (q, tuple(sorted(s.id for s in srcs)))
         self._log = []
+        self.last_update = {}
         hit = None if fresh else self._cache.get(self._cache_key)
         age = time.monotonic() - hit[0] if hit else CACHE_TTL
         cached = age < CACHE_TTL
@@ -826,11 +835,19 @@ class App:
         elif self.local_query.malformed:
             self.status = f"searching; ignored {len(self.local_query.malformed)} malformed filter(s)"
 
-    def _store_cache(self) -> None:
-        """Remember a search only if every source answered (never cache a failure)."""
+    def _finish_search(self) -> None:
+        """Once every source has answered: count consecutive failures (a search where
+        *everything* failed means we're offline, not that sources died) and cache the
+        search if none failed."""
         key, log = self._cache_key, self._log
         self._cache_key = None
-        if key and log and not isinstance(self.search, Replay) and all(u.results is not None for u in log):
+        if not key or not log or isinstance(self.search, Replay):
+            return
+        failed = {u.source for u in log if u.results is None}
+        if len(failed) < len(log):
+            for u in log:
+                self.fail_streak[u.source] = self.fail_streak.get(u.source, 0) + 1 if u.results is None else 0
+        if not failed:
             self._cache[key] = (time.monotonic(), tuple(log))
             while len(self._cache) > CACHE_MAX:
                 self._cache.pop(next(iter(self._cache)))
@@ -1441,6 +1458,7 @@ class App:
             self.search_done += 1
             changed = True
             self._log.append(u)
+            self.last_update[u.source] = u
             if u.results is None:
                 self.errors[u.source] = u.error
             else:
@@ -1456,7 +1474,7 @@ class App:
             self.sel = (restored if restored is not None
                         else min(self.sel, max(0, len(visible) - 1)))
             if self.search_done >= self.search_total:
-                self._store_cache()
+                self._finish_search()
         return changed
 
     def retry_failed_sources(self) -> None:
@@ -1760,14 +1778,15 @@ class App:
             elif k in ("/", "i"):
                 self.editing = True
             elif k == "E":
-                if self.errors:
+                if self.last_update or self.errors or self.paused_sources():
                     self.show_errors = not self.show_errors
                 else:
-                    self.status = "all sources answered — nothing to show"
+                    self.status = "no search yet — nothing to show"
             elif k == "f":
                 if self.search is not None:
                     self.filtering = True
             elif k == "R":
+                self.fail_streak.clear()  # a fresh search also gives paused sources another chance
                 self.submit(fresh=True)
             elif k == "esc":
                 if self.show_errors:
@@ -2074,17 +2093,29 @@ def _search_line(app: App, inner_w: int) -> str:
 
 
 def _errors_panel(app: App, width: int, height: int) -> list[str]:
+    """Source health: failures (with the reason), paused sources, then the rest by speed."""
     inner_w = width - 4
-    inner: list[str] = []
-    if not app.errors:
-        inner.append(cell("No failed sources — every source answered.", inner_w, dim=True))
+    ups = dict(app.last_update)
     for sid, msg in app.errors.items():
-        inner.append(cell(f" {app.source_label(sid)} —", inner_w, color=T.BAD, bold=True))
-        for ln in _wrap(clean(msg) or "unknown error", inner_w - 2):
-            inner.append("  " + cell(ln, inner_w - 2, dim=True))
-        inner.append(cell("", inner_w))
-    count = f"({len(app.errors)})" if app.errors else None
-    return _wrap_panel("Failed sources", inner, width, height, True, count)
+        ups.setdefault(sid, SourceUpdate(sid, None, msg))
+    failed = [u for u in ups.values() if u.results is None]
+    paused = sorted(app.paused_sources() - set(ups))
+    good = sorted((u for u in ups.values() if u.results is not None), key=lambda u: -u.elapsed)
+    inner = [cell("r retries failed sources · R searches again and un-pauses paused ones", inner_w, dim=True),
+             cell("", inner_w)]
+    for u in failed:
+        inner.append(cell(f" {T.ERR} {app.source_label(u.source)}  {u.elapsed:.1f}s", inner_w, color=T.BAD, bold=True))
+        for ln in _wrap(clean(u.error) or "unknown error", inner_w - 4):
+            inner.append("    " + cell(ln, inner_w - 4, dim=True))
+    for sid in paused:
+        inner.append(cell(f" {T.PAUSE} {app.source_label(sid)}  paused — failed {app.fail_streak[sid]} searches in a row",
+                          inner_w, color=T.WARN))
+    for u in good:
+        inner.append(cell(f" {T.DONE} {app.source_label(u.source)}", inner_w - 22, color=T.GOOD)
+                     + cell(f"{u.elapsed:.1f}s", 7, "right", dim=True)
+                     + cell(f"{len(u.results or [])} results", 15, "right", dim=True))
+    n = f"({len(failed)} failed · {len(paused)} paused)" if failed or paused else None
+    return _wrap_panel("Sources", inner, width, height, True, n)
 
 
 def _search_panel(app: App, width: int) -> list[str]:
@@ -2102,6 +2133,8 @@ def _status_line(app: App, results: Sequence[Result], inner_w: int) -> str:
     if app.search and app.search_done < app.search_total:
         return cell(f"searching… {app.search_done}/{app.search_total} sources", inner_w, dim=True)
     errs = len(app.errors)
+    paused = len(app.paused_sources())
+    pause_note = f"  ({paused} paused — E)" if paused else ""
     if not results:
         if app.search is None:
             return cell("Type to search. Enter runs it; paste a magnet or link to grab it.", inner_w, dim=True)
@@ -2110,8 +2143,9 @@ def _status_line(app: App, results: Sequence[Result], inner_w: int) -> str:
         if errs >= app.search_total:
             return cell("Couldn't reach any source — they may be down.", inner_w, color=T.WARN)
         q = clean(app.query)
-        return cell(f'No results for "{q}".' if q else "Nothing new right now.", inner_w, dim=True)
-    note = f"  ({errs} source{'' if errs == 1 else 's'} down)" if errs else ""
+        return cell((f'No results for "{q}".' if q else "Nothing new right now.") + pause_note,
+                    inner_w, dim=True)
+    note = (f"  ({errs} source{'' if errs == 1 else 's'} down)" if errs else "") + pause_note
     head = "popular now" if not app.query.strip() else f"{len(results)} result{'' if len(results) == 1 else 's'}"
     if app.filter_buf:
         head = f'{len(results)} of {len(app.results)} match "{clean(app.filter_buf)}"'
@@ -2405,7 +2439,7 @@ def _help_panel(app: App, width: int, height: int) -> list[str]:
                      ("o", "open page in browser"), ("y", "copy magnet"),
                      ("/  i", "edit query"), ("↑ ↓", "recall past searches"),
                      ("f  R", "filter results live · search again, skipping the cache"),
-                     ("r", "retry failed sources"), ("E", "show why sources failed"),
+                     ("r", "retry failed sources"), ("E", "source health: speed, failures, paused"),
                      ("z", "hide dead torrents"),
                      ("filters", "seeders: size: age: files: source: group: res: codec:"),
                      ("examples", 'matrix -cam size:>1GiB group:movies'),
@@ -2477,7 +2511,7 @@ def _footer(app: App, width: int) -> str:
         hints = [("←→", "variant"), ("d", "download"), ("D", "folder"), ("e", ".torrent"), ("f", "files"),
                  ("o", "page"), ("y", "copy"), ("p", "poster"), ("esc/q", "back")]
     elif app.show_errors:
-        hints = [("esc/E", "close"), ("r", "retry"), ("q", "quit")]
+        hints = [("esc/E", "close"), ("r", "retry failed"), ("R", "search again"), ("q", "quit")]
     elif app.view == "search" and app.filtering:
         hints = [("type", "filter"), ("↑↓", "move"), ("enter", "keep"), ("esc", "clear"), ("^c", "quit")]
     elif app.view == "search" and app.editing:

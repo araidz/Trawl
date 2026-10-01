@@ -867,7 +867,7 @@ try:
     err_app.on_key("E")
     assert err_app.show_errors, "E opens the errors viewer"
     ep = "\n".join(strip_ansi(x) for x in render(err_app, 100, 30))
-    assert "Failed sources" in ep and "TPB" in ep and "HTTP 403" in ep, ep
+    assert "Sources" in ep and "2 failed" in ep and "TPB" in ep and "HTTP 403" in ep, ep
     assert "blocked by Cloudflare" in ep, ep
     err_app.on_key("esc")
     assert not err_app.show_errors, "esc closes the errors viewer"
@@ -1273,13 +1273,17 @@ _made = []
 _canned = {"yts": [Result("1" * 40, "Dune.2021.2160p.WEB", 9 << 30, 90, 1, "yts", "m1"),
                    Result("2" * 40, "Dune Part Two 2024 1080p", 4 << 30, 80, 1, "yts", "m2")],
            "eztv": [Result("3" * 40, "Dune 1984 720p", 1 << 30, 70, 1, "eztv", "m3")]}
+_src_log = []
 class _FakeSearch:
     def __init__(self, q, sources):
         _made.append(q)
+        _src_log.append([s.id for s in sources])
         self.updates, self.total, self.sources = queue.Queue(), len(sources), {s.id: s for s in sources}
         for s in sources:
-            self.updates.put(SourceUpdate(s.id, None, "boom") if q == "bad" and s.id == "yts"
-                             else SourceUpdate(s.id, list(_canned.get(s.id, []))))
+            u = (SourceUpdate(s.id, None, "boom") if q == "offline" or (q == "bad" and s.id == "yts")
+                 else SourceUpdate(s.id, list(_canned.get(s.id, []))))
+            u.elapsed = 1.5 if s.id == "yts" else 0.2
+            self.updates.put(u)
     def retry(self, ids): return ()
 _orig_search, _orig_hist = gs["Search"], gs["save_history"]
 gs["Search"], gs["save_history"] = _FakeSearch, lambda h: None
@@ -1332,6 +1336,41 @@ apc.on_key("f"); apc.on_key("d"); apc.query = "dune"; apc.submit()
 assert not apc.filter_buf and not apc.filtering, "a new search drops the filter"
 apc.results = []; apc.search = None; apc.on_key("f")
 assert not apc.filtering, "no filter on the splash"
+# quarantine: 3 failed searches in a row pause a source; offline never counts; R lifts it
+apq = App(eng=None)
+for i in range(3):
+    apq.query = "offline"; apq.submit(); apq.drain_search()
+assert not apq.fail_streak and not apq.paused_sources(), "a search where everything failed says nothing about sources"
+for i in range(3):
+    apq.query = "bad"; apq.submit(); apq.drain_search()
+    assert apq.fail_streak["yts"] == i + 1 and apq.paused_sources() == (set() if i < 2 else {"yts"}), i
+assert apq.fail_streak["eztv"] == 0
+apq.query = "bad"; apq.submit()
+assert "yts" not in _src_log[-1] and "eztv" in _src_log[-1], "a paused source is skipped"
+apq.drain_search()
+assert any("1 paused" in x for x in _cols(apq)), "the results panel says a source is paused"
+apq.on_key("E")
+assert apq.show_errors
+_ep = "\n".join(_cols(apq))
+assert "paused — failed 3 searches in a row" in _ep and "R searches again" in _ep and "1 paused" in _ep, _ep
+apq.on_key("esc"); assert not apq.show_errors
+apq.on_key("R")
+assert not apq.fail_streak or apq.fail_streak.get("yts") == 1, apq.fail_streak
+assert "yts" in _src_log[-1], "R gives paused sources another chance"
+apq.drain_search()
+apq.query = "dune"; apq.submit(); apq.drain_search()
+assert apq.fail_streak["yts"] == 0, "a successful search resets the streak"
+# source health panel: slowest first, failures show reason + time
+apq.on_key("E")
+_ep = _cols(apq)
+_yi = next(i for i, x in enumerate(_ep) if "YTS" in x and "1.5s" in x and "2 results" in x)
+_ei = next(i for i, x in enumerate(_ep) if "EZTV" in x and "0.2s" in x)
+assert _yi < _ei, "slowest source first"
+apq.on_key("esc")
+apq.query = "bad"; apq.submit(); apq.drain_search(); apq.on_key("E")
+_ep = "\n".join(_cols(apq))
+assert "✗ YTS  1.5s" in _ep and "boom" in _ep and "1 failed" in _ep, _ep
+assert all(dwidth(x) <= 120 for x in _cols(apq))
 gs["Search"], gs["save_history"] = _orig_search, _orig_hist
 
 # multi-select: mark rows, batch grab, batch to a folder, guards, modal renders
