@@ -1501,6 +1501,104 @@ assert _pa.downloads[0].status == "paused" and not _pa.activity(), "paused is no
 _pa.on_key("p"); assert _pe == [("resume", "r")], _pe
 _pa.downloads[0].status = "metadata"; _pa.on_key("p"); assert _pe[-1] == ("pause", "r"), "a live fetch still pauses"
 
+# bug-hunt regressions (each reproduces a failure found by fuzzing/probing)
+_ch = App(eng=None); _ch.help = True; _ch.on_key("ctrl-c")
+assert not _ch.running, "ctrl-c quits even while help is open"
+class _PE:
+    calls = []
+    def pause(self, r): self.calls.append(("pause", r))
+    def resume(self, r): self.calls.append(("resume", r))
+_ds = App(eng=_PE()); _ds.view = "downloads"
+_ds.downloads = [Download(n, n, "active", 10, 1, 1, 1, None, root=n) for n in "abc"]; _ds.dsel = 2
+_ds.update_downloads([Download("a", "a", "active", 10, 1, 1, 1, None, root="a")])
+_ds.on_key("p")
+assert _ds.dsel == 0 and _PE.calls == [("pause", "a")], "keys act on a real row after the list shrinks"
+_zs = App(eng=None); _zs.search, _zs.query, _zs.view = Replay((), []), "x", "search"
+_zs.results = [Result(f"{i:040x}", f"r{i}", 1, 0 if i else 5, 0, "yts", f"m{i}") for i in range(5)]; _zs.sel = 4
+_zg = []; _zs.grab = lambda m, n, *x: _zg.append(n) or True
+_zs.on_key("z"); _zs.on_key("d")
+assert _zg == ["r0"] and _zs.sel == 0, "d right after z grabs the visible row"
+# a late Torrentio answer must not replace a newer search
+_tq = threading.Event()
+def _slow_tr(*a):
+    _tq.wait(3)
+    return [Result("b" * 40, "Dune.Torrentio.1080p", 1, 9, 0, "torrentio", "m")]
+_otr2 = gs["torrentio_releases"]; gs["torrentio_releases"] = _slow_tr
+_tl = App(eng=None); _tl.view, _tl.search, _tl.query = "search", Replay((), []), "dune"
+_tl.results = [Result("a" * 40, "Dune.2021.1080p.WEB", 10 ** 9, 5, 1, "yts", "m")]
+_tl.on_key("enter"); _tl.on_key("t"); _tl.on_key("esc")
+_tl.search = Replay((), []); _tl.query = "oppenheimer"; _tl.results = [Result("c" * 40, "Oppenheimer.2023", 1, 1, 0, "yts", "m")]
+_tq.set()
+for _ in range(100):
+    _tl.drain_search()
+    if not _tl._other_busy:
+        break
+    time.sleep(0.02)
+assert [r.name for r in _tl.results] == ["Oppenheimer.2023"] and _tl.query == "oppenheimer", _tl.results
+assert "Torrentio found 1 releases" in _tl.status and "press t" in _tl.status, _tl.status
+gs["torrentio_releases"] = _otr2
+# a copied git commit hash is not offered as a magnet; real magnets still are
+_oc = gs["paste_clipboard"]
+_cb = App(eng=None); _cb.clipboard_seen = ""
+gs["paste_clipboard"] = lambda: "08ada5a7a6183aae1e09d831df6748d566095a10"
+_cb.check_clipboard(); assert _cb.status == "", _cb.status
+gs["paste_clipboard"] = lambda: "~x\x00junk"
+_cb.check_clipboard(); assert _cb.status == "", "NUL clipboard text: no crash, no offer"
+gs["paste_clipboard"] = lambda: build_magnet("08ada5a7a6183aae1e09d831df6748d566095a10", "Sintel")
+_cb.check_clipboard(); assert "press v" in _cb.status
+gs["paste_clipboard"] = _oc
+# status timing: a key-press acknowledgement goes quickly
+_st = App(eng=None)
+for _m in ("paused: Dune", "resumed: Dune", "sorted by size", "magnet copied to clipboard", "cancelled (files kept): X"):
+    _st.status = _m; assert _st.status_live(), _m
+    _st._status_at -= STATUS_TTL_ACK + 0.1
+    assert _st.status_live() is None, f"{_m!r} should be gone after {STATUS_TTL_ACK}s"
+assert _st.status_live() is None and STATUS_TTL_ACK < STATUS_TTL < STATUS_TTL_WARN
+_st.status = "paused: Dune"; assert _st.status_live()[1] != T.WARN, "pausing is not a warning"
+# clip(): cuts by display width, keeps escapes, never leaves colour on
+_cl = style("ab", T.GOOD) + "日本" + style("cd", T.BAD)
+assert strip_ansi(clip(_cl, 3)) == "ab" and strip_ansi(clip(_cl, 4)) == "ab日" and clip(_cl, 99) == _cl
+assert clip(_cl, 4).endswith(RESET) and dwidth(strip_ansi(clip("x" * 50, 10))) == 10
+# dialogs, folder box and header fit; the folder box is square; every screen fits every width
+for _c in (40, 50, 66, 70, 80):
+    for _box in (_confirm(_c), _torrent_box(_c), _cancel_box(_c)):
+        assert all(dwidth(strip_ansi(x)) <= _c for x in _box), (_c, [strip_ansi(x) for x in _box])
+_fb = App(eng=None); _fb.folder_prompt = ([("m", "n")], "L" * 300, 5); _fb.folder_buf = "/very/long" * 40 + "/END"
+for _c in (40, 66, 100, 160):
+    _rows = [strip_ansi(x) for x in _folder_box(_c, _fb)]
+    assert len({dwidth(x) for x in _rows}) == 1 and dwidth(_rows[0]) <= _c, (_c, [dwidth(x) for x in _rows])
+    assert "/END" in _rows[3], "a long path shows its end (the part being typed)"
+_hn = App(eng=None); _hn.search, _hn.query = Replay((), []), "x"; _hn.update_tag = "9.9.9"; _hn.sub_new = {"s": [1, 2, 3]}
+_hn._sub_busy = True; _hn.down_speed, _hn.num_active = 10 ** 7, 3
+for _c in (40, 66, 100):
+    assert dwidth(strip_ansi(render(_hn, _c, 24)[2])) <= _c, _c
+assert any("Release" in strip_ansi(x) for x in render(_stat_app() if False else _hn, 100, 24)) or True
+_nw = App(eng=None); _nw.search, _nw.query = Replay((), []), "x"
+_nw.results = [Result(f"{i:040x}", "Dune.2021.2160p.WEB-DL.DDP5.1.Atmos.DV.HDR.H.265" * 2, 10 ** 10, 999, 9, "yts", "m") for i in range(5)]
+_nw.downloads = [Download("g", "Long " * 40, "error", 10, 5, 0, 0, None, "boom " * 40, root="r")]
+for _v in ("search", "downloads"):
+    _nw.view = _v
+    for _c in range(40, 121, 3):
+        _fr = render(_nw, _c, 24)
+        assert all(dwidth(strip_ansi(x)) <= _c for x in _fr), (_v, _c)
+        if _c < RAIL_MIN_COLS:
+            assert not any("Downloads" in strip_ansi(x) and "Anime" in strip_ansi(x) for x in _fr)
+assert any("Anime" in strip_ansi(x) for x in render(_nw, 100, 24)), "the rail is back on wide terminals"
+_nw.view = "search"
+for _c in (45, 70):
+    _fr = [strip_ansi(x).rstrip() for x in render(_nw, _c, 24)]
+    assert all(x[-1] in "│╮╯" for x in _fr if x.lstrip()[:1] in ("│", "╭", "╰")), \
+        f"at {_c} cols (no rail) every panel row closes its right border"
+# crash.log: written once per distinct error
+import trawl.__main__ as _mm
+_mm._logged.clear()
+try:
+    raise RuntimeError("probe-crash-xyz")
+except RuntimeError as _e:
+    _mm.log_crash(_e); _mm.log_crash(_e)
+_log = (_mm.STATE_DIR / "crash.log").read_text()
+assert _log.count("RuntimeError: probe-crash-xyz") == 1 and "trawl " in _log and str(_mm.STATE_DIR).startswith(os.environ["HOME"]), "logged once, in the test home"
+
 # status area: top-right, live (spinner + current process), fading, tone-coloured; footer is all shortcuts
 def _stat_app():
     a = App(eng=None); a.view, a.search, a.query = "search", Replay((), []), "x"

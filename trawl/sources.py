@@ -538,9 +538,12 @@ def _local_torrent(s: str) -> str | None:
     except ValueError:
         parts = []
     for cand in (*parts[:1], s) if len(parts) == 1 else (s,):
-        path = os.path.expanduser(cand)
-        if path.lower().endswith(".torrent") and os.path.isfile(path):
-            return path
+        try:
+            path = os.path.expanduser(cand)
+            if path.lower().endswith(".torrent") and os.path.isfile(path):
+                return path
+        except ValueError:  # a NUL byte (e.g. odd clipboard text) can't be a path
+            pass
     return None
 
 

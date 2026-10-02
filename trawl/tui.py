@@ -107,6 +107,7 @@ def save_config(cfg: dict) -> None:
         pass
 
 RAIL_W = 18  # glyph + label + count
+RAIL_MIN_COLS = 80  # narrower terminals drop the category rail so the panels fit
 MARGIN = 2
 GAP = 2
 
@@ -134,6 +135,28 @@ def style(text: str, color: str | None = None, bold: bool = False, dim: bool = F
 
 def strip_ansi(s: str) -> str:
     return _ANSI.sub("", s)
+
+
+_ANSI_SPLIT = re.compile(r"(\x1b\[[0-9;?]*[A-Za-z])")
+
+
+def clip(line: str, w: int) -> str:
+    """Cut a styled line to `w` display columns, keeping its escape codes intact. A line wider
+    than the terminal wraps and shoves every row below it down, so no frame line may exceed it."""
+    if dwidth(strip_ansi(line)) <= w:
+        return line
+    out, used = [], 0
+    for part in _ANSI_SPLIT.split(line):
+        if part.startswith("\x1b["):
+            out.append(part)
+            continue
+        for ch in part:
+            cw = _cw(ch)
+            if used + cw > w:
+                return "".join(out) + RESET
+            out.append(ch)
+            used += cw
+    return "".join(out) + RESET
 
 
 def _cw(ch: str) -> int:
@@ -335,8 +358,11 @@ PEEK_TIMEOUT = 45  # seconds to wait for a magnet's file list before giving up
 CACHE_TTL = 600  # a finished search is replayed from memory for 10 minutes
 CACHE_MAX = 20
 PALETTE_ROWS = 9  # command-palette list height
-STATUS_TTL = 10.0       # seconds a plain status message stays in the top-right corner
-STATUS_TTL_WARN = 30.0  # warnings and errors linger longer
+STATUS_TTL_ACK = 4.0    # "paused: X", "sorted by size"…: a key press acknowledged, gone quickly
+STATUS_TTL = 8.0        # other information
+STATUS_TTL_WARN = 20.0  # warnings and errors linger longer
+_ACK = ("paused", "resumed", "sorted", "hiding", "showing", "copied", "magnet copied", "opened", "revealed",
+        "cancelled", "marked", "unfollowed", "retrying")
 SUB_RETRY = 600  # seconds before an unanswered follow check is tried again
 QUARANTINE_AFTER = 3  # searches in a row a source may fail before it's paused for the session
 
@@ -673,6 +699,7 @@ class App:
         self._sub_done: list = []  # (show id, new releases, sources answered) from the check thread; None = finished
         self._other: tuple | None = None  # (title, results, error) handed back by the Torrentio thread
         self._other_busy = False
+        self._other_for = None  # the search that was showing when t was pressed
         self.last_update: dict[str, SourceUpdate] = {}  # newest answer per source, for the health view
         self.fail_streak: dict[str, int] = {}  # source id -> consecutive failed searches
         self.folder_buf = ""
@@ -718,7 +745,8 @@ class App:
     def _cur(self) -> Result | None:
         """The selected search result, or None if the list is empty/out of range."""
         rs = self.visible_results()
-        return rs[self.sel] if 0 <= self.sel < len(rs) else None
+        self.sel = max(0, min(self.sel, len(rs) - 1))  # z/filters/categories can shrink the list under sel
+        return rs[self.sel] if rs else None
 
     def _meta_kind(self, r: Result) -> str | None:
         return kind_for(self.result_group(r))
@@ -849,13 +877,15 @@ class App:
         low = msg.lower()
         if low.startswith(("error", "couldn't", "(no engine)")) or "failed" in low:
             color, ttl = T.BAD, STATUS_TTL_WARN
-        elif "press " in low or low.startswith(("not enough", "only ", "nothing", "no ", "torrentio:")) or "paused" in low:
+        elif "press " in low or low.startswith(("not enough", "only ", "nothing", "no ", "torrentio:")):
             color, ttl = T.WARN, STATUS_TTL_WARN
         elif low.startswith(("grabbing", "following", "saved", "opened", "resumed", "revealed", "unfollowed",
                              "marked", "new episodes", "downloading")) or "copied" in low:
             color, ttl = T.GOOD, STATUS_TTL
         else:
             color, ttl = T.ALT, STATUS_TTL
+        if low.startswith(_ACK):
+            ttl = STATUS_TTL_ACK
         return (msg, color) if time.monotonic() - self._status_at < ttl else None
 
     def activity(self) -> list[str]:
@@ -1215,7 +1245,8 @@ class App:
     def check_clipboard(self) -> None:
         """If a grabbable magnet/link appears on the clipboard, offer v once."""
         clip = paste_clipboard()
-        if clip and clip != self.clipboard_seen and parse_source(clip) and not self.editing:
+        bare_hash = re.fullmatch(r"\s*[0-9a-fA-F]{40}\s*", clip or "")  # a git commit hash looks the same
+        if clip and clip != self.clipboard_seen and not bare_hash and parse_source(clip) and not self.editing:
             self.clipboard_seen = clip
             self.status = "magnet or link detected in clipboard — press v to grab it"
 
@@ -1626,6 +1657,7 @@ class App:
                 continue
             kept.append(d)
         self.downloads = kept
+        self.dsel = min(self.dsel, max(0, len(kept) - 1))  # keys act on a real row after the list shrinks
         if self._peek:
             self._poll_peek()
 
@@ -1672,7 +1704,7 @@ class App:
             self.status = "Torrentio lists releases per episode — open an SxxEyy result"
         else:
             kind, sn, en = ("series", int(ep.group(1)), int(ep.group(2))) if ep else ("movie", None, None)
-            self._other_busy = True
+            self._other_busy, self._other_for = True, self.search
             self.status = f'asking Torrentio about "{clean(title)}"…'
             threading.Thread(target=self._fetch_releases, args=(title, year, kind, sn, en), daemon=True).start()
 
@@ -1689,6 +1721,9 @@ class App:
         self._other, self._other_busy = None, False
         if err or not rs:
             self.status = f"Torrentio: {err}" if err else f'Torrentio knows no releases of "{clean(title)}"'
+            return
+        if self.search is not self._other_for:  # the user ran another search meanwhile: don't replace it
+            self.status = f'Torrentio found {len(rs)} releases of "{clean(title)}" — open it again and press t'
             return
         self._show_results(title, rs)
         self.status = f'{len(rs)} releases of "{clean(title)}" from Torrentio'
@@ -1920,6 +1955,9 @@ class App:
         self.sel = 0
 
     def on_key(self, k: str) -> None:
+        if k == "ctrl-c":  # always, whatever is open
+            self.running = False
+            return
         if self.help:
             if k in ("up", "down", "j", "k", "pageup", "pagedown"):
                 if k in ("down", "j"):
@@ -2503,7 +2541,8 @@ def _following_panel(app: App, width: int, height: int) -> list[str]:
                        inner_w, color=T.ALT, bold=True)]
         for r in new[:6]:
             tag, tcolor = app.source_tag(r.source)
-            inner.append(cell(f"  {fmt_ep(episode_of(r.name))}  {clean(r.name)}", inner_w - 15, color=T.GOOD)
+            ep = episode_of(r.name)
+            inner.append(cell(f"  {fmt_ep(ep) if ep else '':6}  {clean(r.name)}", inner_w - 15, color=T.GOOD)
                          + cell(fmt_bytes(r.size), 10, "right", dim=True)
                          + cell(tag, 5, "right", color=tcolor))
     return _wrap_panel("Following", inner, width, height, True, f"({len(app.subs)})" if app.subs else None)
@@ -2992,14 +3031,21 @@ def _splash(app: App, cols: int, rows: int) -> list[str]:
     return lines
 
 def _modal_box(cols: int, label: str, hints: list[tuple[str, str]], color: str) -> list[str]:
-    plain = "  " + label + "   " + "  ·  ".join(f"{k} {v}" for k, v in hints) + "  "
+    # narrow terminals: shorten the label, then the hints ("the .torrent" -> "the"), then keys only
+    for hs in (hints, [(k, v.split()[0]) for k, v in hints], [(k, "") for k, _ in hints]):
+        hint_w = dwidth("  ·  ".join(f"{k} {v}".strip() for k, v in hs))
+        if hint_w + 7 + 6 + 4 <= cols or not hs[0][1]:
+            break
+    hints = hs
+    label = dtrunc(label, max(6, cols - 4 - 7 - hint_w))
+    plain = "  " + label + "   " + "  ·  ".join(f"{k} {v}".strip() for k, v in hints) + "  "
     box_w = dwidth(plain) + 2
     pre = " " * max(0, (cols - box_w) // 2)
     inner = "  " + style(label, color, bold=True) + "   "
     for i, (k, v) in enumerate(hints):
         if i:
             inner += style("  ·  ", dim=True)
-        inner += style(k, T.ACCENT) + style(" " + v, dim=True)
+        inner += style(k, T.ACCENT) + (style(" " + v, dim=True) if v else "")
     inner += "  "
     return [
         pre + style("╭" + "─" * (box_w - 2) + "╮", color),
@@ -3028,20 +3074,17 @@ def _folder_box(cols: int, app: App) -> list[str]:
     box_w = min(max(dwidth(label) + 6, 30), cols - 2)
     pre = " " * max(0, (cols - box_w) // 2)
     inner_w = box_w - 4
-    shown = dtrunc(clean(app.folder_buf), inner_w)
-    caret = "\x1b[7m \x1b[0m" if dwidth(shown) >= inner_w else ""
-    path = style("path: ", dim=True) + style(shown, T.TEXT) + caret
+    buf, room = clean(app.folder_buf), max(1, inner_w - 7)  # "path: " + the caret
+    while dwidth(buf) > room:  # keep the end of a long path: that's the part being typed
+        buf = "…" + buf[2:] if buf.startswith("…") else "…" + buf[1:]
+    path = style("path: ", dim=True) + style(buf, T.TEXT) + "\x1b[7m \x1b[0m"
     hint = style("enter", T.ACCENT) + style(" download  ", dim=True) \
         + style("esc", T.ACCENT) + style(" cancel", dim=True)
-    def _pad_styled(s: str) -> str:
-        return s + " " * max(0, inner_w - dwidth(strip_ansi(s)))
+    def row(s: str) -> str:
+        return pre + style("│", T.ACCENT) + " " + s + " " * max(0, inner_w - dwidth(strip_ansi(s))) + " " + style("│", T.ACCENT)
     return [
         pre + style("╭" + "─" * (box_w - 2) + "╮", T.ACCENT),
-        pre + style("│", T.ACCENT) + _pad_styled(style(dtrunc(label, inner_w), T.TEXT, bold=True)) + style("│", T.ACCENT),
-        pre + style("│", T.ACCENT) + cell("", inner_w) + style("│", T.ACCENT),
-        pre + style("│", T.ACCENT) + _pad_styled(path) + style("│", T.ACCENT),
-        pre + style("│", T.ACCENT) + cell("", inner_w) + style("│", T.ACCENT),
-        pre + style("│", T.ACCENT) + _pad_styled(hint) + style("│", T.ACCENT),
+        row(style(dtrunc(label, inner_w), T.TEXT, bold=True)), row(""), row(path), row(""), row(hint),
         pre + style("╰" + "─" * (box_w - 2) + "╯", T.ACCENT),
     ]
 
@@ -3177,14 +3220,14 @@ def render(app: App, cols: int, rows: int) -> list[str]:
     cols = max(40, cols)
     rows = max(12, rows)
     if app.view == "search" and app.search is None and not app.help and not app.settings and not app.following:
-        return _redact_frame(_overlay(_splash(app, cols, rows), app, cols, rows), app)
+        return [clip(x, cols) for x in _redact_frame(_overlay(_splash(app, cols, rows), app, cols, rows), app)]
     lines: list[str] = []
     for L in _logo_lines():
         lines.append(" " * MARGIN + L)
     rule_w = max(0, cols - 2 * MARGIN)
     notes = ([f"{app.new_count()} new episode(s) — W"] if app.new_count() else []) \
         + ([_update_note(app)] if app.update_tag else [])
-    note = f" {'  ·  '.join(notes)} " if notes else ""
+    note = f" {dtrunc('  ·  '.join(notes), max(0, rule_w - 6))} " if notes else ""
     bar, bar_w = _status_bar(app, max(0, rule_w - dwidth(note) - 8))
     if bar or note:
         dashes = max(0, rule_w - dwidth(note) - (bar_w + 2 if bar else 0) - 2)
@@ -3195,7 +3238,7 @@ def render(app: App, cols: int, rows: int) -> list[str]:
 
     body_h, panel_h = _main_heights(rows)
     use_rail = app.view in ("search", "downloads") and app.detail is None and not app.help \
-        and not app.settings and not app.following and app.picker is None
+        and not app.settings and not app.following and app.picker is None and cols >= RAIL_MIN_COLS
     content_w = cols - MARGIN - RAIL_W - GAP - 1 if use_rail else cols - MARGIN - 1
 
     if app.help:
@@ -3225,4 +3268,4 @@ def render(app: App, cols: int, rows: int) -> list[str]:
     lines.append("")
     lines.append(" " * MARGIN + _footer(app, cols - MARGIN))
     lines = (lines + [""] * rows)[:rows]
-    return _redact_frame(_overlay(lines, app, cols, rows), app)
+    return [clip(x, cols) for x in _redact_frame(_overlay(lines, app, cols, rows), app)]

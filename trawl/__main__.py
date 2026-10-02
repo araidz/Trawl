@@ -11,9 +11,10 @@ import signal
 import sys
 import threading
 import time
+import traceback
 
 from . import __version__
-from .aria2 import Aria2, Aria2Error
+from .aria2 import STATE_DIR, Aria2, Aria2Error
 from .sources import parse_magnet, parse_source, refresh_trackers
 from .tui import App, Terminal, paste_clipboard, render
 
@@ -21,6 +22,24 @@ HELP = ("trawl — terminal torrent finder over aria2.\n"
         "  trawl               start (press s to resume partial downloads on disk)\n"
         "  trawl <query>       start and search for a query\n"
         "  trawl <magnet|url|file.torrent>  start and grab a magnet, link, or torrent file")
+
+
+_logged: set[str] = set()
+
+
+def log_crash(e: BaseException) -> None:
+    """Append the traceback to crash.log in the state dir (the UI keeps running). Each distinct
+    error is written once per run, so a recurring one can't grow the file without bound."""
+    tb = "".join(traceback.format_exception(e))
+    if tb in _logged:
+        return
+    _logged.add(tb)
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        with open(STATE_DIR / "crash.log", "a") as f:
+            f.write(f"--- {time.strftime('%Y-%m-%d %H:%M:%S')} trawl {__version__}\n{tb}")
+    except OSError:
+        pass
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -75,39 +94,48 @@ def main(argv: list[str] | None = None) -> int:
     last_poll = 0.0
     prev_title = None
     try:
+        failures = 0
         while app.running:
-            cols, rows = term.size()
-            busy = bool(app.activity())  # the spinner needs a steady ~10 fps while something runs
-            dirty = bool(keys := term.read_keys(0.04 if app.animating(rows) else 0.1 if busy else 0.2))
-            for k in keys:
-                app.on_key(k)
-                dirty = True  # also covers keys that open/close views without state change
-            if not app.running:
-                break
-            if app.drain_search():
-                dirty = True
-            now = time.monotonic()
-            if now - last_poll > 0.5:
-                try:
-                    app.update_downloads(eng.poll())
-                    g = eng.global_stat()
-                    app.down_speed = int(g.get("downloadSpeed", 0) or 0)
-                    app.num_active = int(g.get("numActive", 0) or 0)
-                except Aria2Error:
-                    pass
-                last_poll = now
-                app.start_check()  # no-op unless a followed show is due
-                dirty = True
-                app.check_clipboard()
-            if busy or app.animating(rows):
-                dirty = True  # spinner / sheen animation frames
-            if dirty or term.size() != (cols, rows):
+            try:
                 cols, rows = term.size()
-                term.write(render(app, cols, rows), (cols, rows))
-                title = app.page_title
-                if title != prev_title:
-                    term.set_title(title)
-                    prev_title = title
+                busy = bool(app.activity())  # the spinner needs a steady ~10 fps while something runs
+                dirty = bool(keys := term.read_keys(0.04 if app.animating(rows) else 0.1 if busy else 0.2))
+                for k in keys:
+                    app.on_key(k)
+                    dirty = True  # also covers keys that open/close views without state change
+                if not app.running:
+                    break
+                if app.drain_search():
+                    dirty = True
+                now = time.monotonic()
+                if now - last_poll > 0.5:
+                    try:
+                        app.update_downloads(eng.poll())
+                        g = eng.global_stat()
+                        app.down_speed = int(g.get("downloadSpeed", 0) or 0)
+                        app.num_active = int(g.get("numActive", 0) or 0)
+                    except Aria2Error:
+                        pass
+                    last_poll = now
+                    app.start_check()  # no-op unless a followed show is due
+                    dirty = True
+                    app.check_clipboard()
+                if busy or app.animating(rows):
+                    dirty = True  # spinner / sheen animation frames
+                if dirty or term.size() != (cols, rows):
+                    cols, rows = term.size()
+                    term.write(render(app, cols, rows), (cols, rows))
+                    title = app.page_title
+                    if title != prev_title:
+                        term.set_title(title)
+                        prev_title = title
+                failures = 0
+            except Exception as e:  # a bug must not take the downloads down with the app
+                failures += 1
+                log_crash(e)
+                app.status = "error: something went wrong — details saved to crash.log"
+                if failures > 20:  # failing every tick (e.g. the terminal is gone): give up
+                    raise
     except KeyboardInterrupt:
         pass
     finally:

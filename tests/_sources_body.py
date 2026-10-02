@@ -496,6 +496,10 @@ while len(_got) < 2:
 assert _got["slow"].elapsed >= 0.14 and _got["boom"].elapsed < 0.14, {k: v.elapsed for k, v in _got.items()}
 assert SourceUpdate("a", []).elapsed == 0.0, "elapsed is optional"
 
+# clipboard text with a NUL byte after "~" made expanduser raise and killed the app
+for junk in ("~bob\x00.torrent", "~x\x00", "~\x00/a.torrent", "/tmp/a\x00.torrent"):
+    assert parse_source(junk) is None, junk
+
 # release parser + res:/codec: operators
 _pr = parse_release
 assert _pr("Dune.Part.Two.2024.2160p.WEB-DL.DDP5.1.Atmos.DV.HDR.H.265-GRP") == \

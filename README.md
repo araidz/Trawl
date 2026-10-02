@@ -259,7 +259,8 @@ uses a private session file so it never touches your own aria2 state.
 
 State lives in `~/Library/Application Support/Trawl/`:
 `history.txt` (searches), `downloads.jsonl` (completed), `config.json` (settings),
-`update.json` (last update check), `subscriptions.json` (followed shows),
+`update.json` (last update check), `subscriptions.json` (followed shows), `crash.log`
+(only if something unexpected went wrong: Trawl logs it there and keeps running),
 `pending.jsonl` (direct-link grabs, for resuming), `aria2-session.txt` (private session).
 
 Torznab endpoint keys are masked in the UI and errors, as are metadata keys.
