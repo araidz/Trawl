@@ -9,6 +9,9 @@ meta = to_download({"gid": "a", "status": "active", "totalLength": "0",
                     "completedLength": "0", "downloadSpeed": "0",
                     "files": [{"path": "/x/[METADATA]Some.Movie"}]})
 assert meta.status == "metadata" and meta.name == "Some.Movie", meta
+_pm = to_download({"gid": "p", "status": "paused", "totalLength": "0", "completedLength": "0", "downloadSpeed": "0",
+                   "files": [{"path": "/x/[METADATA]Some.Movie"}]})
+assert _pm.status == "paused" and _pm.name == "Some.Movie", "a paused magnet is paused, not 'fetching metadata'"
 live = to_download({"gid": "b", "status": "active", "totalLength": "100",
                    "completedLength": "50", "downloadSpeed": "10",
                    "connections": "7", "files": [{"path": "/x/Some.Movie.mkv"}]})

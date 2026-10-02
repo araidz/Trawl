@@ -83,7 +83,8 @@ def to_download(st: dict) -> Download:
     name = _name(st)
     if name.startswith(_METADATA):  # magnet still resolving its .torrent
         name = name[len(_METADATA):] or "fetching metadata"
-        status = "metadata"
+        if status != "paused":  # a paused magnet must stay "paused", or p can't resume it
+            status = "metadata"
     eta = (total - completed) / speed if speed > 0 and total > completed else None
     return Download(
         gid=st.get("gid", "?"),

@@ -1487,6 +1487,20 @@ assert apt.status == 'Torrentio knows no releases of "Nothing"' and apt.detail i
 apt.on_key("t"); assert apt._other_busy, "a failed lookup can be retried"; _tr_wait(apt)
 gs["torrentio_releases"] = _otr
 
+# a paused magnet that never resolved its metadata can be resumed with p
+from .aria2 import to_download
+_pe = []
+class _PauseEng:
+    def pause(self, r): _pe.append(("pause", r))
+    def resume(self, r): _pe.append(("resume", r))
+_pa = App(eng=_PauseEng()); _pa.view = "downloads"
+_pa.downloads = [to_download({"gid": "g", "status": "paused", "totalLength": "0", "completedLength": "0",
+                              "downloadSpeed": "0", "files": [{"path": "/d/[METADATA]Coyote"}]})]
+_pa.downloads[0].root = "r"
+assert _pa.downloads[0].status == "paused" and not _pa.activity(), "paused is not 'fetching metadata'"
+_pa.on_key("p"); assert _pe == [("resume", "r")], _pe
+_pa.downloads[0].status = "metadata"; _pa.on_key("p"); assert _pe[-1] == ("pause", "r"), "a live fetch still pauses"
+
 # status area: top-right, live (spinner + current process), fading, tone-coloured; footer is all shortcuts
 def _stat_app():
     a = App(eng=None); a.view, a.search, a.query = "search", Replay((), []), "x"
