@@ -408,6 +408,31 @@ def update_available() -> str:
     return tag.lstrip("v") if _newer(tag, __version__) else ""
 
 
+AWAKE_MODES = ("on", "ac", "off")  # keep the Mac awake while downloading: always / on the charger / never
+_power: list = [0.0, True]  # (checked at, on AC) — pmset is asked at most every 30 s
+
+
+def on_ac_power() -> bool:
+    """True on the charger (or a desktop Mac, or if we can't tell)."""
+    if time.monotonic() - _power[0] > 30:
+        try:
+            out = subprocess.run(["pmset", "-g", "batt"], capture_output=True, text=True, timeout=2).stdout
+            _power[:] = [time.monotonic(), "Battery Power" not in out.split("\n", 1)[0]]
+        except (OSError, subprocess.SubprocessError):
+            _power[:] = [time.monotonic(), True]
+    return _power[1]
+
+
+def start_caffeinate() -> subprocess.Popen | None:
+    """Hold off idle *system* sleep (the screen may still sleep) for as long as this process
+    lives: -w ties it to our pid, so a crash or kill can never leave the Mac stuck awake."""
+    try:
+        return subprocess.Popen(["caffeinate", "-i", "-w", str(os.getpid())],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        return None
+
+
 def notify(title: str, message: str) -> None:
     """Fire-and-forget macOS desktop notification (never blocks the UI)."""
     script = f"display notification {json.dumps(clean(message)[:200])} with title {json.dumps(title)}"
@@ -676,6 +701,8 @@ class App:
         self.show_errors = False  # per-source failure viewer over the results
         self.hide_dead = bool(cfg.get("hide_dead", False))
         self.update_check = bool(cfg.get("update_check", True))
+        self.keep_awake = cfg.get("keep_awake") if cfg.get("keep_awake") in AWAKE_MODES else "on"
+        self._caff: subprocess.Popen | None = None  # the caffeinate holding the Mac awake, if any
         self.update_tag = ""  # newer release found by check_update, shown in header/splash
         self._space_warned = ""  # uri whose low-disk warning was shown; pressing again overrides
         self.folder_prompt: tuple[list[tuple[str, str]], str, int] | None = None  # ([(uri, name)], label, bytes) for D
@@ -1256,7 +1283,7 @@ class App:
                             "max_downloads": self.max_dl_set,
                             "meta_provider": self.meta_provider,
                             "theme": self.theme, "hide_dead": self.hide_dead,
-                            "update_check": self.update_check,
+                            "update_check": self.update_check, "keep_awake": self.keep_awake,
                             "tmdb_key": self.tmdb_key, "omdb_key": self.omdb_key,
                             "torznab_feeds": [dict(feed) for feed in self.torznab_feeds]})
         save_config(self.config)
@@ -1269,7 +1296,7 @@ class App:
 
     def setting_items(self) -> list[tuple[str, object]]:
         return ([('section', 'General'), ('dir', None), ('concurrency', None), ('limit', None), ('provider', None),
-                 ('meta-key', None), ('theme', None), ('updates', None),
+                 ('meta-key', None), ('theme', None), ('updates', None), ('awake', None),
                  ('section', 'Sources')]
                 + [('source', s) for s in SOURCES]
                 + [('section', 'Torznab feeds')]
@@ -1380,6 +1407,10 @@ class App:
             elif k in ("enter", " ") and kind == "updates":
                 self.update_check = not self.update_check
                 self._save_settings()
+            elif k in ("enter", " ") and kind == "awake":
+                self.keep_awake = AWAKE_MODES[(AWAKE_MODES.index(self.keep_awake) + 1) % len(AWAKE_MODES)]
+                self._save_settings()
+                self.update_awake()
             elif k in ("enter", " ") and kind in ("source", "feed"):
                 sid = value.id if kind == "source" else value["id"]
                 self.disabled_sources.symmetric_difference_update({sid})
@@ -1683,6 +1714,30 @@ class App:
         self.dsel = min(self.dsel, max(0, len(kept) - 1))  # keys act on a real row after the list shrinks
         if self._peek:
             self._poll_peek()
+        self.update_awake()
+
+    @property
+    def awake(self) -> bool:
+        return self._caff is not None and self._caff.poll() is None
+
+    def update_awake(self) -> None:
+        """Keep the Mac from idle-sleeping exactly while something is downloading (a sleeping
+        Mac freezes aria2 until you wake it). Paused, queued or finished downloads don't count."""
+        want = (self.keep_awake != "off" and any(d.status in ("active", "metadata") for d in self.downloads)
+                and (self.keep_awake == "on" or on_ac_power()))
+        if want and not self.awake:
+            self._caff = start_caffeinate()
+        elif not want and self._caff is not None:
+            self.release_awake()
+
+    def release_awake(self) -> None:
+        if self._caff is not None:
+            try:
+                self._caff.terminate()
+                self._caff.wait(timeout=2)
+            except Exception:  # already gone, or won't die: -w still ends it when trawl exits
+                pass
+            self._caff = None
 
     def _finish_export(self, gid: str, ih: str, name: str, dir_path: str) -> None:
         self._exports.pop(gid, None)
@@ -2804,8 +2859,13 @@ def _settings_panel(app: App, width: int, height: int) -> list[str]:
             inner.append(cell(str(value).upper(), inner_w, color=T.ALT, bold=True, dim=True))
             continue
         prefix = cell(T.PTR if selected else "", 2, color=T.ACCENT)
-        if kind in ("dir", "limit", "provider", "meta-key", "theme", "updates", "concurrency"):
-            if kind == "concurrency":
+        if kind in ("dir", "limit", "provider", "meta-key", "theme", "updates", "concurrency", "awake"):
+            if kind == "awake":
+                label = "Keep Mac awake"
+                shown = {"on": "while downloading", "ac": "while downloading, on the charger",
+                         "off": "off (the Mac may sleep mid-download)"}[app.keep_awake]
+                on = app.keep_awake != "off"
+            elif kind == "concurrency":
                 label = "Downloads at once"
                 shown = (app.edit_buf + "▌" if app.edit_field == "concurrency"
                          else f"{app.max_dl or '?'}  ← →" + ("" if app.max_dl_set else "  (from aria2.conf)"))
@@ -2927,6 +2987,7 @@ def _help_panel(app: App, width: int, height: int) -> list[str]:
                       ("↑ ↓  j k", "move selection (keyboard only; the mouse is ignored)"),
                       ("tab", "switch search / downloads")]),
         ("Downloads", [("enter", "open a finished download"), ("+ / -", "more / fewer downloads at once"),
+                       ("☕", "the Mac is kept awake while downloading (settings: Keep Mac awake)"),
                        ("p", "pause / resume"), ("x", "cancel (ask: delete or keep files)"),
                        ("r", "retry a failed download"), ("f", "choose files (season packs)"),
                        ("o", "reveal in Finder"), ("s", "resume partial downloads on disk")]),
@@ -3228,8 +3289,9 @@ def _status_bar(app: App, budget: int) -> tuple[str, int]:
     spin = T.SPIN[int(time.monotonic() * 12) % len(T.SPIN)]
     item = {"msg": dtrunc(redact(clean(live[0]), app._all_secrets()), 200) if live else "",
             "act": f"{spin} " + " · ".join(act) if act else "",
-            "stat": f"{T.DOWN} {fmt_speed(app.down_speed)} · {app.num_active} active"
-            if app.down_speed > 0 or app.num_active > 0 else ""}
+            "stat": (f"{T.DOWN} {fmt_speed(app.down_speed)} · {app.num_active} active"
+                     if app.down_speed > 0 or app.num_active > 0 else "")
+            + (" · ☕" if app.awake and (app.down_speed > 0 or app.num_active > 0) else "☕" if app.awake else "")}
 
     def width() -> int:
         shown = [v for v in item.values() if v]

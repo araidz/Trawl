@@ -144,6 +144,7 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         term.leave()
         app.end_peek()
+        app.release_awake()
         eng.stop()
     return 0
 

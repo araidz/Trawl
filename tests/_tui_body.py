@@ -1,3 +1,11 @@
+# never spawn a real caffeinate from the tests (update_downloads would): a stand-in process
+class _FakeCaff:
+    def __init__(self): self.alive = True
+    def poll(self): return None if self.alive else 0
+    def terminate(self): self.alive = False
+    def wait(self, timeout=None): return 0
+_caff_made = []
+globals()["start_caffeinate"] = lambda: (_caff_made.append(_FakeCaff()), _caff_made[-1])[1]
 # width primitives
 assert dwidth("abc") == 3 and dwidth("日本") == 4, "east-asian width"
 assert dwidth(strip_ansi(cell("hi", 10))) == 10, "cell pads to width"
@@ -1670,6 +1678,62 @@ for _t in T.THEMES:
     assert all(dwidth(strip_ansi(x)) <= 100 for x in render(App(eng=None), 100, 30)), _t
 T.set_theme("violet"); _logo_lines.cache_clear()
 assert any("━┓╳╳╳╳╲" in strip_ansi(x) for x in render(App(eng=None), 100, 30)), "splash shows the new mark"
+
+# keep the Mac awake exactly while downloading (caffeinate -i -w pid), per the setting
+def _dl(st): return Download(st, st, st, 10, 1, 1, 1, None, root=st)
+_aw = App(eng=None); _aw.keep_awake = "on"; _caff_made.clear()
+_aw.update_downloads([_dl("paused"), _dl("waiting"), _dl("complete"), _dl("error")])
+assert not _aw.awake and not _caff_made, "paused / queued / finished / failed don't keep the Mac up"
+_aw.update_downloads([_dl("waiting"), _dl("active")])
+assert _aw.awake and len(_caff_made) == 1, "an active download holds it"
+_aw.update_downloads([_dl("active")]); _aw.update_downloads([_dl("metadata")])
+assert len(_caff_made) == 1, "one hold, not one per poll"
+assert "☕" in strip_ansi(_status_bar(_aw, 80)[0]), "the corner shows it"
+_caff_made[-1].alive = False  # caffeinate killed from outside
+_aw.update_downloads([_dl("active")]); assert _aw.awake and len(_caff_made) == 2, "a dead hold is replaced"
+_aw.update_downloads([_dl("paused")])
+assert not _aw.awake and _aw._caff is None and not _caff_made[-1].alive, "released when nothing runs"
+assert "☕" not in strip_ansi(_status_bar(_aw, 80)[0])
+_aw.update_downloads([_dl("active")]); _aw.release_awake()
+assert not _aw.awake and not _caff_made[-1].alive, "quit releases it"
+_oac = gs["on_ac_power"]
+_aw.keep_awake = "ac"; gs["on_ac_power"] = lambda: False
+_aw.update_downloads([_dl("active")]); assert not _aw.awake, "charger-only mode on battery: no hold"
+gs["on_ac_power"] = lambda: True
+_aw.update_downloads([_dl("active")]); assert _aw.awake, "charger-only mode on the charger: hold"
+gs["on_ac_power"] = lambda: False
+_aw.update_downloads([_dl("active")]); assert not _aw.awake, "unplugged mid-download: released"
+gs["on_ac_power"] = _oac
+_aw.keep_awake = "off"; _aw.update_downloads([_dl("active")]); assert not _aw.awake
+# the setting: cycles on -> charger -> off, persists, applies at once; junk config falls back to on
+_svk = {}; _osk = gs["save_config"]; gs["save_config"] = lambda c: _svk.update(c)
+_aw.keep_awake = "on"; _aw.settings = True; _aw.view = "search"
+_aw.set_sel = [k for k, _ in _aw.setting_items()].index("awake")
+assert any("Keep Mac awake" in strip_ansi(x) and "while downloading" in strip_ansi(x) for x in render(_aw, 120, 50))
+_aw.on_key("enter"); assert _aw.keep_awake == "ac" and _svk["keep_awake"] == "ac"
+_aw.on_key(" "); assert _aw.keep_awake == "off" and not _aw.awake, "switching off releases right away"
+_aw.on_key("enter"); assert _aw.keep_awake == "on" and _aw.awake, "switching on with a download running holds right away"
+_aw.settings = False; _aw.release_awake()
+gs["save_config"] = _osk
+_olk = gs["load_config"]
+for _v, _want in (("ac", "ac"), ("off", "off"), ("bogus", "on"), (None, "on"), (1, "on")):
+    gs["load_config"] = lambda v=_v: {"keep_awake": v}
+    assert App(eng=None).keep_awake == _want, _v
+gs["load_config"] = _olk
+# on_ac_power reads pmset's first line, caches it, and assumes AC if pmset fails
+_orun = subprocess.run
+class _R:
+    def __init__(self, out): self.stdout = out
+_pm_calls = []
+subprocess.run = lambda *a, **k: (_pm_calls.append(a), _R("Now drawing from 'Battery Power'\n -InternalBattery-0 80%"))[1]
+_power[:] = [0.0, True]
+assert on_ac_power() is False and on_ac_power() is False and len(_pm_calls) == 1, "cached for 30 s"
+_power[:] = [0.0, True]; subprocess.run = lambda *a, **k: _R("Now drawing from 'AC Power'\n")
+assert on_ac_power() is True
+def _boom(*a, **k): raise OSError("no pmset")
+_power[:] = [0.0, False]; subprocess.run = _boom
+assert on_ac_power() is True, "can't tell: assume plugged in"
+subprocess.run = _orun; _power[:] = [0.0, True]
 
 # status area: top-right, live (spinner + current process), fading, tone-coloured; footer is all shortcuts
 def _stat_app():

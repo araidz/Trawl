@@ -127,6 +127,14 @@ Trawl is a from-scratch Python TUI inspired by
 - **Resume** — unfinished downloads resume automatically on the next launch;
   `s` additionally scans the download folder for stray partial `*.aria2` files
   (torrents and remembered direct-http grabs).
+- **Keeps the Mac awake while downloading** — a sleeping Mac freezes downloads
+  until you wake it. While something is actually downloading, Trawl holds off idle
+  *system* sleep with macOS's own `caffeinate` (the screen still turns off), shows
+  `☕` in the status corner, and lets go as soon as nothing is running. The hold is
+  tied to Trawl's process, so it ends even if Trawl crashes. Settings (`g`, "Keep Mac
+  awake"): while downloading (default), only on the charger, or off. Closing the
+  lid still sleeps the Mac: macOS ignores apps for that, unless it's on the charger
+  with an external display (closed-display mode).
 - **Downloads at once** — aria2 runs a fixed number of downloads at the same time
   and queues the rest. Change it with `+`/`-` in the Downloads view, or in settings
   (`g`, "Downloads at once": `←`/`→`, or `Enter` to type a number). It applies
