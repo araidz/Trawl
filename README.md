@@ -40,20 +40,30 @@ Trawl is a from-scratch Python TUI inspired by
 ```
   ▀█▀ █▀▄ ▄▀▄ █ ▄ █ █    ━┓╳╳╳╳╲
    █  █▀▄ █▀█ ▀▄▀▄▀ █▄▄  ━┛╳╳╳╳╱↓
-  ────────────────────────────────────────────────────────────────────
-                    ╭─ Search ────────────────────────────────────────╮
-  ▌ All             │ ❯ oppenheimer                                   │
-    Games           ╰─────────────────────────────────────────────────╯
-    Movies
-    TV              ╭─ Results · seeders ─────────────────────── (3) ─╮
-    Anime           │ 3 results                                       │
-    Books           │    Name                     Size       S:L   Src │
-    Downloads       │ ❯  Oppenheimer (2023)…   1.83 GB   1240:88   YTS │
-                    │    Oppenheimer 2023 2…  14.90 GB    910:41   KNB │
-                    │    Oppenheimer.2023.P…   1.96 GB    540:30   TPB │
-                    ╰─────────────────────────────────────────────────╯
+  ────────────────────────────────────────────────────────────────────────────────────────────────────
+                      ╭─ Search ──────────────────────────────────────────────────────────────────────╮
+  ▌ ✦ All          3  │ ❯ oppenheimer                                                                 │
+    ◆ Games           ╰───────────────────────────────────────────────────────────────────────────────╯
+    ★ Movies       2
+    ▶ TV              ╭─ Results · seeders ───────────────────────────────────────────────────── (3) ─╮
+    ❀ Anime           │ 3 results                                                                     │
+    ▤ Books           │    Name                             Release              Size      Seed   Src │
+                      │ ❯  Oppenheimer (2023) 1080p BluRay… 1080p BD          1.83 GB   1240:88   YTS │
+    ↓ Downloads       │    Oppenheimer.2023.2160p.UHD.BluR… 2160p REMUX HDR  14.90 GB    910:41   KNB │
+                      │    Oppenheimer.2023.PROPER.1080p.W… 1080p WEB         1.96 GB    540:30   TPB │
+    KEYS              │                                                                               │
+    move          ↑↓  │                                                                               │
+    details    enter  │                                                                               │
+    mark       space  │                                                                               │
+    grab           d  │                                                                               │
+    folder         D  │                                                                               │
+    filter         f  │                                                                               │
+    follow         w  │                                                                               │
+    sort           S  │                                                                               │
+    category      ←→  │                                                                               │
+    all keys       ?  ╰───────────────────────────────────────────────────────────────────────────────╯
 
-  ↑↓ move  ·  enter details  ·  d grab  ·  o page  ·  y copy  ·  q quit
+  : commands  ·  ? all keys  ·  g settings  ·  q quit
 ```
 
 ## Features
@@ -99,6 +109,10 @@ Trawl is a from-scratch Python TUI inspired by
   shows`), the download speed, and the latest message, which fades after ten
   seconds (warnings and errors stay for thirty, coloured accordingly). The bottom
   line is left entirely to shortcuts.
+- **Shortcuts on screen** — under the categories, a KEYS list shows what you can
+  press on the current screen (action, then key), most useful first; if the window
+  is short it ends with `all keys ?`. The bottom line keeps only the keys that work
+  everywhere. Below 80 columns (no side column) the bottom line lists them all.
 - **Command palette** — `Ctrl-K` anywhere (or `:` from the results and downloads
   views) opens a searchable list of every action that makes sense right now:
   type a few letters (`fold`, `sort`, `theme nord`), `↑↓`, `Enter`. It replays the

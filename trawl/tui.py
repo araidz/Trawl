@@ -708,6 +708,7 @@ class App:
         self.folder_prompt: tuple[list[tuple[str, str]], str, int] | None = None  # ([(uri, name)], label, bytes) for D
         self.marked: set[str] = set()  # _mkey of results ticked with space for a batch grab
         self.palette = False  # command palette open (ctrl-k, or : from a results/downloads view)
+        self.rail_keys_shown = False  # render: the rail listed this screen's keys (the footer then shrinks)
         self.pal_buf = ""
         self.pal_sel = 0
         self.filtering = False  # typing into the live results filter (f)
@@ -2532,7 +2533,30 @@ def _rail(app: App, h: int) -> list[str]:
                  + cell("Downloads", 9, color=T.ACCENT if dsel else T.TEXT, bold=dsel)
                  + cell(f"({n})" if n else "", 5, "right", color=T.ACCENT if dsel else None,
                         bold=dsel, dim=not dsel))
+    lines += _rail_keys(app, h - len(lines))
     return (lines + [cell("", RAIL_W)] * h)[:h]
+
+
+def _rail_keys(app: App, room: int) -> list[str]:
+    """This screen's shortcuts as a vertical list under the categories: action on the left, key
+    on the right. If the window is too short for all of them, the last line points to `?`."""
+    hints, rail = _hints(app)
+    keys = [h for h in hints if h[0] not in RAIL_GLOBAL] if rail else []
+    if not keys or room < 4:  # blank + "KEYS" + at least two rows
+        app.rail_keys_shown = False
+        return []
+    more = ("?", "all keys") if any(h[0] == "?" for h in hints) else None
+    fit = room - 2
+    if len(keys) + bool(more) > fit:
+        keys = keys[:fit - 1] + [more or ("…", "more")]
+    elif more:
+        keys = keys + [more]
+    kw = max(dwidth(k) for k, _ in keys)
+    app.rail_keys_shown = True
+    out = [cell("", RAIL_W), "  " + cell("KEYS", RAIL_W - 2, color=T.ALT, bold=True, dim=True)]
+    for k, label in keys:  # indented under the category icons; key column ends where the counts do
+        out.append("  " + cell(label, RAIL_W - 3 - kw, dim=True) + " " + cell(k, kw, "right", color=T.ACCENT))
+    return out
 
 
 def _caret_view(q: str, cur: int, avail: int) -> tuple[str, str, str]:
@@ -3009,7 +3033,13 @@ def _help_panel(app: App, width: int, height: int) -> list[str]:
     return _wrap_panel("Help", shown, width, height, True, count)
 
 
-def _footer(app: App, width: int) -> str:
+RAIL_GLOBAL = (":", "?", "g", "q", "^c")  # keys that work anywhere: they stay on the bottom line
+
+
+def _hints(app: App) -> tuple[list[tuple[str, str]], bool]:
+    """(key, action) shortcuts for what's on screen, most useful first. The bool says whether this
+    is a screen with the left rail, whose KEYS list then carries everything but RAIL_GLOBAL."""
+    rail = False
     if app.palette:
         hints = [("type", "to find"), ("↑↓", "move"), ("↵", "run"), ("esc", "close"), ("^c", "quit")]
     elif app.cancel_prompt is not None:
@@ -3052,23 +3082,33 @@ def _footer(app: App, width: int) -> str:
                  ("t", "releases"),
                  ("o", "page"), ("y", "copy"), ("p", "poster"), ("esc/q", "back")]
     elif app.show_errors:
-        hints = [("esc/E", "close"), ("r", "retry failed"), ("R", "search again"), ("q", "quit")]
+        rail, hints = True, [("esc/E", "close"), ("r", "retry"), ("R", "re-search"), ("q", "quit")]
     elif app.view == "search" and app.filtering:
-        hints = [("type", "filter"), ("↑↓", "move"), ("enter", "keep"), ("esc", "clear"), ("^c", "quit")]
+        rail, hints = True, [("type", "filter"), ("↑↓", "move"), ("enter", "keep"), ("esc", "clear"), ("^c", "quit")]
     elif app.view == "search" and app.editing:
-        hints = [("enter", "search"), ("↑↓", "history"), ("esc", "nav"), ("tab", "downloads"), ("^c", "quit")]
+        rail, hints = True, [("enter", "search"), ("↑↓", "history"), ("esc", "leave box"), ("tab", "downloads"),
+                             ("^c", "quit")]
     elif app.view == "search":
         n = len(app._marked_results())
-        hints = [("↑↓", "move"), ("enter", "details"), ("space", "mark"), ("f", "filter"),
-                 ("d", f"grab {n}" if n else "grab"), ("D", "folder"), ("e", ".torrent"),
-                 ("o", "page"), ("y", "copy"),
-                 ("r", "retry"), ("E", "errors"), ("z", "hide dead"), ("S", "sort"), ("←→", "category"),
-                 ("v", "paste"), (":", "commands"), ("g", "settings"), ("q", "quit")]
+        rail, hints = True, [("↑↓", "move"), ("enter", "details"), ("space", "mark"),
+                             ("d", f"grab {n}" if n else "grab"), ("D", "folder"), ("f", "filter"), ("w", "follow"),
+                             ("S", "sort"), ("←→", "category"), ("z", "hide dead"), ("e", ".torrent"),
+                             ("o", "page"), ("y", "copy"), ("v", "paste"), ("r", "retry"), ("E", "sources"),
+                             ("R", "re-search"), (":", "commands"), ("?", "all keys"), ("g", "settings"),
+                             ("q", "quit")]
     else:
-        hints = [("↑↓", "move"), ("↵", "open"), ("p", "pause/resume"), ("x", "cancel"), ("r", "retry"),
-                 ("+/-", "at once"),
-                 ("f", "files"), ("o", "reveal"), ("s", "resume"), (":", "commands"), ("g", "settings"),
-                 ("tab", "search"), ("q", "quit")]
+        rail, hints = True, [("↑↓", "move"), ("↵", "open"), ("p", "pause/play"), ("x", "cancel"), ("r", "retry"),
+                             ("+/-", "at once"), ("f", "files"), ("o", "reveal"), ("s", "resume"),
+                             ("tab", "search"), (":", "commands"), ("?", "all keys"), ("g", "settings"),
+                             ("q", "quit")]
+    return hints, rail
+
+
+def _footer(app: App, width: int, rail_keys: bool = False) -> str:
+    """The bottom line. While the rail lists this screen's keys, only the global ones stay here."""
+    hints, rail = _hints(app)
+    if rail_keys and rail:
+        hints = [h for h in hints if h[0] in RAIL_GLOBAL] or hints
     out, used = "", 0
     sep = "  " + T.DOT + "  "
     sep_w = dwidth(sep)
@@ -3364,12 +3404,13 @@ def render(app: App, cols: int, rows: int) -> list[str]:
         else:
             content += _downloads_panel(app, content_w, panel_h)
     content = (content + [""] * body_h)[:body_h]
+    app.rail_keys_shown = False
     rail = _rail(app, body_h) if use_rail else []
 
     for i in range(body_h):
         lines.append(" " * MARGIN + (rail[i] + " " * GAP if use_rail else "") + content[i])
 
     lines.append("")
-    lines.append(" " * MARGIN + _footer(app, cols - MARGIN))
+    lines.append(" " * MARGIN + _footer(app, cols - MARGIN, rail_keys=use_rail and app.rail_keys_shown))
     lines = (lines + [""] * rows)[:rows]
     return [clip(x, cols) for x in _redact_frame(_overlay(lines, app, cols, rows), app)]
