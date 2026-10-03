@@ -46,6 +46,7 @@ class Download:
     error: str = ""
     root: str = ""  # the gid we added (poll sets it); remove() takes this
     path: str = ""  # on-disk path of the first file (for reveal-in-Finder)
+    meta: bool = False  # a magnet whose .torrent hasn't arrived yet (whatever its status)
 
     @property
     def progress(self) -> float:
@@ -81,9 +82,12 @@ def to_download(st: dict) -> Download:
     speed = int(st.get("downloadSpeed") or 0)
     status = st.get("status") or ""
     name = _name(st)
-    if name.startswith(_METADATA):  # magnet still resolving its .torrent
+    meta = name.startswith(_METADATA)  # magnet still resolving its .torrent
+    if meta:
         name = name[len(_METADATA):] or "fetching metadata"
-        if status != "paused":  # a paused magnet must stay "paused", or p can't resume it
+        # only a magnet aria2 is working on is "fetching": a queued one stays "waiting", a failed
+        # one "error" (so r retries it), a paused one "paused" (so p resumes it)
+        if status == "active":
             status = "metadata"
     eta = (total - completed) / speed if speed > 0 and total > completed else None
     return Download(
@@ -97,6 +101,7 @@ def to_download(st: dict) -> Download:
         eta=eta,
         error=st.get("errorMessage", ""),
         path=(st.get("files") or [{}])[0].get("path", ""),
+        meta=meta,
     )
 
 
@@ -331,6 +336,20 @@ class Aria2:
     def set_dir(self, path: str) -> None:
         try:
             self._call("aria2.changeGlobalOption", [{"dir": path}])
+        except Aria2Error:
+            pass
+
+    def max_concurrent(self) -> int | None:
+        """How many downloads aria2 runs at once (the rest queue as "waiting")."""
+        try:
+            return int(self._call("aria2.getGlobalOption")["max-concurrent-downloads"])
+        except (Aria2Error, KeyError, TypeError, ValueError):
+            return None
+
+    def set_max_concurrent(self, n: int) -> None:
+        """Takes effect immediately: queued downloads start (or wait) to match."""
+        try:
+            self._call("aria2.changeGlobalOption", [{"max-concurrent-downloads": str(n)}])
         except Aria2Error:
             pass
 

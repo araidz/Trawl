@@ -1599,6 +1599,58 @@ except RuntimeError as _e:
 _log = (_mm.STATE_DIR / "crash.log").read_text()
 assert _log.count("RuntimeError: probe-crash-xyz") == 1 and "trawl " in _log and str(_mm.STATE_DIR).startswith(os.environ["HOME"]), "logged once, in the test home"
 
+# queued downloads look queued; "downloads at once" setting (settings ←/→/type, +/- in Downloads, palette)
+from .aria2 import to_download as _td
+_mag = lambda st: _td({"gid": st, "status": st, "totalLength": "0", "completedLength": "0", "downloadSpeed": "0",
+                       "files": [{"path": f"/d/[METADATA]Movie {st}"}]})
+class _CE:
+    n = 5
+    def set_max_concurrent(self, n): _CE.n = n
+    def download_dir(self): return None
+_cq = App(eng=_CE()); _cq.view = "downloads"; _cq.max_dl = 5
+_cq.downloads = [_mag(s) for s in ("active", "waiting", "waiting", "error", "paused")]
+for _i, _d in enumerate(_cq.downloads): _d.root = str(_i)
+_scr = "\n".join(strip_ansi(x) for x in render(_cq, 120, 40))
+assert _scr.count("queued") >= 2 and _scr.count("fetching metadata…") == 1, _scr
+assert "(5) · 1 active · 2 queued · 5 at once" in _scr, "title shows the queue and the limit"
+assert _cq.activity() == ["fetching metadata"], "the spinner counts only the magnet aria2 is working on"
+_cq.dsel = 1; _cq.on_key("o"); assert "metadata" in _cq.status, "o on a queued magnet: no location yet"
+_sv2 = {}; _osc = gs["save_config"]; gs["save_config"] = lambda c: _sv2.update(c)
+_cq.on_key("+"); assert _cq.max_dl == 6 and _CE.n == 6 and _sv2["max_downloads"] == 6 and "6" in _cq.status
+_cq.on_key("="); _cq.on_key("-"); _cq.on_key("-"); assert _cq.max_dl == 5 and _CE.n == 5
+for _ in range(30): _cq.on_key("-")
+assert _cq.max_dl == MAX_DL_RANGE[0], "never below 1"
+for _ in range(40): _cq.on_key("+")
+assert _cq.max_dl == MAX_DL_RANGE[1] and _CE.n == MAX_DL_RANGE[1], "never above 20"
+_cq.view = "search"; _cq.settings = True
+_cq.set_sel = [k for k, _ in _cq.setting_items()].index("concurrency")
+assert any("Downloads at once" in strip_ansi(x) and "20" in strip_ansi(x) for x in render(_cq, 120, 40))
+assert "type a number" in strip_ansi(_footer(_cq, 160))
+_cq.on_key("left"); assert _cq.max_dl == 19
+_cq.on_key("right"); _cq.on_key("right"); assert _cq.max_dl == 20
+_cq.on_key("enter"); assert _cq.edit_field == "concurrency" and _cq.edit_buf == "20"
+_cq.on_key("ctrl-u")
+for ch in "99": _cq.on_key(ch)
+_cq.on_key("enter"); assert _cq.edit_field == "concurrency" and "1 to 20" in _cq.status and _cq.max_dl == 20, "out of range rejected"
+_cq.on_key("ctrl-u"); _cq.on_key("3"); _cq.on_key("enter")
+assert _cq.edit_field is None and _cq.max_dl == 3 and _CE.n == 3 and _sv2["max_downloads"] == 3
+_cq.on_key("ctrl-u") if _cq.edit_field else None
+_cq.on_key("enter"); _cq.on_key("esc"); assert _cq.edit_field is None and _cq.max_dl == 3, "esc cancels typing"
+_cq.settings = False
+gs["save_config"] = _osc
+# saved value is used; junk in config is ignored; unset shows the aria2.conf value
+_olc = gs["load_config"]
+for _cfgv, _want in ((7, 7), (0, None), (99, None), ("5", None), (None, None)):
+    gs["load_config"] = lambda v=_cfgv: {"max_downloads": v}
+    assert App(eng=None).max_dl_set == _want, (_cfgv, App(eng=None).max_dl_set)
+gs["load_config"] = _olc
+_cu = App(eng=None); _cu.max_dl_set, _cu.max_dl = None, 5; _cu.settings = True
+_cu.set_sel = [k for k, _ in _cu.setting_items()].index("concurrency")
+assert any("(from aria2.conf)" in strip_ansi(x) for x in render(_cu, 120, 40))
+_cu.settings = False; _cu.view = "downloads"; _cu.on_key("ctrl-k")
+assert {"More downloads at once", "Fewer downloads at once"} <= {a[0] for a in _cu.palette_items()}
+_cu.on_key("esc")
+
 # status area: top-right, live (spinner + current process), fading, tone-coloured; footer is all shortcuts
 def _stat_app():
     a = App(eng=None); a.view, a.search, a.query = "search", Replay((), []), "x"

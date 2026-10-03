@@ -107,7 +107,8 @@ def save_config(cfg: dict) -> None:
         pass
 
 RAIL_W = 18  # glyph + label + count
-RAIL_MIN_COLS = 80  # narrower terminals drop the category rail so the panels fit
+RAIL_MIN_COLS = 80
+MAX_DL_RANGE = (1, 20)  # the simultaneous-downloads setting  # narrower terminals drop the category rail so the panels fit
 MARGIN = 2
 GAP = 2
 
@@ -666,6 +667,10 @@ class App:
         self.disabled_sources: set[str] = set(cfg.get("disabled_sources", []))
         self.download_dir: str | None = cfg.get("download_dir")
         self.speed_limit: str | None = cfg.get("speed_limit")  # e.g. "2M"; None = unlimited
+        md = cfg.get("max_downloads")
+        lo, hi = MAX_DL_RANGE
+        self.max_dl_set: int | None = md if isinstance(md, int) and lo <= md <= hi else None  # None = aria2.conf decides
+        self.max_dl: int | None = self.max_dl_set  # what aria2 actually runs at once (main fills it in)
         self.clipboard_seen = ""  # last clipboard content offered for v
         self.dl_history: list[dict] = load_dl_history()  # completed downloads, oldest->newest
         self.settings = False  # settings overlay open
@@ -1253,6 +1258,7 @@ class App:
     def _save_settings(self) -> None:
         self.config.update({"disabled_sources": sorted(self.disabled_sources),
                             "download_dir": self.download_dir, "speed_limit": self.speed_limit,
+                            "max_downloads": self.max_dl_set,
                             "meta_provider": self.meta_provider,
                             "theme": self.theme, "hide_dead": self.hide_dead,
                             "update_check": self.update_check,
@@ -1267,7 +1273,7 @@ class App:
         _static_bar.cache_clear()
 
     def setting_items(self) -> list[tuple[str, object]]:
-        return ([('section', 'General'), ('dir', None), ('limit', None), ('provider', None),
+        return ([('section', 'General'), ('dir', None), ('concurrency', None), ('limit', None), ('provider', None),
                  ('meta-key', None), ('theme', None), ('updates', None),
                  ('section', 'Sources')]
                 + [('source', s) for s in SOURCES]
@@ -1358,6 +1364,10 @@ class App:
                 else:
                     self.remove_feed = value["id"]
                     self.status = f"press x or Enter to remove {torznab_label(value['url'])}"
+            elif k in ("left", "right") and kind == "concurrency":
+                self.set_concurrency((self.max_dl or 5) + (1 if k == "right" else -1))
+            elif k in ("enter", " ") and kind == "concurrency":
+                self.edit_field, self.edit_buf = "concurrency", str(self.max_dl or "")
             elif k in ("enter", " ") and kind in ("dir", "limit"):
                 self.edit_field = kind
                 self.edit_buf = (self.download_dir or (self.eng.download_dir() if self.eng else "") or ""
@@ -1392,6 +1402,16 @@ class App:
         self.set_sel = self._snap_setting(self.set_sel)
         self.status = "feed removed"
 
+    def set_concurrency(self, n: int) -> None:
+        """How many downloads run at once; the rest wait as queued. Applied live and remembered."""
+        lo, hi = MAX_DL_RANGE
+        n = max(lo, min(hi, n))
+        self.max_dl = self.max_dl_set = n
+        if self.eng:
+            self.eng.set_max_concurrent(n)
+        self._save_settings()
+        self.status = f"downloads at once: {n}"
+
     def _commit_edit(self) -> None:
         if self.edit_field == "dir":
             self.download_dir = self.edit_buf.strip() or None
@@ -1405,6 +1425,14 @@ class App:
             self.speed_limit = raw or None
             if self.eng:
                 self.eng.set_limit(raw or "0")  # 0 = unlimited
+        elif self.edit_field == "concurrency":
+            raw, (lo, hi) = self.edit_buf.strip(), MAX_DL_RANGE
+            if not (raw.isdigit() and lo <= int(raw) <= hi):
+                self.status = f"downloads at once: a number from {lo} to {hi}"
+                return
+            self.edit_field = None
+            self.set_concurrency(int(raw))
+            return
         elif self.edit_field == "key":
             self._set_provider_key(self.edit_buf.strip() or None)
             self.meta.clear()  # re-fetch with the new key
@@ -1910,6 +1938,8 @@ class App:
         out += [("Paste magnet or link from clipboard", "v",
                  lambda: (setattr(self, "view", "search"), self.on_key("v"))),
                 ("Resume partial downloads on disk", "s", self.resume_partial),
+                ("More downloads at once", "+", lambda: self.set_concurrency((self.max_dl or 5) + 1)),
+                ("Fewer downloads at once", "-", lambda: self.set_concurrency((self.max_dl or 5) - 1)),
                 ("Settings", "g", lambda: (setattr(self, "settings", True),
                                             setattr(self, "set_sel", self._snap_setting(0)))),
                 ("Followed shows", "W", self.open_following),
@@ -2237,7 +2267,9 @@ class App:
             if not self.downloads or not (0 <= self.dsel < len(self.downloads)):
                 return
             d = self.downloads[self.dsel]
-            if k == "enter":
+            if k in ("+", "=", "-"):
+                self.set_concurrency((self.max_dl or 5) + (-1 if k == "-" else 1))
+            elif k == "enter":
                 if d.status != "complete" or not d.path:
                     self.status = "not finished yet — o reveals the folder"
                 elif open_url(open_target(d.path, d.name)):
@@ -2256,7 +2288,7 @@ class App:
                         self.eng.pause(d.root)
                     self.status = f"paused: {clean(d.name)[:40]}"
             elif k == "o":
-                if not d.path or d.status == "metadata":
+                if not d.path or d.meta:
                     self.status = "location not ready yet — fetching metadata"
                 elif reveal(d.path):
                     self.status = f"revealed: {clean(d.name)[:40]}"
@@ -2725,7 +2757,10 @@ def _downloads_panel(app: App, width: int, height: int) -> list[str]:
             elif d.status == "metadata":
                 icon, ic, base = T.DOWN, T.ACCENT, T.ACCENT
                 stats = "fetching metadata…"
-            else:  # active / waiting
+            elif d.status == "waiting":  # queued behind the downloads-at-once limit
+                icon, ic, base = "…", T.RULE, T.RULE
+                stats = f"queued  {pct}%" if d.progress else "queued"
+            else:  # active
                 icon, ic, base = T.DOWN, T.ACCENT, T.ACCENT
                 stats = f"{pct}%  {fmt_speed(d.speed)}  {T.PEER}{d.peers}" + (f"  {fmt_eta(d.eta)}" if d.eta else "")
             stat_w = min(dwidth(stats) + 1, inner_w - 6)
@@ -2747,10 +2782,12 @@ def _downloads_panel(app: App, width: int, height: int) -> list[str]:
             inner.append(cell(T.DONE, 2, color=T.GOOD)
                          + cell(clean(rec.get("name", "?")), inner_w - 2 - rw, color=T.TEXT)
                          + cell(right, rw, "right", dim=True))
-    active = sum(1 for d in live if d.status in ("active", "waiting", "metadata"))
+    active = sum(1 for d in live if d.status in ("active", "metadata"))
+    queued = sum(1 for d in live if d.status == "waiting")
     title_count = f"({len(live)})" if live else None
-    if active and title_count:
-        title_count += f" · {active} active"
+    if title_count:
+        title_count += (f" · {active} active" if active else "") + (f" · {queued} queued" if queued else "") \
+            + (f" · {app.max_dl} at once" if app.max_dl and (active or queued) else "")
     return _wrap_panel("Downloads", inner, width, height, app.view == "downloads",
                        title_count)
 
@@ -2770,8 +2807,13 @@ def _settings_panel(app: App, width: int, height: int) -> list[str]:
             inner.append(cell(str(value).upper(), inner_w, color=T.ALT, bold=True, dim=True))
             continue
         prefix = cell(T.PTR if selected else "", 2, color=T.ACCENT)
-        if kind in ("dir", "limit", "provider", "meta-key", "theme", "updates"):
-            if kind == "updates":
+        if kind in ("dir", "limit", "provider", "meta-key", "theme", "updates", "concurrency"):
+            if kind == "concurrency":
+                label = "Downloads at once"
+                shown = (app.edit_buf + "▌" if app.edit_field == "concurrency"
+                         else f"{app.max_dl or '?'}  ← →" + ("" if app.max_dl_set else "  (from aria2.conf)"))
+                on = True
+            elif kind == "updates":
                 label = "Update check"
                 shown = "daily (GitHub)" if app.update_check else "off"
                 on = app.update_check
@@ -2887,7 +2929,7 @@ def _help_panel(app: App, width: int, height: int) -> list[str]:
         ("Navigate", [("ctrl-k  :", "command palette: every action, searchable"),
                       ("↑ ↓  j k", "move selection / scroll wheel"),
                       ("tab", "switch search / downloads")]),
-        ("Downloads", [("enter", "open a finished download"),
+        ("Downloads", [("enter", "open a finished download"), ("+ / -", "more / fewer downloads at once"),
                        ("p", "pause / resume"), ("x", "cancel (ask: delete or keep files)"),
                        ("r", "retry a failed download"), ("f", "choose files (season packs)"),
                        ("o", "reveal in Finder"), ("s", "resume partial downloads on disk")]),
@@ -2938,6 +2980,8 @@ def _footer(app: App, width: int) -> str:
                 hints = [("↑↓", "move"), ("enter", "add"), ("a", "add"), ("g/esc", "close")]
             elif kind == "source":
                 hints = [("↑↓", "move"), ("space/enter", "toggle"), ("a", "add"), ("g/esc", "close")]
+            elif kind == "concurrency":
+                hints = [("↑↓", "move"), ("←→", "change"), ("enter", "type a number"), ("g/esc", "close")]
             elif kind in ("dir", "meta-key", "limit"):
                 hints = [("↑↓", "move"), ("enter/space", "edit"), ("a", "add"), ("g/esc", "close")]
             else:  # provider / theme
@@ -2964,6 +3008,7 @@ def _footer(app: App, width: int) -> str:
                  ("v", "paste"), (":", "commands"), ("g", "settings"), ("q", "quit")]
     else:
         hints = [("↑↓", "move"), ("↵", "open"), ("p", "pause/resume"), ("x", "cancel"), ("r", "retry"),
+                 ("+/-", "at once"),
                  ("f", "files"), ("o", "reveal"), ("s", "resume"), (":", "commands"), ("g", "settings"),
                  ("tab", "search"), ("q", "quit")]
     out, used = "", 0

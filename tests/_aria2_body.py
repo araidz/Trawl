@@ -12,12 +12,27 @@ assert meta.status == "metadata" and meta.name == "Some.Movie", meta
 _pm = to_download({"gid": "p", "status": "paused", "totalLength": "0", "completedLength": "0", "downloadSpeed": "0",
                    "files": [{"path": "/x/[METADATA]Some.Movie"}]})
 assert _pm.status == "paused" and _pm.name == "Some.Movie", "a paused magnet is paused, not 'fetching metadata'"
+# an unresolved magnet keeps aria2's real state; only an active one is "fetching metadata"
+for _st, _want in (("active", "metadata"), ("waiting", "waiting"), ("paused", "paused"), ("error", "error"), ("complete", "complete")):
+    _d = to_download({"gid": "q", "status": _st, "totalLength": "0", "completedLength": "0", "downloadSpeed": "0",
+                      "files": [{"path": "/x/[METADATA]Queued.Movie"}]})
+    assert _d.status == _want and _d.meta and _d.name == "Queued.Movie", (_st, _d.status)
+assert not to_download({"gid": "r", "status": "waiting", "files": [{"path": "/x/Real.mkv"}]}).meta
 live = to_download({"gid": "b", "status": "active", "totalLength": "100",
                    "completedLength": "50", "downloadSpeed": "10",
                    "connections": "7", "files": [{"path": "/x/Some.Movie.mkv"}]})
 assert live.progress == 0.5 and live.eta == 5.0 and live.peers == 7, live
 assert _follow({"status": "complete", "followedBy": ["z"]}) == "z"
 assert _follow({"status": "active", "followedBy": ["z"]}) is None
+# downloads at once: read and set live through aria2's global option
+_cm = Aria2(conf=None); _cc = []
+_cm._call = lambda m, p=None, **k: _cc.append((m, p)) or {"max-concurrent-downloads": "5"}  # type: ignore[method-assign]
+assert _cm.max_concurrent() == 5
+_cm.set_max_concurrent(8)
+assert _cc[-1] == ("aria2.changeGlobalOption", [{"max-concurrent-downloads": "8"}]), _cc
+def _down(*a, **k): raise Aria2Error("gone")
+_cm._call = _down  # type: ignore[method-assign]
+assert _cm.max_concurrent() is None and _cm.set_max_concurrent(3) is None, "engine trouble never raises"
 # add_torrent_file: base64 blob -> aria2.addTorrent, tracked like any root
 import tempfile as _tf3
 _tp = os.path.join(_tf3.mkdtemp(), "x.torrent")

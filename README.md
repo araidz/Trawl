@@ -127,6 +127,12 @@ Trawl is a from-scratch Python TUI inspired by
 - **Resume** — unfinished downloads resume automatically on the next launch;
   `s` additionally scans the download folder for stray partial `*.aria2` files
   (torrents and remembered direct-http grabs).
+- **Downloads at once** — aria2 runs a fixed number of downloads at the same time
+  and queues the rest. Change it with `+`/`-` in the Downloads view, or in settings
+  (`g`, "Downloads at once": `←`/`→`, or `Enter` to type a number). It applies
+  immediately and is remembered; until you set it, your `aria2.conf` decides. The
+  Downloads title shows `· N active · N queued · N at once`, and queued rows say
+  *queued* rather than looking stuck.
 - **Safety nets** — before a grab, Trawl compares the torrent's size with the
   free space on the target volume (keeping 1 GiB spare) and warns instead of
   filling your disk; press the same key again to grab anyway. `q` quits at once
@@ -211,6 +217,7 @@ You can also start straight into a search: `trawl oppenheimer`.
 | --- | --- |
 | `↑ ↓` | move / scroll · `PgUp/PgDn` page · `Home/End` jump |
 | `Enter` | open a finished download (a season pack opens its folder) |
+| `+` · `-` | more / fewer downloads at once (1–20; the rest wait as *queued*, and start as slots free up) |
 | `p` | pause / resume · `x` cancel (asks: delete files or keep) |
 | `r` | retry a failed download |
 | `f` | choose which files to download (season packs) |

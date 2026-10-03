@@ -75,6 +75,9 @@ def main(argv: list[str] | None = None) -> int:
         eng.set_dir(app.download_dir)
     if app.speed_limit:
         eng.set_limit(app.speed_limit)
+    if app.max_dl_set:
+        eng.set_max_concurrent(app.max_dl_set)
+    app.max_dl = app.max_dl_set or eng.max_concurrent()
     app.clipboard_seen = paste_clipboard()
     if initial:
         pm = parse_source(initial)
