@@ -1735,51 +1735,53 @@ _power[:] = [0.0, False]; subprocess.run = _boom
 assert on_ac_power() is True, "can't tell: assume plugged in"
 subprocess.run = _orun; _power[:] = [0.0, True]
 
-# rail KEYS: this screen's shortcuts under the categories (action, then key); the footer keeps the globals
+# rail KEYS: every shortcut for the screen in the lower-left corner (action, then key); bottom line empty
 def _rk_app(view="search"):
     a = App(eng=None); a.search, a.query, a.view = Replay((), []), "dune", view; a.search_done = a.search_total = 0
     a.results = [Result(f"{i:040x}", f"Dune.{i}.1080p.WEB", 10 ** 9, 50, 1, "yts", "m") for i in range(30)]
     return a
-def _rail_txt(a, cols=110, rows=34):
+def _rail_txt(a, cols=110, rows=44):
     fr = [strip_ansi(x) for x in render(a, cols, rows)]
-    return [x[MARGIN:MARGIN + RAIL_W] for x in fr], fr[-1].strip()
-for _view, _must in (("search", [("details", "enter"), ("mark", "space"), ("grab", "d"), ("follow", "w")]),
-                     ("downloads", [("open", "↵"), ("pause/play", "p"), ("at once", "+/-"), ("search", "tab")])):
+    body_h = _main_heights(rows)[0]
+    rail = [x[MARGIN:MARGIN + RAIL_W] for x in fr[len(T.LOGO_LINES) + 1:len(T.LOGO_LINES) + 1 + body_h]]
+    return rail, fr[-1].strip()
+def _list_rows(rail):
+    k = next(i for i, x in enumerate(rail) if x.split() == ["KEYS"])
+    return k, [x.split() for x in rail[k + 1:]]
+for _view in ("search", "downloads"):
     _a = _rk_app(_view); _rl, _ft = _rail_txt(_a)
-    _rows = [x.split() for x in _rl]
-    for _lab, _key in _must:
-        assert any(r[-1:] == [_key] and " ".join(r[:-1]) == _lab for r in _rows), (_view, _lab, _key, _rl)
-    assert any(r == ["KEYS"] for r in _rows) and _rows[next(i for i, r in enumerate(_rows) if r == ["KEYS"]) + 1] == ["move", "↑↓"]
-    assert _ft == ": commands  ·  ? all keys  ·  g settings  ·  q quit", (_view, _ft)
-    _hk = {k for k, _ in _hints(_a)[0]}
-    _railk = {r[-1] for r in _rows[next(i for i, r in enumerate(_rows) if r == ["KEYS"]) + 1:-2] if r}  # not the footer
-    assert _railk <= _hk and not (_railk - {"?"}) & set(RAIL_GLOBAL), "rail and footer split one list, nothing twice"
+    _k, _rows = _list_rows(_rl)
+    _all = _hints(_a)[0]
+    assert [(r[-1], " ".join(r[:-1])) for r in _rows] == _all, (_view, _rows)  # tall window: every key, in order
+    assert _rows[-4:] == [["commands", ":"], ["all", "keys", "?"], ["settings", "g"], ["quit", "q"]]
+    assert _ft == "", "the bottom line is empty: everything is in the list"
+    assert _k + 1 + len(_rows) == len(_rl), "the list ends on the rail's last row (lower-left corner)"
+    assert not _rl[_k - 1].strip() and not _rl[_k - 2].strip(), "a gap above it: not glued to the categories"
     assert all(dwidth(x) <= RAIL_W for x in _rl) and not any("…" in x for x in _rl), "every label fits"
-# marked rows show in the rail too
+# marked rows show in the list too
 _a = _rk_app(); _a.marked = {_a._mkey(r) for r in _a.results[:3]}
-assert any(x.split() == ["grab", "3", "d"] for x in _rail_txt(_a)[0])
-# short window: the list is cut, "all keys ?" is the last line; too short: no list, full footer back
-_rl, _ft = _rail_txt(_rk_app(), rows=22)
-_tail = [x.split() for x in _rl[:-2] if x.strip()][-1]  # the rail's last line, not the footer
-assert _tail == ["all", "keys", "?"] and "? all keys" in _ft, _rl
+assert ["grab", "3", "d"] in _list_rows(_rail_txt(_a)[0])[1]
+# short window: least-used screen keys drop first; commands/all keys/settings/quit always stay
+_a = _rk_app(); _rl, _ft = _rail_txt(_a, rows=26)
+_k, _rows = _list_rows(_rl)
+assert _rows[:2] == [["move", "↑↓"], ["details", "enter"]] and _rows[-4:] == [["commands", ":"], ["all", "keys", "?"], ["settings", "g"], ["quit", "q"]]
+assert len(_rows) < len(_hints(_a)[0]) and _ft == "" and _k + 1 + len(_rows) == len(_rl)
+# too short for a useful list: no list, the bottom line carries every key again
 _a = _rk_app(); _rl, _ft = _rail_txt(_a, rows=14)
-assert not any("KEYS" in x for x in _rl) and not _a.rail_keys_shown and "d grab" in _ft, "no room: footer does the job"
-# typing and filtering: their own keys, no "?" (it would type), footer keeps ^c
-_a = _rk_app(); _a.editing = True; _rl, _ft = _rail_txt(_a)
-assert any(x.split() == ["leave", "box", "esc"] for x in _rl) and not any(x.split()[-1:] == ["?"] for x in _rl) and _ft == "^c quit"
-_a = _rk_app(); _a.filtering = True; _rl, _ft = _rail_txt(_a)
-assert any(x.split() == ["keep", "enter"] for x in _rl) and _ft == "^c quit"
-# no rail = the full footer, exactly as before: narrow terminal, details, settings, splash
+assert not any("KEYS" in x for x in _rl) and not _a.rail_keys_shown and "d grab" in _ft and "q quit" in _ft
+# typing and filtering: their own keys, ending in ^c quit (q and ? would just type)
+_a = _rk_app(); _a.editing = True; _k, _rows = _list_rows(_rail_txt(_a)[0])
+assert ["leave", "box", "esc"] in _rows and _rows[-1] == ["quit", "^c"] and ["all", "keys", "?"] not in _rows
+_a = _rk_app(); _a.filtering = True; _k, _rows = _list_rows(_rail_txt(_a)[0])
+assert ["keep", "enter"] in _rows and _rows[-1] == ["quit", "^c"]
+# no rail = the full bottom line, exactly as before: narrow terminal, details, settings, prompts
 _a = _rk_app(); assert "d grab" in strip_ansi(render(_a, 79, 34)[-1]) and not _a.rail_keys_shown, "below 80 cols"
 _a = _rk_app(); _a.detail = _a.results[0]; assert "d download" in strip_ansi(render(_a, 110, 34)[-1])
 _a = _rk_app(); _a.settings = True; assert "g/esc close" in strip_ansi(render(_a, 110, 34)[-1])
-# prompts over a rail screen keep their own footer
-_a = _rk_app(); _a.confirm_quit = False; _a.cancel_prompt = None
-_a.folder_prompt = ([("m", "n")], "x", 0); assert "enter download" in strip_ansi(render(_a, 110, 34)[-1])
-for _rws in (20, 24, 34, 60):
+_a = _rk_app(); _a.folder_prompt = ([("m", "n")], "x", 0); assert "enter download" in strip_ansi(render(_a, 110, 34)[-1])
+for _rws in (14, 20, 24, 34, 60):
     for _v in ("search", "downloads"):
-        _a = _rk_app(_v)
-        assert all(dwidth(strip_ansi(x)) <= 110 for x in render(_a, 110, _rws)), (_v, _rws)
+        assert all(dwidth(strip_ansi(x)) <= 110 for x in render(_rk_app(_v), 110, _rws)), (_v, _rws)
 
 # status area: top-right, live (spinner + current process), fading, tone-coloured; footer is all shortcuts
 def _stat_app():
@@ -1816,9 +1818,11 @@ _sb.search, _sb.search_done, _sb.search_total = Search.__new__(Search), 7, 22
 _sb.down_speed, _sb.num_active = 3_500_000, 2
 for cols in (150, 120, 100, 70, 55):
     fr = [strip_ansi(x) for x in render(_sb, cols, 24)]
-    head, foot = fr[2], fr[-1] if fr[-1].strip() else next(x for x in reversed(fr) if x.strip())
+    head, foot = fr[2], fr[-1]
     assert "grabbing: Dune" in head and "searching 7/22" in head and head.rstrip().endswith("─"), (cols, head)
-    assert dwidth(head) <= cols and "grabbing" not in foot and "q quit" in foot, (cols, foot)
+    assert dwidth(head) <= cols and "grabbing" not in foot, (cols, foot)
+    assert "q quit" in foot or any(x[MARGIN:MARGIN + RAIL_W].split() == ["quit", "q"] for x in fr), \
+        f"quit is always shown: on the bottom line, or in the rail's list ({cols})"
     assert ("3.3 MB/s" in head) == (cols >= 70), f"the speed is the first thing dropped when tight ({cols})"
 _sb.status = "only 3.00 GB free, needs 14.00 GB — press again to grab anyway"
 for cols in (150, 90, 70, 55):
