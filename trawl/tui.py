@@ -479,17 +479,10 @@ def parse_keys(data: bytes) -> list[str]:
     while i < n:
         b = data[i]
         if b == 0x1b:
-            if data[i:i + 3] == b"\x1b[<":  # SGR mouse: \x1b[<btn;x;y(M|m)
+            if data[i:i + 3] == b"\x1b[<":  # SGR mouse \x1b[<btn;x;y(M|m): keyboard only, so swallowed
                 j = i + 3
                 while j < n and data[j] not in (ord("M"), ord("m")):
                     j += 1
-                parts = data[i + 3:j].split(b";")
-                if parts and parts[0].isdigit():
-                    btn = int(parts[0])
-                    if btn == 64:  # wheel up
-                        keys.append("up")
-                    elif btn == 65:  # wheel down
-                        keys.append("down")
                 i = j + 1
             elif data[i:i + 6] == b"\x1b[200~":  # bracketed paste: wrap to close
                 j = data.find(b"\x1b[201~", i + 6)
@@ -550,6 +543,8 @@ class Terminal:
         self.saved = termios.tcgetattr(self.fd)
         tty.setraw(self.fd)
         # alt-screen + clear + SGR mouse + bracketed paste; trawl owns the whole tab
+        # mouse reporting stays on only so the wheel arrives as mouse codes (which parse_keys drops):
+        # with it off, Terminal.app turns wheel turns into arrow keys on full-screen apps
         sys.stdout.write("\x1b[?1049h\x1b[3J\x1b[2J\x1b[H\x1b[?25l\x1b[?1000h\x1b[?1006h\x1b[?2004h")
         sys.stdout.flush()
 
@@ -2443,6 +2438,8 @@ def _logo_lines() -> tuple[str, ...]:
                 seg += " "
             elif ch in T.NET_GLYPHS:
                 seg += style(ch, T.NET_COLOR, bold=True)
+            elif ch in T.CATCH_GLYPHS:
+                seg += style(ch, T.GOOD, bold=True)
             else:
                 seg += style(ch, T.logo_color(((i / last) + ty) / 2), bold=True)
         out.append(seg)
@@ -2927,7 +2924,7 @@ def _help_panel(app: App, width: int, height: int) -> list[str]:
                        ("on a feed row", "e endpoint · K separate key · x remove"),
                        ("g / esc", "close")]),
         ("Navigate", [("ctrl-k  :", "command palette: every action, searchable"),
-                      ("↑ ↓  j k", "move selection / scroll wheel"),
+                      ("↑ ↓  j k", "move selection (keyboard only; the mouse is ignored)"),
                       ("tab", "switch search / downloads")]),
         ("Downloads", [("enter", "open a finished download"), ("+ / -", "more / fewer downloads at once"),
                        ("p", "pause / resume"), ("x", "cancel (ask: delete or keep files)"),

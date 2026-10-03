@@ -150,12 +150,14 @@ BLOCK = "█"
 TRACK = "░"
 SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"  # busy spinner frames
 
-# trawl wordmark + a trawling-net mesh (gradient on the word, aqua on the net)
+# trawl wordmark (gradient) + what it does: tow lines pull a net (aqua) through the water, the
+# mesh tapers to the cod-end, and the catch drops out as a download (green, the downloads arrow)
 LOGO_LINES: list[str] = [
-    "▀█▀ █▀▄ ▄▀▄ █ ▄ █ █     ╱╲╱╲╱╲",
-    " █  █▀▄ █▀█ ▀▄▀▄▀ █▄▄   ╲╱╲╱╲╱",
+    "▀█▀ █▀▄ ▄▀▄ █ ▄ █ █    ━┓╳╳╳╳╲",
+    " █  █▀▄ █▀█ ▀▄▀▄▀ █▄▄  ━┛╳╳╳╳╱↓",
 ]
-NET_GLYPHS = set("╱╲╳▞▚◇")
+NET_GLYPHS = set("╱╲╳━┓┛")
+CATCH_GLYPHS = set("↓")
 
 
 def source_style(source_id: str) -> tuple[str, str]:

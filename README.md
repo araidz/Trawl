@@ -1,8 +1,8 @@
 # Trawl
 
 ```
-▀█▀ █▀▄ ▄▀▄ █ ▄ █ █     ╱╲╱╲╱╲
- █  █▀▄ █▀█ ▀▄▀▄▀ █▄▄   ╲╱╲╱╲╱
+▀█▀ █▀▄ ▄▀▄ █ ▄ █ █    ━┓╳╳╳╳╲
+ █  █▀▄ █▀█ ▀▄▀▄▀ █▄▄  ━┛╳╳╳╳╱↓
 ```
 
 ![macOS](https://img.shields.io/badge/macOS-000?logo=apple&logoColor=white)
@@ -24,8 +24,8 @@ Trawl is a from-scratch Python TUI inspired by
 ## Preview
 
 ```
-                      ▀█▀ █▀▄ ▄▀▄ █ ▄ █ █     ╱╲╱╲╱╲
-                       █  █▀▄ █▀█ ▀▄▀▄▀ █▄▄   ╲╱╲╱╲╱
+                      ▀█▀ █▀▄ ▄▀▄ █ ▄ █ █    ━┓╳╳╳╳╲
+                       █  █▀▄ █▀█ ▀▄▀▄▀ █▄▄  ━┛╳╳╳╳╱↓
 
            A curated, terminal-native torrent & book finder.
                games  ·  movies  ·  tv  ·  anime  ·  books
@@ -38,8 +38,8 @@ Trawl is a from-scratch Python TUI inspired by
 ```
 
 ```
-  ▀█▀ █▀▄ ▄▀▄ █ ▄ █ █     ╱╲╱╲╱╲
-   █  █▀▄ █▀█ ▀▄▀▄▀ █▄▄   ╲╱╲╱╲╱
+  ▀█▀ █▀▄ ▄▀▄ █ ▄ █ █    ━┓╳╳╳╳╲
+   █  █▀▄ █▀█ ▀▄▀▄▀ █▄▄  ━┛╳╳╳╳╱↓
   ────────────────────────────────────────────────────────────────────
                     ╭─ Search ────────────────────────────────────────╮
   ▌ All             │ ❯ oppenheimer                                   │
@@ -139,7 +139,7 @@ Trawl is a from-scratch Python TUI inspired by
   when nothing is downloading and only asks while something is in flight.
 - **Quality of life** — persistent search history, completion notifications,
   clipboard magnet auto-detect (new magnets/links are offered as they appear),
-  mouse-wheel scrolling, a settings overlay (toggle sources, set the download
+  keyboard-only control (the mouse and scroll wheel are ignored), a settings overlay (toggle sources, set the download
   dir and an optional speed cap), and quit confirmation while a download is running.
 - **Single file** — ships as one stdlib zipapp executable on your `PATH`.
 

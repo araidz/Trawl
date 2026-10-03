@@ -73,10 +73,17 @@ finally:
 assert parse_keys(b"\x1b[A") == ["up"]
 assert parse_keys(b"ab\r\x7f\t\x03") == ["a", "b", "enter", "backspace", "tab", "ctrl-c"]
 assert parse_keys("café".encode()) == ["c", "a", "f", "é"]
-assert parse_keys(b"\x1b[<64;10;5M") == ["up"], "wheel up"
-assert parse_keys(b"\x1b[<65;10;5M") == ["down"], "wheel down"
+# keyboard only: wheel, clicks and drags are swallowed, typed keys around them survive
+for _ms in (b"\x1b[<64;10;5M", b"\x1b[<65;10;5M", b"\x1b[<0;3;4M", b"\x1b[<0;3;4m", b"\x1b[<32;9;9M", b"\x1b[<2;1;1M"):
+    assert parse_keys(_ms) == [], _ms
+assert parse_keys(b"a\x1b[<65;10;5M\x1b[<65;10;6Mb\x1b[A") == ["a", "b", "up"], "only the keys"
+assert parse_keys(b"\x1b[<65;10") == [], "a mouse code cut off at the end of a read is dropped, not typed"
+_mw = App(eng=None); _mw.view, _mw.downloads, _mw.dsel = "downloads", [], 0
+for _k in parse_keys(b"\x1b[<65;1;1M" * 20):
+    _mw.on_key(_k)
+assert _mw.dsel == 0 and _mw.running, "wheel turns don't move anything"
 assert parse_keys(b"\x1b[<0;1;1M") == [], "click ignored, sequence consumed"
-assert parse_keys(b"a\x1b[<64;1;1Mb") == ["a", "up", "b"], "mouse mid-stream"
+assert parse_keys(b"a\x1b[<64;1;1Mb") == ["a", "b"], "mouse mid-stream is swallowed"
 assert parse_keys(b"\x1b[5~\x1b[6~") == ["pageup", "pagedown"], "page keys"
 assert parse_keys(b"\x1b[H\x1b[F\x1b[1~\x1b[4~\x1b[7~\x1b[8~") == \
     ["home", "end", "home", "end", "home", "end"], "home/end variants"
@@ -1650,6 +1657,19 @@ assert any("(from aria2.conf)" in strip_ansi(x) for x in render(_cu, 120, 40))
 _cu.settings = False; _cu.view = "downloads"; _cu.on_key("ctrl-k")
 assert {"More downloads at once", "Fewer downloads at once"} <= {a[0] for a in _cu.palette_items()}
 _cu.on_key("esc")
+
+# logo: wordmark + towed net (aqua) + catch (green); both rows line up with the old layout height
+assert len(T.LOGO_LINES) == 2 and all(dwidth(x) <= 32 for x in T.LOGO_LINES)
+assert "↓" in T.LOGO_LINES[1] and set("━┓┛╳") <= set("".join(T.LOGO_LINES)) and set("╳━┓┛") <= T.NET_GLYPHS
+_logo_lines.cache_clear()
+_ll = "".join(_logo_lines())
+assert _fg(T.GOOD) + "↓" in _ll and _fg(T.NET_COLOR) + "╳" in _ll and _fg(T.NET_COLOR) + "━" in _ll
+assert [strip_ansi(x) for x in _logo_lines()] == T.LOGO_LINES
+for _t in T.THEMES:
+    T.set_theme(_t); _logo_lines.cache_clear()
+    assert all(dwidth(strip_ansi(x)) <= 100 for x in render(App(eng=None), 100, 30)), _t
+T.set_theme("violet"); _logo_lines.cache_clear()
+assert any("━┓╳╳╳╳╲" in strip_ansi(x) for x in render(App(eng=None), 100, 30)), "splash shows the new mark"
 
 # status area: top-right, live (spinner + current process), fading, tone-coloured; footer is all shortcuts
 def _stat_app():
